@@ -1,0 +1,341 @@
+from __future__ import annotations
+
+import argparse
+import json
+from pathlib import Path
+from typing import Dict, List, Optional, Sequence, Tuple
+
+import cv2
+import numpy as np
+import torch
+
+from utils.config import (
+    CHAIR_SUPPRESS_WITH_PERSON_IOU,
+    CLASS_CONF_THRESH,
+    CLASS_NAMES,
+    CONF_THRESH,
+    IMG_SIZE,
+    MEAN,
+    NMS_IOU_THRESH,
+    NUM_CLASSES,
+    STD,
+)
+from utils.model import AnchorFreeDetector
+from utils.nms import LetterboxMeta, postprocess_batch
+
+VALID_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
+
+
+def imread_unicode(path: Path) -> Optional[np.ndarray]:
+    if not path.exists():
+        return None
+    arr = np.fromfile(str(path), dtype=np.uint8)
+    if arr.size == 0:
+        return None
+    return cv2.imdecode(arr, cv2.IMREAD_COLOR)
+
+
+def imwrite_unicode(path: Path, image_bgr: np.ndarray) -> bool:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    ext = path.suffix.lower() if path.suffix.lower() in VALID_EXTS else ".jpg"
+    out_path = path if path.suffix.lower() in VALID_EXTS else path.with_suffix(ext)
+    ok, enc = cv2.imencode(ext, image_bgr)
+    if not ok:
+        return False
+    enc.tofile(str(out_path))
+    return True
+
+
+def enhance_low_light_bgr(image_bgr: np.ndarray) -> np.ndarray:
+    gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
+    if float(gray.mean()) >= 82.0:
+        return image_bgr
+    lab = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2LAB)
+    l, a, b = cv2.split(lab)
+    clahe = cv2.createCLAHE(clipLimit=2.2, tileGridSize=(8, 8))
+    l = clahe.apply(l)
+    out = cv2.cvtColor(cv2.merge([l, a, b]), cv2.COLOR_LAB2BGR)
+    lut = np.array([((i / 255.0) ** 0.82) * 255.0 for i in range(256)], dtype=np.float32)
+    lut = np.clip(lut, 0, 255).astype(np.uint8)
+    return cv2.LUT(out, lut)
+
+
+def letterbox_preprocess(image_bgr: np.ndarray, img_size: int) -> Tuple[torch.Tensor, LetterboxMeta]:
+    image_bgr = enhance_low_light_bgr(image_bgr)
+    h, w = image_bgr.shape[:2]
+    scale = min(float(img_size) / max(w, 1), float(img_size) / max(h, 1))
+    new_w = max(1, int(round(w * scale)))
+    new_h = max(1, int(round(h * scale)))
+    resized = cv2.resize(image_bgr, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+
+    canvas = np.full((img_size, img_size, 3), 114, dtype=np.uint8)
+    dx = (img_size - new_w) // 2
+    dy = (img_size - new_h) // 2
+    canvas[dy : dy + new_h, dx : dx + new_w] = resized
+
+    rgb = cv2.cvtColor(canvas, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
+    rgb = (rgb - np.array(MEAN, dtype=np.float32)) / np.array(STD, dtype=np.float32)
+    tensor = torch.from_numpy(rgb).permute(2, 0, 1).contiguous()
+
+    meta = LetterboxMeta(scale=scale, dx=float(dx), dy=float(dy), orig_w=int(w), orig_h=int(h))
+    return tensor, meta
+
+
+def collect_images(image_dir: Path) -> List[Path]:
+    imgs = [p for p in sorted(image_dir.iterdir()) if p.is_file() and p.suffix.lower() in VALID_EXTS]
+    return imgs
+
+
+def draw_prediction(image_bgr: np.ndarray, boxes: Sequence[dict], class_names: Sequence[str]) -> np.ndarray:
+    out = image_bgr.copy()
+    cls_to_idx = {c: i for i, c in enumerate(class_names)}
+
+    for obj in boxes:
+        cls_name = str(obj["class"])
+        score = float(obj["confidence"])
+        x1, y1, x2, y2 = [int(round(v)) for v in obj["bbox"]]
+        idx = cls_to_idx.get(cls_name, 0)
+        color = (
+            int((53 * (idx + 1)) % 255),
+            int((97 * (idx + 1)) % 255),
+            int((193 * (idx + 1)) % 255),
+        )
+        cv2.rectangle(out, (x1, y1), (x2, y2), color, 2)
+        label = f"{cls_name}:{score:.2f}"
+        cv2.putText(out, label, (x1, max(14, y1 - 4)), cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1, cv2.LINE_AA)
+    return out
+
+
+def box_iou(a: Sequence[float], b: Sequence[float]) -> float:
+    ax1, ay1, ax2, ay2 = [float(v) for v in a]
+    bx1, by1, bx2, by2 = [float(v) for v in b]
+    xx1 = max(ax1, bx1)
+    yy1 = max(ay1, by1)
+    xx2 = min(ax2, bx2)
+    yy2 = min(ay2, by2)
+    w = max(0.0, xx2 - xx1)
+    h = max(0.0, yy2 - yy1)
+    inter = w * h
+    area_a = max(0.0, ax2 - ax1) * max(0.0, ay2 - ay1)
+    area_b = max(0.0, bx2 - bx1) * max(0.0, by2 - by1)
+    return inter / (area_a + area_b - inter + 1e-9)
+
+
+def apply_class_thresholds(
+    predictions: List[dict],
+    class_names: Sequence[str],
+    class_conf_thresh: Sequence[float],
+) -> List[dict]:
+    th_map = {c: float(class_conf_thresh[i]) for i, c in enumerate(class_names) if i < len(class_conf_thresh)}
+    out: List[dict] = []
+    for pred in predictions:
+        keep = []
+        for box in pred.get("boxes", []):
+            c = str(box.get("class", ""))
+            s = float(box.get("confidence", 0.0))
+            thr = th_map.get(c, 0.5)
+            if s >= thr:
+                keep.append(box)
+        out.append({"image_id": pred.get("image_id"), "boxes": keep})
+    return out
+
+
+def suppress_chair_inside_person(predictions: List[dict], iou_thresh: float) -> List[dict]:
+    out: List[dict] = []
+    for pred in predictions:
+        boxes = pred.get("boxes", [])
+        persons = [b for b in boxes if str(b.get("class")) == "person"]
+        keep: List[dict] = []
+        for b in boxes:
+            cls = str(b.get("class", ""))
+            if cls != "chair":
+                keep.append(b)
+                continue
+            chair_box = b.get("bbox", [0, 0, 0, 0])
+            remove = False
+            for p in persons:
+                if box_iou(chair_box, p.get("bbox", [0, 0, 0, 0])) >= float(iou_thresh):
+                    remove = True
+                    break
+            if not remove:
+                keep.append(b)
+        out.append({"image_id": pred.get("image_id"), "boxes": keep})
+    return out
+
+
+@torch.no_grad()
+def run_inference(
+    model: AnchorFreeDetector,
+    image_paths: List[Path],
+    device: torch.device,
+    batch_size: int,
+    img_size: int,
+    conf_thresh: float,
+    nms_thresh: float,
+    class_names: Sequence[str],
+) -> List[dict]:
+    results: List[dict] = []
+    amp_enabled = device.type == "cuda"
+
+    for start in range(0, len(image_paths), batch_size):
+        batch_paths = image_paths[start : start + batch_size]
+        tensors: List[torch.Tensor] = []
+        metas: List[LetterboxMeta] = []
+        image_ids: List[str] = []
+
+        for p in batch_paths:
+            image = imread_unicode(p)
+            if image is None:
+                continue
+            tensor, meta = letterbox_preprocess(image, img_size=img_size)
+            tensors.append(tensor)
+            metas.append(meta)
+            image_ids.append(p.name)
+
+        if not tensors:
+            continue
+
+        images = torch.stack(tensors, dim=0).to(device, non_blocking=True).to(memory_format=torch.channels_last)
+        with torch.autocast(device_type=device.type, enabled=amp_enabled):
+            outputs = model(images)
+
+        batch_results = postprocess_batch(
+            outputs=outputs,
+            image_ids=image_ids,
+            metas=metas,
+            class_names=class_names,
+            num_classes=len(class_names),
+            img_size=img_size,
+            conf_thresh=conf_thresh,
+            nms_thresh=nms_thresh,
+            reg_decode="auto",
+            center_combine="mul",
+            min_box_size=2.0,
+        )
+        results.extend(batch_results)
+
+    return results
+
+
+def save_preview_images(predictions: List[dict], image_dir: Path, preview_dir: Path, limit: int, class_names: Sequence[str]) -> int:
+    preview_dir.mkdir(parents=True, exist_ok=True)
+    saved = 0
+
+    for pred in predictions[:limit]:
+        image_id = pred["image_id"]
+        img_path = image_dir / image_id
+        image = imread_unicode(img_path)
+        if image is None:
+            continue
+
+        vis = draw_prediction(image, pred.get("boxes", []), class_names=class_names)
+        out_path = preview_dir / image_id
+        if imwrite_unicode(out_path, vis):
+            saved += 1
+    return saved
+
+
+def load_checkpoint_model(checkpoint_path: Path, device: torch.device) -> Tuple[AnchorFreeDetector, List[str], int]:
+    ckpt = torch.load(str(checkpoint_path), map_location=device)
+    classes = ckpt.get("classes", CLASS_NAMES)
+    img_size = int(ckpt.get("img_size", IMG_SIZE))
+    num_classes = len(classes)
+
+    model = AnchorFreeDetector(num_classes=num_classes, pretrained=False).to(device)
+    state = ckpt.get("model_state_dict", ckpt)
+    model.load_state_dict(state, strict=True)
+    model.eval()
+
+    return model, list(classes), img_size
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Predict with anchor-free detector and export JSON.")
+    parser.add_argument("--image_dir", type=Path, required=True)
+    parser.add_argument("--output", type=Path, default=Path("predictions.json"))
+    parser.add_argument(
+        "--checkpoint",
+        "--model_path",
+        dest="checkpoint",
+        type=Path,
+        default=Path("models/best.pth"),
+        help="Path to trained model checkpoint (.pth). '--model_path' is kept as a backward-compatible alias.",
+    )
+    parser.add_argument("--img_size", type=int, default=IMG_SIZE)
+    parser.add_argument("--batch_size", type=int, default=24)
+    parser.add_argument("--conf_thresh", type=float, default=CONF_THRESH)
+    parser.add_argument("--nms_thresh", type=float, default=NMS_IOU_THRESH)
+    parser.add_argument(
+        "--class_conf",
+        type=str,
+        default=",".join(str(x) for x in CLASS_CONF_THRESH),
+        help="Per-class thresholds in CLASS_NAMES order, e.g. '0.38,0.40,0.40,0.40,0.72'",
+    )
+    parser.add_argument("--chair_suppress_iou", type=float, default=CHAIR_SUPPRESS_WITH_PERSON_IOU)
+    parser.add_argument("--preview_dir", type=Path, default=Path("results"))
+    parser.add_argument("--preview_count", type=int, default=50)
+    parser.add_argument("--device", type=str, default="auto", choices=["auto", "cuda", "cpu"])
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+    if not args.checkpoint.exists():
+        raise FileNotFoundError(f"Checkpoint not found: {args.checkpoint}")
+    if not args.image_dir.exists():
+        raise FileNotFoundError(f"Image directory not found: {args.image_dir}")
+
+    if args.device == "auto":
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    else:
+        device = torch.device(args.device)
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    torch.set_float32_matmul_precision("high")
+
+    model, ckpt_classes, ckpt_img_size = load_checkpoint_model(args.checkpoint, device=device)
+    model = model.to(memory_format=torch.channels_last)
+    class_names = ckpt_classes if ckpt_classes else CLASS_NAMES
+    img_size = args.img_size if args.img_size > 0 else ckpt_img_size
+
+    class_conf = [float(x.strip()) for x in str(args.class_conf).split(",") if x.strip()]
+    if len(class_conf) != len(class_names):
+        raise ValueError(f"--class_conf must have {len(class_names)} values (got {len(class_conf)}).")
+
+    image_paths = collect_images(args.image_dir)
+    if not image_paths:
+        raise ValueError(f"No images found in: {args.image_dir}")
+
+    predictions = run_inference(
+        model=model,
+        image_paths=image_paths,
+        device=device,
+        batch_size=max(1, args.batch_size),
+        img_size=img_size,
+        conf_thresh=float(args.conf_thresh),
+        nms_thresh=float(args.nms_thresh),
+        class_names=class_names,
+    )
+    predictions = apply_class_thresholds(predictions, class_names=class_names, class_conf_thresh=class_conf)
+    predictions = suppress_chair_inside_person(predictions, iou_thresh=float(args.chair_suppress_iou))
+
+    args.output.parent.mkdir(parents=True, exist_ok=True)
+    with args.output.open("w", encoding="utf-8") as f:
+        json.dump(predictions, f, ensure_ascii=False, indent=2)
+
+    saved = save_preview_images(
+        predictions=predictions,
+        image_dir=args.image_dir,
+        preview_dir=args.preview_dir,
+        limit=max(0, args.preview_count),
+        class_names=class_names,
+    )
+
+    print(f"Device: {device}")
+    print(f"Predicted images: {len(predictions)}")
+    print(f"Saved JSON: {args.output}")
+    print(f"Saved preview images: {saved} -> {args.preview_dir}")
+
+
+if __name__ == "__main__":
+    main()
