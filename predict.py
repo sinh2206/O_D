@@ -22,6 +22,7 @@ from utils.config import (
 )
 from utils.model import AnchorFreeDetector
 from utils.nms import LetterboxMeta, postprocess_batch
+from utils.runtime import device_summary, resolve_device
 
 VALID_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 
@@ -285,13 +286,11 @@ def main() -> None:
     if not args.image_dir.exists():
         raise FileNotFoundError(f"Image directory not found: {args.image_dir}")
 
-    if args.device == "auto":
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    else:
-        device = torch.device(args.device)
-    torch.backends.cuda.matmul.allow_tf32 = True
-    torch.backends.cudnn.allow_tf32 = True
-    torch.set_float32_matmul_precision("high")
+    device = resolve_device(args.device)
+    if torch.cuda.is_available():
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        torch.set_float32_matmul_precision("high")
 
     model, ckpt_classes, ckpt_img_size = load_checkpoint_model(args.checkpoint, device=device)
     model = model.to(memory_format=torch.channels_last)
@@ -331,7 +330,7 @@ def main() -> None:
         class_names=class_names,
     )
 
-    print(f"Device: {device}")
+    print(f"Device: {device_summary(device)}")
     print(f"Predicted images: {len(predictions)}")
     print(f"Saved JSON: {args.output}")
     print(f"Saved preview images: {saved} -> {args.preview_dir}")

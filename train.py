@@ -6,7 +6,7 @@ import json
 import random
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import albumentations as A
 import cv2
@@ -33,6 +33,7 @@ from utils.config import (
 )
 from utils.loss import DetectionLoss
 from utils.model import AnchorFreeDetector
+from utils.runtime import create_grad_scaler, device_summary, resolve_device, resolve_num_workers, should_pin_memory
 
 VALID_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 
@@ -320,6 +321,7 @@ def make_dataloader(
     batch_size: int,
     shuffle: bool,
     num_workers: int,
+    pin_memory: bool,
     sampler: Optional[WeightedRandomSampler] = None,
 ) -> DataLoader:
     return DataLoader(
@@ -328,7 +330,7 @@ def make_dataloader(
         shuffle=(shuffle and sampler is None),
         sampler=sampler,
         num_workers=num_workers,
-        pin_memory=True,
+        pin_memory=pin_memory,
         persistent_workers=(num_workers > 0),
         drop_last=False,
         collate_fn=collate_fn,
@@ -341,7 +343,7 @@ def train_one_epoch(
     loader: DataLoader,
     optimizer: torch.optim.Optimizer,
     device: torch.device,
-    scaler: torch.cuda.amp.GradScaler,
+    scaler: Any,
     amp_enabled: bool,
 ) -> Dict[str, float]:
     model.train()
@@ -460,9 +462,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lr_backbone", type=float, default=2e-4)
     parser.add_argument("--lr_head", type=float, default=2e-3)
     parser.add_argument("--weight_decay", type=float, default=1e-4)
-    parser.add_argument("--num_workers", type=int, default=6)
+    parser.add_argument("--num_workers", type=int, default=-1, help="DataLoader workers. Use -1 for auto.")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--resume", type=Path, default=None)
+    parser.add_argument("--device", type=str, default="auto", choices=["auto", "cuda", "cpu"])
     parser.add_argument("--label_smoothing", type=float, default=LABEL_SMOOTHING)
     parser.add_argument("--center_radius", type=float, default=1.3)
     parser.add_argument("--no_scale_ranges", action="store_true")
@@ -475,13 +478,15 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     seed_everything(args.seed)
-    torch.backends.cudnn.benchmark = True
-    torch.backends.cuda.matmul.allow_tf32 = True
-    torch.backends.cudnn.allow_tf32 = True
-    torch.set_float32_matmul_precision("high")
-
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = resolve_device(args.device)
+    if torch.cuda.is_available():
+        torch.backends.cudnn.benchmark = True
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        torch.set_float32_matmul_precision("high")
     amp_enabled = (device.type == "cuda") and (not args.no_amp)
+    pin_memory = should_pin_memory(device)
+    num_workers, max_safe_workers = resolve_num_workers(args.num_workers)
 
     train_samples, classes = parse_samples(args.train_data, args.image_dir, class_names=None)
     val_samples, _ = parse_samples(args.val_data, args.val_image_dir, class_names=classes)
@@ -504,10 +509,17 @@ def main() -> None:
         train_ds,
         batch_size=args.batch_size,
         shuffle=True,
-        num_workers=args.num_workers,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
         sampler=train_sampler,
     )
-    val_loader = make_dataloader(val_ds, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers)
+    val_loader = make_dataloader(
+        val_ds,
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+    )
 
     model = AnchorFreeDetector(num_classes=num_classes, pretrained=True).to(device).to(memory_format=torch.channels_last)
     criterion = DetectionLoss(
@@ -520,7 +532,7 @@ def main() -> None:
     ).to(device)
     optimizer = build_optimizer(model, lr_backbone=args.lr_backbone, lr_head=args.lr_head, weight_decay=args.weight_decay)
     scheduler = CosineAnnealingLR(optimizer, T_max=max(args.epochs, 1))
-    scaler = torch.cuda.amp.GradScaler(enabled=amp_enabled)
+    scaler = create_grad_scaler(device=device, enabled=amp_enabled)
 
     start_epoch = 1
     best_val_loss = float("inf")
@@ -538,7 +550,10 @@ def main() -> None:
     best_path = args.checkpoint_dir / "best.pth"
     last_path = args.checkpoint_dir / "last.pth"
 
-    print(f"Device: {device}, AMP: {amp_enabled}")
+    print(f"Device: {device_summary(device)}, AMP: {amp_enabled}")
+    if args.num_workers >= 0 and args.num_workers != num_workers:
+        print(f"Requested num_workers={args.num_workers} exceeds safe limit; using {num_workers}.")
+    print(f"DataLoader workers: {num_workers} (max safe: {max_safe_workers}), pin_memory: {pin_memory}")
     print(f"Train samples: {len(train_ds)}, Val samples: {len(val_ds)}, Classes: {classes}")
     print(f"Balanced sampling: {not args.no_balanced_sampling}")
     print(f"Class weights enabled: {not args.no_class_weights}")
