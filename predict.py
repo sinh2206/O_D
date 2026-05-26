@@ -278,6 +278,47 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", type=str, default="auto", choices=["auto", "cuda", "cpu"])
     return parser.parse_args()
 
+def suppress_contained_boxes(predictions: List[dict]) -> List[dict]:
+    """Loại bỏ box cùng lớp nếu nó nằm hoàn toàn bên trong một box khác có confidence cao hơn."""
+    out: List[dict] = []
+    for pred in predictions:
+        boxes = pred.get("boxes", [])
+        if len(boxes) <= 1:
+            out.append(pred)
+            continue
+
+        # Gom nhóm theo class
+        class_boxes: Dict[str, list] = {}
+        for idx, box in enumerate(boxes):
+            cls = str(box.get("class", ""))
+            class_boxes.setdefault(cls, []).append((idx, box))
+
+        keep_mask = [True] * len(boxes)
+
+        for cls, items in class_boxes.items():
+            n = len(items)
+            if n <= 1:
+                continue
+            # Sắp xếp theo confidence giảm dần
+            items.sort(key=lambda x: float(x[1].get("confidence", 0.0)), reverse=True)
+            indices = [it[0] for it in items]
+            bboxes  = [it[1].get("bbox", [0,0,0,0]) for it in items]
+
+            for i in range(n):
+                if not keep_mask[indices[i]]:
+                    continue
+                xi1, yi1, xi2, yi2 = bboxes[i]
+                for j in range(i + 1, n):
+                    if not keep_mask[indices[j]]:
+                        continue
+                    xj1, yj1, xj2, yj2 = bboxes[j]
+                    # Kiểm tra box j nằm hoàn toàn trong box i
+                    if xj1 >= xi1 and yj1 >= yi1 and xj2 <= xi2 and yj2 <= yi2:
+                        keep_mask[indices[j]] = False  # loại bỏ box j
+
+        new_boxes = [box for idx, box in enumerate(boxes) if keep_mask[idx]]
+        out.append({"image_id": pred.get("image_id"), "boxes": new_boxes})
+    return out
 
 def main() -> None:
     args = parse_args()
@@ -316,6 +357,7 @@ def main() -> None:
         class_names=class_names,
     )
     predictions = apply_class_thresholds(predictions, class_names=class_names, class_conf_thresh=class_conf)
+    predictions = suppress_contained_boxes(predictions)
     predictions = suppress_chair_inside_person(predictions, iou_thresh=float(args.chair_suppress_iou))
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
