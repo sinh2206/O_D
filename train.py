@@ -39,14 +39,21 @@ class DetectionDataset(Dataset):
         return len(self.image_info)
 
     def __getitem__(self, idx):
-        img_info = self.image_info[idx]
-        img_id = img_info['id']
-        img_path = self.image_dir / img_info['file_name']
-        
-        image = imread_unicode(str(img_path))
-        if image is None:
-            # Fallback or skip
-            return self.__getitem__((idx + 1) % len(self))
+        # Avoid recursion errors with a simple loop
+        max_retries = 10
+        for _ in range(max_retries):
+            img_info = self.image_info[idx]
+            img_id = img_info['id']
+            img_path = self.image_dir / img_info['file_name']
+            
+            image = imread_unicode(str(img_path))
+            if image is not None:
+                break
+            idx = (idx + 1) % len(self)
+        else:
+            # If all else fails, return a blank image
+            image = np.full((IMG_SIZE, IMG_SIZE, 3), 114, dtype=np.uint8)
+            img_id = "error"
             
         image = enhance_low_light_bgr(image)
         image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
@@ -81,22 +88,24 @@ def collate_fn(batch):
     targets = [item[1] for item in batch]
     return images, targets
 
-def train_one_epoch(model, loader, optimizer, device, epoch):
+def train_one_epoch(model, loader, optimizer, scaler, device, epoch):
     model.train()
     pbar = tqdm(loader, desc=f"Epoch {epoch}")
     total_loss = 0
     
     for images, targets in pbar:
-        images = images.to(device)
-        # targets is a list of dicts, we'll move them to device in loss.py or here
+        images = images.to(device, non_blocking=True).to(memory_format=torch.channels_last)
         targets = [{'boxes': t['boxes'].to(device), 'labels': t['labels'].to(device)} for t in targets]
         
-        optimizer.zero_grad()
-        predictions = model(images)
-        loss, loss_dict = compute_loss(predictions, targets, device)
+        optimizer.zero_grad(set_to_none=True)
         
-        loss.backward()
-        optimizer.step()
+        with torch.amp.autocast('cuda', enabled=(device.type == 'cuda')):
+            predictions = model(images)
+            loss, loss_dict = compute_loss(predictions, targets, device)
+        
+        scaler.scale(loss).backward()
+        scaler.step(optimizer)
+        scaler.update()
         
         total_loss += loss.item()
         pbar.set_postfix(loss=loss.item(), obj=loss_dict['obj'], reg=loss_dict['reg'])
@@ -110,11 +119,12 @@ def validate_one_epoch(model, loader, device, epoch):
     
     with torch.no_grad():
         for images, targets in pbar:
-            images = images.to(device)
+            images = images.to(device, non_blocking=True).to(memory_format=torch.channels_last)
             targets = [{'boxes': t['boxes'].to(device), 'labels': t['labels'].to(device)} for t in targets]
             
-            predictions = model(images)
-            loss, _ = compute_loss(predictions, targets, device)
+            with torch.amp.autocast('cuda', enabled=(device.type == 'cuda')):
+                predictions = model(images)
+                loss, _ = compute_loss(predictions, targets, device)
             
             total_loss += loss.item()
             pbar.set_postfix(loss=loss.item())
@@ -139,7 +149,7 @@ def main():
     
     transform = A.Compose([
         A.LongestMaxSize(max_size=IMG_SIZE),
-        A.PadIfNeeded(min_height=IMG_SIZE, min_width=IMG_SIZE, border_mode=cv2.BORDER_CONSTANT, value=114),
+        A.PadIfNeeded(min_height=IMG_SIZE, min_width=IMG_SIZE, border_mode=cv2.BORDER_CONSTANT, fill=114),
         A.HorizontalFlip(p=0.5),
         A.ColorJitter(p=0.2),
         A.Normalize(mean=MEAN, std=STD),
@@ -148,22 +158,25 @@ def main():
     
     val_transform = A.Compose([
         A.LongestMaxSize(max_size=IMG_SIZE),
-        A.PadIfNeeded(min_height=IMG_SIZE, min_width=IMG_SIZE, border_mode=cv2.BORDER_CONSTANT, value=114),
+        A.PadIfNeeded(min_height=IMG_SIZE, min_width=IMG_SIZE, border_mode=cv2.BORDER_CONSTANT, fill=114),
         A.Normalize(mean=MEAN, std=STD),
         ToTensorV2()
     ], bbox_params=A.BboxParams(format='pascal_voc', label_fields=['category_ids']))
     
     train_dataset = DetectionDataset(args.train_data, args.image_dir, transform=transform)
-    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, collate_fn=collate_fn, num_workers=4)
+    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, 
+                              collate_fn=collate_fn, num_workers=2, pin_memory=True)
     
     val_loader = None
     if args.val_data and args.val_image_dir:
         val_dataset = DetectionDataset(args.val_data, args.val_image_dir, transform=val_transform)
-        val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, collate_fn=collate_fn, num_workers=4)
+        val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, 
+                                collate_fn=collate_fn, num_workers=2, pin_memory=True)
     
-    model = YOLOv2Detector(pretrained=True).to(device)
+    model = YOLOv2Detector(pretrained=True).to(device).to(memory_format=torch.channels_last)
     optimizer = get_optimizer(model, lr=args.lr)
     scheduler = get_scheduler(optimizer, args.epochs)
+    scaler = torch.amp.GradScaler('cuda', enabled=(device.type == 'cuda'))
     
     start_epoch = 0
     best_val_loss = float('inf')
@@ -172,7 +185,7 @@ def main():
         start_epoch, best_val_loss = load_checkpoint(args.resume, model, optimizer)
         
     for epoch in range(start_epoch, args.epochs):
-        train_loss = train_one_epoch(model, train_loader, optimizer, device, epoch)
+        train_loss = train_one_epoch(model, train_loader, optimizer, scaler, device, epoch)
         
         val_loss = train_loss
         if val_loader:

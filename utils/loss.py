@@ -103,28 +103,38 @@ def compute_loss(predictions, targets_list, device):
     pred_ty = torch.sigmoid(predictions[..., 1])
     pred_tw = predictions[..., 2]
     pred_th = predictions[..., 3]
-    pred_conf = torch.sigmoid(predictions[..., 4])
-    pred_cls = predictions[..., 5:] # Logits
-    
+    pred_conf_logits = predictions[..., 4]  # Raw logits, no sigmoid
+    pred_cls = predictions[..., 5:]         # Raw logits
+
     # 1. Regression Loss (only for objects)
-    loss_x = F.mse_loss(pred_tx[obj_mask], tx[obj_mask])
-    loss_y = F.mse_loss(pred_ty[obj_mask], ty[obj_mask])
-    loss_w = F.mse_loss(pred_tw[obj_mask], tw[obj_mask])
-    loss_h = F.mse_loss(pred_th[obj_mask], th[obj_mask])
-    loss_reg = loss_x + loss_y + loss_w + loss_h
-    
-    # 2. Objectness Loss (BCE)
-    # obj_mask values are 1, noobj_mask targets are 0
+    if obj_mask.any():
+        loss_x = F.mse_loss(pred_tx[obj_mask], tx[obj_mask])
+        loss_y = F.mse_loss(pred_ty[obj_mask], ty[obj_mask])
+        loss_w = F.mse_loss(pred_tw[obj_mask], tw[obj_mask])
+        loss_h = F.mse_loss(pred_th[obj_mask], th[obj_mask])
+        loss_reg = loss_x + loss_y + loss_w + loss_h
+    else:
+        loss_reg = torch.tensor(0.0, device=device)
+
+    # 2. Objectness Loss (BCE with logits — AMP-safe)
     t_obj = obj_mask.float()
-    loss_obj = F.binary_cross_entropy(pred_conf[obj_mask], t_obj[obj_mask])
-    loss_noobj = F.binary_cross_entropy(pred_conf[noobj_mask], t_obj[noobj_mask])
-    
+    if obj_mask.any():
+        loss_obj = F.binary_cross_entropy_with_logits(
+            pred_conf_logits[obj_mask], t_obj[obj_mask])
+    else:
+        loss_obj = torch.tensor(0.0, device=device)
+    if noobj_mask.any():
+        loss_noobj = F.binary_cross_entropy_with_logits(
+            pred_conf_logits[noobj_mask], t_obj[noobj_mask])
+    else:
+        loss_noobj = torch.tensor(0.0, device=device)
+
     # 3. Classification Loss (CE, only for objects)
     if obj_mask.any():
         loss_cls = F.cross_entropy(pred_cls[obj_mask], tcls[obj_mask])
     else:
         loss_cls = torch.tensor(0.0, device=device)
-    
+
     total_loss = (LAMBDA_BOX * loss_reg) + \
                  (LAMBDA_OBJ * loss_obj) + \
                  (LAMBDA_NOOBJ * loss_noobj) + \
