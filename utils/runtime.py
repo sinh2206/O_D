@@ -1,71 +1,58 @@
-from __future__ import annotations
-
-import os
-from typing import Any, Tuple
-
 import torch
+import torch.nn as nn
+from torch.optim import AdamW
+from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
+from pathlib import Path
 
-
-def _cpu_limit_from_affinity() -> int:
-    cpu_count = os.cpu_count() or 1
-    try:
-        affinity_count = len(os.sched_getaffinity(0))
-        if affinity_count > 0:
-            cpu_count = min(cpu_count, affinity_count)
-    except (AttributeError, OSError):
-        pass
-    return max(1, int(cpu_count))
-
-
-def resolve_num_workers(requested: int) -> Tuple[int, int]:
-    max_safe = _cpu_limit_from_affinity()
-    if "COLAB_GPU" in os.environ:
-        max_safe = min(max_safe, 2)
-
-    if requested < 0:
-        if max_safe <= 2:
-            return max_safe, max_safe
-        return min(4, max_safe), max_safe
-
-    resolved = max(0, min(int(requested), max_safe))
-    return resolved, max_safe
-
-
-def resolve_device(requested: str = "auto") -> torch.device:
-    req = str(requested).strip().lower()
-    if req == "auto":
-        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    if req == "cuda":
-        if not torch.cuda.is_available():
-            cuda_build = torch.version.cuda or "none"
-            raise RuntimeError(
-                "Requested CUDA device but torch.cuda.is_available() is False. "
-                f"torch.version.cuda={cuda_build}. "
-                "On Colab, enable GPU runtime (T4) in Runtime > Change runtime type."
-            )
+def resolve_device(preferred="cuda"):
+    if preferred == "cuda" and torch.cuda.is_available():
         return torch.device("cuda")
-    if req == "cpu":
-        return torch.device("cpu")
-    raise ValueError(f"Unsupported device option: {requested}")
+    return torch.device("cpu")
 
+def device_summary(device):
+    if device.type == "cuda":
+        return f"GPU: {torch.cuda.get_device_name(0)}"
+    return "CPU"
 
-def should_pin_memory(device: torch.device) -> bool:
-    return device.type == "cuda" and torch.cuda.is_available()
+def load_checkpoint(path, model, optimizer=None):
+    if not Path(path).exists():
+        return 0, float('inf')
+    
+    ckpt = torch.load(path, map_location='cpu')
+    model.load_state_dict(ckpt['model_state_dict'])
+    if optimizer and 'optimizer_state_dict' in ckpt:
+        optimizer.load_state_dict(ckpt['optimizer_state_dict'])
+        
+    return ckpt.get('epoch', 0), ckpt.get('best_loss', float('inf'))
 
+def save_checkpoint(path, epoch, model, optimizer, best_loss):
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    torch.save({
+        'epoch': epoch,
+        'model_state_dict': model.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict(),
+        'best_loss': best_loss
+    }, path)
 
-def create_grad_scaler(device: torch.device, enabled: bool) -> Any:
-    amp_enabled = bool(enabled and device.type == "cuda")
+def get_optimizer(model, lr=1e-3, weight_decay=1e-4):
+    # Differentiate learning rates for backbone and head if desired
+    # Here we just use a single LR for simplicity or filter by name
+    backbone_params = []
+    head_params = []
+    for name, param in model.named_parameters():
+        if 'backbone' in name:
+            backbone_params.append(param)
+        else:
+            head_params.append(param)
+            
+    optimizer = AdamW([
+        {'params': backbone_params, 'lr': lr * 0.1},
+        {'params': head_params, 'lr': lr}
+    ], weight_decay=weight_decay)
+    
+    return optimizer
 
-    if hasattr(torch, "amp") and hasattr(torch.amp, "GradScaler"):
-        try:
-            return torch.amp.GradScaler(device.type, enabled=amp_enabled)
-        except TypeError:
-            return torch.amp.GradScaler(enabled=amp_enabled)
-
-    return torch.cuda.amp.GradScaler(enabled=amp_enabled)
-
-
-def device_summary(device: torch.device) -> str:
-    if device.type == "cuda" and torch.cuda.is_available():
-        return f"cuda ({torch.cuda.get_device_name(0)})"
-    return str(device)
+def get_scheduler(optimizer, epochs, warmup_epochs=3):
+    # Cosine annealing with warmup is often good for YOLO
+    # Simple cosine annealing for now
+    return torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
