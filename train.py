@@ -103,18 +103,39 @@ def train_one_epoch(model, loader, optimizer, device, epoch):
         
     return total_loss / len(loader)
 
+def validate_one_epoch(model, loader, device, epoch):
+    model.eval()
+    pbar = tqdm(loader, desc=f"Val Epoch {epoch}")
+    total_loss = 0
+    
+    with torch.no_grad():
+        for images, targets in pbar:
+            images = images.to(device)
+            targets = [{'boxes': t['boxes'].to(device), 'labels': t['labels'].to(device)} for t in targets]
+            
+            predictions = model(images)
+            loss, _ = compute_loss(predictions, targets, device)
+            
+            total_loss += loss.item()
+            pbar.set_postfix(loss=loss.item())
+            
+    return total_loss / len(loader)
+
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--train_ann', type=str, required=True)
-    parser.add_argument('--train_img', type=str, required=True)
+    parser.add_argument('--train_data', type=str, required=True, help='Path to train annotations JSON')
+    parser.add_argument('--val_data', type=str, help='Path to val annotations JSON')
+    parser.add_argument('--image_dir', type=str, required=True, help='Directory for train images')
+    parser.add_argument('--val_image_dir', type=str, help='Directory for val images')
+    parser.add_argument('--checkpoint_dir', type=str, default='./models/', help='Directory to save models')
     parser.add_argument('--epochs', type=int, default=50)
     parser.add_argument('--batch_size', type=int, default=16)
     parser.add_argument('--lr', type=float, default=1e-3)
     parser.add_argument('--resume', type=str, default=None)
-    parser.add_argument('--output', type=str, default='models/best.pth')
     args = parser.parse_args()
     
     device = resolve_device()
+    Path(args.checkpoint_dir).mkdir(parents=True, exist_ok=True)
     
     transform = A.Compose([
         A.LongestMaxSize(max_size=IMG_SIZE),
@@ -125,27 +146,49 @@ def main():
         ToTensorV2()
     ], bbox_params=A.BboxParams(format='pascal_voc', label_fields=['category_ids']))
     
-    dataset = DetectionDataset(args.train_ann, args.train_img, transform=transform)
-    loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, collate_fn=collate_fn, num_workers=4)
+    val_transform = A.Compose([
+        A.LongestMaxSize(max_size=IMG_SIZE),
+        A.PadIfNeeded(min_height=IMG_SIZE, min_width=IMG_SIZE, border_mode=cv2.BORDER_CONSTANT, value=114),
+        A.Normalize(mean=MEAN, std=STD),
+        ToTensorV2()
+    ], bbox_params=A.BboxParams(format='pascal_voc', label_fields=['category_ids']))
+    
+    train_dataset = DetectionDataset(args.train_data, args.image_dir, transform=transform)
+    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, collate_fn=collate_fn, num_workers=4)
+    
+    val_loader = None
+    if args.val_data and args.val_image_dir:
+        val_dataset = DetectionDataset(args.val_data, args.val_image_dir, transform=val_transform)
+        val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, collate_fn=collate_fn, num_workers=4)
     
     model = YOLOv2Detector(pretrained=True).to(device)
     optimizer = get_optimizer(model, lr=args.lr)
     scheduler = get_scheduler(optimizer, args.epochs)
     
     start_epoch = 0
-    best_loss = float('inf')
+    best_val_loss = float('inf')
     
     if args.resume:
-        start_epoch, best_loss = load_checkpoint(args.resume, model, optimizer)
+        start_epoch, best_val_loss = load_checkpoint(args.resume, model, optimizer)
         
     for epoch in range(start_epoch, args.epochs):
-        avg_loss = train_one_epoch(model, loader, optimizer, device, epoch)
+        train_loss = train_one_epoch(model, train_loader, optimizer, device, epoch)
+        
+        val_loss = train_loss
+        if val_loader:
+            val_loss = validate_one_epoch(model, val_loader, device, epoch)
+            
         scheduler.step()
         
-        if avg_loss < best_loss:
-            best_loss = avg_loss
-            save_checkpoint(args.output, epoch, model, optimizer, best_loss)
-            print(f"Saved best model with loss {best_loss:.4f}")
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            save_path = Path(args.checkpoint_dir) / 'best.pth'
+            save_checkpoint(str(save_path), epoch, model, optimizer, best_val_loss)
+            print(f"Saved best model with val_loss {best_val_loss:.4f}")
+        
+        # Also save last
+        last_path = Path(args.checkpoint_dir) / 'last.pth'
+        save_checkpoint(str(last_path), epoch, model, optimizer, val_loss)
 
 if __name__ == "__main__":
     main()
