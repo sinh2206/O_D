@@ -1,23 +1,21 @@
-import numpy as np
+from __future__ import annotations
 
-# Image configuration
 IMG_SIZE = 320
 
-# Class configuration
 CLASS_NAMES = ["person", "car", "dog", "cat", "chair"]
 NUM_CLASSES = len(CLASS_NAMES)
-CLASS_TO_IDX = {name: i for i, name in enumerate(CLASS_NAMES)}
+CLASS_TO_IDX = {name: idx for idx, name in enumerate(CLASS_NAMES)}
 
-# Grid and Stride configuration
 STRIDE = 32
-GRID_SIZE = IMG_SIZE // STRIDE  # Should be 10 for 320/32
+GRID_SIZE = IMG_SIZE // STRIDE
 
-# Anchor configuration (width, height) in pixels
-# Example: 3 common sizes
-ANCHOR_SIZES = [(48, 48), (96, 96), (192, 192)]
+ANCHOR_SIZES = [
+    (48.0, 48.0),
+    (96.0, 96.0),
+    (192.0, 192.0),
+]
 NUM_ANCHORS = len(ANCHOR_SIZES)
 
-# Loss weights and thresholds
 IOU_POS_THRESH = 0.5
 IOU_IGNORE_THRESH = 0.5
 LAMBDA_OBJ = 5.0
@@ -25,10 +23,9 @@ LAMBDA_NOOBJ = 0.5
 LAMBDA_BOX = 5.0
 LAMBDA_CLS = 1.0
 
-# Normalization constants (ImageNet)
 MEAN = [0.485, 0.456, 0.406]
 STD = [0.229, 0.224, 0.225]
 
-# Inference defaults
-CONF_THRESH = 0.3
+CONF_THRESH = 0.30
 NMS_IOU_THRESH = 0.45
+CLASS_CONF_THRESH = [CONF_THRESH for _ in CLASS_NAMES]
