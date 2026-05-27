@@ -7,7 +7,15 @@ from typing import List
 
 import torch
 
-from utils.config import CLASS_CONF_THRESH, CLASS_NAMES, CONF_THRESH, IMG_SIZE, MAX_OBJECTS_PER_IMAGE, NMS_IOU_THRESH
+from utils.config import (
+    CLASS_CONF_THRESH,
+    CLASS_NAMES,
+    CONF_THRESH,
+    IMG_SIZE,
+    MAX_OBJECTS_PER_IMAGE,
+    NMS_CLASS_AGNOSTIC,
+    NMS_IOU_THRESH,
+)
 from utils.forecast import apply_class_thresholds, load_checkpoint_model, run_inference, save_predictions_json
 from utils.model import YOLOv2Detector
 from utils.process import draw_prediction, imread_unicode, imwrite_unicode
@@ -201,6 +209,8 @@ def parse_args() -> argparse.Namespace:
         help="Per-class thresholds in CLASS_NAMES order, e.g. '0.30,0.30,0.30,0.30,0.30'.",
     )
     parser.add_argument("--max_objects_per_image", type=int, default=MAX_OBJECTS_PER_IMAGE)
+    parser.add_argument("--class_agnostic_nms", action="store_true", default=NMS_CLASS_AGNOSTIC)
+    parser.add_argument("--per_class_nms", action="store_true", help="Override and use per-class NMS.")
     parser.add_argument("--preview_dir", type=Path, default=Path("results"))
     parser.add_argument("--preview_count", type=int, default=50)
     parser.add_argument("--device", type=str, default="auto", choices=["auto", "cuda", "cpu"])
@@ -248,6 +258,7 @@ def main() -> None:
         nms_thresh=float(args.nms_thresh),
         class_names=class_names,
         max_objects_per_image=max(1, int(args.max_objects_per_image)),
+        class_agnostic_nms=bool(args.class_agnostic_nms and not args.per_class_nms),
     )
     predictions = apply_class_thresholds(
         predictions=predictions,

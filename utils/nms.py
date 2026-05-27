@@ -6,7 +6,15 @@ import torch
 import torch.nn.functional as F
 import torchvision.ops as ops
 
-from .config import ANCHOR_SIZES, CONF_THRESH, MAX_OBJECTS_PER_IMAGE, NMS_IOU_THRESH, NUM_ANCHORS, STRIDE
+from .config import (
+    ANCHOR_SIZES,
+    CONF_THRESH,
+    MAX_OBJECTS_PER_IMAGE,
+    NMS_CLASS_AGNOSTIC,
+    NMS_IOU_THRESH,
+    NUM_ANCHORS,
+    STRIDE,
+)
 from .process import LetterboxMeta
 
 
@@ -117,6 +125,7 @@ def postprocess_batch(
     stride: int = STRIDE,
     anchor_sizes: Sequence[Tuple[float, float]] = ANCHOR_SIZES,
     max_objects_per_image: int = MAX_OBJECTS_PER_IMAGE,
+    class_agnostic_nms: bool = NMS_CLASS_AGNOSTIC,
 ) -> List[Dict[str, object]]:
     boxes, scores, labels = decode_predictions(
         pred=outputs,
@@ -141,7 +150,10 @@ def postprocess_batch(
             results.append({"image_id": image_ids[i], "boxes": []})
             continue
 
-        nms_keep = ops.batched_nms(b, s, c, float(nms_thresh))
+        if class_agnostic_nms:
+            nms_keep = ops.nms(b, s, float(nms_thresh))
+        else:
+            nms_keep = ops.batched_nms(b, s, c, float(nms_thresh))
         b = b[nms_keep]
         s = s[nms_keep]
         c = c[nms_keep]

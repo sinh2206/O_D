@@ -6,7 +6,16 @@ from typing import Dict, List, Optional, Sequence
 
 import torch
 
-from .config import ANCHOR_SIZES, CLASS_NAMES, CONF_THRESH, IMG_SIZE, MAX_OBJECTS_PER_IMAGE, NMS_IOU_THRESH, STRIDE
+from .config import (
+    ANCHOR_SIZES,
+    CLASS_NAMES,
+    CONF_THRESH,
+    IMG_SIZE,
+    MAX_OBJECTS_PER_IMAGE,
+    NMS_CLASS_AGNOSTIC,
+    NMS_IOU_THRESH,
+    STRIDE,
+)
 from .nms import postprocess_batch
 from .process import LetterboxMeta, letterbox_preprocess
 
@@ -23,6 +32,7 @@ def run_inference(
     class_names: Sequence[str] = CLASS_NAMES,
     stride: int = STRIDE,
     max_objects_per_image: int = MAX_OBJECTS_PER_IMAGE,
+    class_agnostic_nms: bool = NMS_CLASS_AGNOSTIC,
 ) -> List[Dict[str, object]]:
     from .process import imread_unicode
 
@@ -63,6 +73,7 @@ def run_inference(
             stride=int(stride),
             anchor_sizes=ANCHOR_SIZES,
             max_objects_per_image=int(max_objects_per_image),
+            class_agnostic_nms=bool(class_agnostic_nms),
         )
         results.extend(batch_results)
     return results

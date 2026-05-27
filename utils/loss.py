@@ -7,6 +7,8 @@ import torch.nn.functional as F
 
 from .config import (
     ANCHOR_SIZES,
+    HARD_NEGATIVE_MIN,
+    HARD_NEGATIVE_RATIO,
     IOU_IGNORE_THRESH,
     IOU_POS_THRESH,
     LAMBDA_BOX,
@@ -177,7 +179,6 @@ def compute_loss(
     pos_count = int(obj_mask.sum().item())
     neg_count = int(noobj_mask.sum().item())
     pos_norm = max(pos_count, 1)
-    neg_norm = max(neg_count, 1)
 
     if pos_count > 0:
         loss_x = F.smooth_l1_loss(torch.sigmoid(pred_tx[obj_mask]), tx[obj_mask], reduction="sum") / pos_norm
@@ -197,11 +198,18 @@ def compute_loss(
         obj_loss = torch.zeros((), device=device)
 
     if neg_count > 0:
-        noobj_loss = F.binary_cross_entropy_with_logits(
-            pred_obj[noobj_mask],
-            obj_target[noobj_mask],
-            reduction="sum",
-        ) / neg_norm
+        neg_logits = pred_obj[noobj_mask]
+        neg_targets = obj_target[noobj_mask]
+        neg_losses = F.binary_cross_entropy_with_logits(neg_logits, neg_targets, reduction="none")
+
+        if pos_count > 0:
+            keep_k = int(max(float(HARD_NEGATIVE_MIN), float(HARD_NEGATIVE_RATIO) * float(pos_count)))
+        else:
+            keep_k = int(HARD_NEGATIVE_MIN)
+        keep_k = max(1, min(int(neg_losses.numel()), keep_k))
+
+        hard_neg_losses, _ = torch.topk(neg_losses, k=keep_k, largest=True, sorted=False)
+        noobj_loss = hard_neg_losses.mean()
     else:
         noobj_loss = torch.zeros((), device=device)
 
