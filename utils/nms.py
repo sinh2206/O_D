@@ -6,7 +6,7 @@ import torch
 import torch.nn.functional as F
 import torchvision.ops as ops
 
-from .config import ANCHOR_SIZES, CONF_THRESH, NMS_IOU_THRESH, NUM_ANCHORS, STRIDE
+from .config import ANCHOR_SIZES, CONF_THRESH, MAX_OBJECTS_PER_IMAGE, NMS_IOU_THRESH, NUM_ANCHORS, STRIDE
 from .process import LetterboxMeta
 
 
@@ -67,6 +67,45 @@ def _map_boxes_back_to_original(boxes: torch.Tensor, meta: LetterboxMeta) -> tor
     return out
 
 
+def _is_fully_inside_xyxy(inner: torch.Tensor, outer: torch.Tensor) -> bool:
+    return bool(
+        inner[0] >= outer[0]
+        and inner[1] >= outer[1]
+        and inner[2] <= outer[2]
+        and inner[3] <= outer[3]
+    )
+
+
+def _suppress_same_class_contained(
+    boxes: torch.Tensor,
+    scores: torch.Tensor,
+    labels: torch.Tensor,
+) -> torch.Tensor:
+    if boxes.numel() == 0:
+        return torch.zeros((0,), dtype=torch.long, device=boxes.device)
+
+    order = torch.argsort(scores, descending=True)
+    kept: List[int] = []
+
+    for ord_idx in order.tolist():
+        candidate_box = boxes[ord_idx]
+        candidate_cls = int(labels[ord_idx].item())
+        drop = False
+        for kept_idx in kept:
+            if int(labels[kept_idx].item()) != candidate_cls:
+                continue
+            kept_box = boxes[kept_idx]
+            if _is_fully_inside_xyxy(candidate_box, kept_box) or _is_fully_inside_xyxy(kept_box, candidate_box):
+                drop = True
+                break
+        if not drop:
+            kept.append(int(ord_idx))
+
+    if not kept:
+        return torch.zeros((0,), dtype=torch.long, device=boxes.device)
+    return torch.as_tensor(kept, dtype=torch.long, device=boxes.device)
+
+
 def postprocess_batch(
     outputs: torch.Tensor,
     image_ids: Sequence[str],
@@ -77,6 +116,7 @@ def postprocess_batch(
     img_size: int = 320,
     stride: int = STRIDE,
     anchor_sizes: Sequence[Tuple[float, float]] = ANCHOR_SIZES,
+    max_objects_per_image: int = MAX_OBJECTS_PER_IMAGE,
 ) -> List[Dict[str, object]]:
     boxes, scores, labels = decode_predictions(
         pred=outputs,
@@ -105,6 +145,18 @@ def postprocess_batch(
         b = b[nms_keep]
         s = s[nms_keep]
         c = c[nms_keep]
+
+        contained_keep = _suppress_same_class_contained(b, s, c)
+        b = b[contained_keep]
+        s = s[contained_keep]
+        c = c[contained_keep]
+
+        max_keep = max(1, int(max_objects_per_image))
+        if b.shape[0] > max_keep:
+            order = torch.argsort(s, descending=True)[:max_keep]
+            b = b[order]
+            s = s[order]
+            c = c[order]
 
         b = _map_boxes_back_to_original(b, metas[i])
         out_boxes: List[Dict[str, object]] = []

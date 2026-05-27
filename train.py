@@ -16,7 +16,7 @@ from albumentations.pytorch import ToTensorV2
 from torch import nn
 from torch.utils.data import DataLoader, Dataset
 
-from utils.config import CLASS_NAMES, IMG_SIZE, MEAN, STD, STRIDE
+from utils.config import CLASS_NAMES, IMG_SIZE, MAX_OBJECTS_PER_IMAGE, MEAN, STD, STRIDE
 from utils.loss import compute_loss
 from utils.model import YOLOv2Detector
 from utils.runtime import (
@@ -38,6 +38,50 @@ class Sample:
     image_path: Path
     boxes: List[List[float]]
     labels: List[int]
+
+
+def _is_fully_inside(a: List[float], b: List[float]) -> bool:
+    return bool(a[0] >= b[0] and a[1] >= b[1] and a[2] <= b[2] and a[3] <= b[3])
+
+
+def _apply_annotation_constraints(
+    boxes: List[List[float]],
+    labels: List[int],
+    max_objects_per_image: int,
+) -> Tuple[List[List[float]], List[int]]:
+    if len(boxes) <= 1:
+        return boxes[: max(0, int(max_objects_per_image))], labels[: max(0, int(max_objects_per_image))]
+
+    max_keep = max(1, int(max_objects_per_image))
+    order = sorted(
+        range(len(boxes)),
+        key=lambda i: (boxes[i][2] - boxes[i][0]) * (boxes[i][3] - boxes[i][1]),
+        reverse=True,
+    )
+
+    kept_indices: List[int] = []
+    for idx in order:
+        candidate_box = boxes[idx]
+        candidate_label = labels[idx]
+
+        drop = False
+        for kept_idx in kept_indices:
+            if labels[kept_idx] != candidate_label:
+                continue
+            kept_box = boxes[kept_idx]
+            if _is_fully_inside(candidate_box, kept_box) or _is_fully_inside(kept_box, candidate_box):
+                drop = True
+                break
+        if drop:
+            continue
+
+        kept_indices.append(idx)
+        if len(kept_indices) >= max_keep:
+            break
+
+    new_boxes = [boxes[i] for i in kept_indices]
+    new_labels = [labels[i] for i in kept_indices]
+    return new_boxes, new_labels
 
 
 def seed_everything(seed: int) -> None:
@@ -64,7 +108,12 @@ def resolve_image_path(image_dir: Path, file_name: str, image_id: str) -> Option
     return None
 
 
-def parse_samples(annotation_path: Path, image_dir: Path, class_names: Optional[List[str]] = None) -> Tuple[List[Sample], List[str]]:
+def parse_samples(
+    annotation_path: Path,
+    image_dir: Path,
+    class_names: Optional[List[str]] = None,
+    max_objects_per_image: int = MAX_OBJECTS_PER_IMAGE,
+) -> Tuple[List[Sample], List[str]]:
     from utils.process import imread_unicode
 
     data = load_annotation(annotation_path)
@@ -103,6 +152,11 @@ def parse_samples(annotation_path: Path, image_dir: Path, class_names: Optional[
             boxes.append([x1, y1, x2, y2])
             labels.append(cls_to_idx[cls_name])
 
+        boxes, labels = _apply_annotation_constraints(
+            boxes=boxes,
+            labels=labels,
+            max_objects_per_image=max_objects_per_image,
+        )
         samples.append(Sample(image_id=image_id, image_path=image_path, boxes=boxes, labels=labels))
 
     if not samples:
@@ -354,6 +408,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--backbone_lr_factor", type=float, default=0.1)
     parser.add_argument("--warmup_epochs", type=int, default=3)
     parser.add_argument("--num_workers", type=int, default=-1, help="DataLoader workers. Use -1 for auto.")
+    parser.add_argument("--max_objects_per_image", type=int, default=MAX_OBJECTS_PER_IMAGE)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--resume", type=Path, default=None)
     parser.add_argument("--device", type=str, default="auto", choices=["auto", "cuda", "cpu"])
@@ -379,8 +434,18 @@ def main() -> None:
         torch.backends.cudnn.allow_tf32 = True
         torch.set_float32_matmul_precision("high")
 
-    train_samples, classes = parse_samples(args.train_data, args.image_dir, class_names=None)
-    val_samples, _ = parse_samples(args.val_data, args.val_image_dir, class_names=classes)
+    train_samples, classes = parse_samples(
+        args.train_data,
+        args.image_dir,
+        class_names=None,
+        max_objects_per_image=max(1, int(args.max_objects_per_image)),
+    )
+    val_samples, _ = parse_samples(
+        args.val_data,
+        args.val_image_dir,
+        class_names=classes,
+        max_objects_per_image=max(1, int(args.max_objects_per_image)),
+    )
     num_classes = len(classes)
 
     train_ds = DetectionDataset(train_samples, transforms=get_train_transforms(args.img_size))

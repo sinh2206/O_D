@@ -26,6 +26,7 @@ __all__ = [
     "CONF_THRESH",
     "NMS_IOU_THRESH",
     "CLASS_CONF_THRESH",
+    "MAX_OBJECTS_PER_IMAGE",
     "YOLOv2Detector",
     "build_targets",
     "compute_loss",
