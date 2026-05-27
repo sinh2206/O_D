@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import math
 from pathlib import Path
 from typing import List
 
@@ -34,6 +35,99 @@ def save_preview_images(predictions: List[dict], image_dir: Path, preview_dir: P
         if imwrite_unicode(preview_dir / image_id, vis):
             saved += 1
     return saved
+
+
+def sanitize_predictions(predictions: List[dict], image_dir: Path, class_names: List[str]) -> List[dict]:
+    valid_classes = set(class_names)
+    image_size_cache: dict[str, tuple[int, int]] = {}
+    sanitized: List[dict] = []
+
+    for pred in predictions:
+        image_id = str(pred.get("image_id", ""))
+        if not image_id:
+            continue
+
+        if image_id not in image_size_cache:
+            image = imread_unicode(image_dir / image_id)
+            if image is None:
+                image_size_cache[image_id] = (0, 0)
+            else:
+                h, w = image.shape[:2]
+                image_size_cache[image_id] = (int(w), int(h))
+
+        width, height = image_size_cache[image_id]
+        if width <= 0 or height <= 0:
+            sanitized.append({"image_id": image_id, "boxes": []})
+            continue
+
+        clean_boxes = []
+        for box in pred.get("boxes", []):
+            cls_name = str(box.get("class", ""))
+            if cls_name not in valid_classes:
+                continue
+
+            conf = float(box.get("confidence", box.get("score", 0.0)))
+            if not math.isfinite(conf):
+                continue
+            conf = max(0.0, min(1.0, conf))
+
+            bbox = box.get("bbox", [])
+            if not isinstance(bbox, list) or len(bbox) != 4:
+                continue
+
+            try:
+                x1, y1, x2, y2 = [float(v) for v in bbox]
+            except (TypeError, ValueError):
+                continue
+            if not all(math.isfinite(v) for v in (x1, y1, x2, y2)):
+                continue
+
+            x1 = max(0.0, min(float(width), x1))
+            x2 = max(0.0, min(float(width), x2))
+            y1 = max(0.0, min(float(height), y1))
+            y2 = max(0.0, min(float(height), y2))
+
+            xi1 = int(math.floor(x1))
+            yi1 = int(math.floor(y1))
+            xi2 = int(math.ceil(x2))
+            yi2 = int(math.ceil(y2))
+
+            xi1 = max(0, min(width - 1, xi1))
+            yi1 = max(0, min(height - 1, yi1))
+            xi2 = max(0, min(width, xi2))
+            yi2 = max(0, min(height, yi2))
+
+            if xi2 <= xi1:
+                if xi1 < width:
+                    xi2 = xi1 + 1
+                else:
+                    continue
+            if yi2 <= yi1:
+                if yi1 < height:
+                    yi2 = yi1 + 1
+                else:
+                    continue
+
+            if xi2 > width:
+                xi2 = width
+                if xi2 <= xi1:
+                    continue
+            if yi2 > height:
+                yi2 = height
+                if yi2 <= yi1:
+                    continue
+
+            clean_boxes.append(
+                {
+                    "bbox": [int(xi1), int(yi1), int(xi2), int(yi2)],
+                    "class": cls_name,
+                    "confidence": float(conf),
+                }
+            )
+
+        sanitized.append({"image_id": image_id, "boxes": clean_boxes})
+
+    return sanitized
 
 
 def parse_args() -> argparse.Namespace:
@@ -108,6 +202,11 @@ def main() -> None:
     predictions = apply_class_thresholds(
         predictions=predictions,
         class_conf_thresh=class_conf,
+        class_names=class_names,
+    )
+    predictions = sanitize_predictions(
+        predictions=predictions,
+        image_dir=args.image_dir,
         class_names=class_names,
     )
 
