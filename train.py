@@ -14,22 +14,27 @@ import numpy as np
 import torch
 from albumentations.pytorch import ToTensorV2
 from torch import nn
-from torch.utils.data import DataLoader, Dataset
+from torch.optim import AdamW
+from torch.optim.lr_scheduler import CosineAnnealingLR
+from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
 
-from utils.config import CLASS_NAMES, IMG_SIZE, MAX_OBJECTS_PER_IMAGE, MEAN, STD, STRIDE
-from utils.loss import compute_loss
-from utils.model import YOLOv2Detector
-from utils.runtime import (
-    create_grad_scaler,
-    device_summary,
-    get_optimizer,
-    get_scheduler,
-    load_checkpoint,
-    resolve_device,
-    resolve_num_workers,
-    save_checkpoint,
-    should_pin_memory,
+from utils.config import (
+    CLASS_FREQ_PRIOR_TRAIN,
+    CLASS_FREQ_PRIOR_VAL,
+    CLASS_LOSS_WEIGHTS,
+    CLASS_NAMES,
+    CLASS_SAMPLER_WEIGHTS,
+    IMG_SIZE,
+    LABEL_SMOOTHING,
+    MEAN,
+    NUM_CLASSES,
+    STD,
+    STRIDES,
 )
+from utils.loss import DetectionLoss
+from utils.model import AnchorFreeDetector
+
+VALID_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 
 
 @dataclass
@@ -40,48 +45,44 @@ class Sample:
     labels: List[int]
 
 
-def _is_fully_inside(a: List[float], b: List[float]) -> bool:
-    return bool(a[0] >= b[0] and a[1] >= b[1] and a[2] <= b[2] and a[3] <= b[3])
+def compute_class_weights(num_classes: int) -> torch.Tensor:
+    if len(CLASS_FREQ_PRIOR_TRAIN) == num_classes and len(CLASS_FREQ_PRIOR_VAL) == num_classes:
+        p = 0.5 * (np.asarray(CLASS_FREQ_PRIOR_TRAIN, dtype=np.float64) + np.asarray(CLASS_FREQ_PRIOR_VAL, dtype=np.float64))
+        p = np.clip(p, 1e-6, None)
+        p = p / p.sum()
+        w = 1.0 / np.sqrt(p)
+    else:
+        w = np.ones((num_classes,), dtype=np.float64)
+
+    if len(CLASS_LOSS_WEIGHTS) == num_classes:
+        w = w * np.asarray(CLASS_LOSS_WEIGHTS, dtype=np.float64)
+
+    w = w / max(w.mean(), 1e-12)
+    w = np.clip(w, 0.55, 2.5)
+    return torch.as_tensor(w, dtype=torch.float32)
 
 
-def _apply_annotation_constraints(
-    boxes: List[List[float]],
-    labels: List[int],
-    max_objects_per_image: int,
-) -> Tuple[List[List[float]], List[int]]:
-    if len(boxes) <= 1:
-        return boxes[: max(0, int(max_objects_per_image))], labels[: max(0, int(max_objects_per_image))]
+def build_sample_weights(samples: List[Sample], class_weights: torch.Tensor) -> torch.Tensor:
+    cw = class_weights.cpu().numpy().astype(np.float64)
+    class_sampler_weights = np.asarray(CLASS_SAMPLER_WEIGHTS, dtype=np.float64)
+    if class_sampler_weights.size != cw.size:
+        class_sampler_weights = np.ones_like(cw)
 
-    max_keep = max(1, int(max_objects_per_image))
-    order = sorted(
-        range(len(boxes)),
-        key=lambda i: (boxes[i][2] - boxes[i][0]) * (boxes[i][3] - boxes[i][1]),
-        reverse=True,
-    )
-
-    kept_indices: List[int] = []
-    for idx in order:
-        candidate_box = boxes[idx]
-        candidate_label = labels[idx]
-
-        drop = False
-        for kept_idx in kept_indices:
-            if labels[kept_idx] != candidate_label:
-                continue
-            kept_box = boxes[kept_idx]
-            if _is_fully_inside(candidate_box, kept_box) or _is_fully_inside(kept_box, candidate_box):
-                drop = True
-                break
-        if drop:
+    ws = np.ones((len(samples),), dtype=np.float64)
+    for i, s in enumerate(samples):
+        if len(s.labels) == 0:
+            ws[i] = 0.9
             continue
+        uniq = np.unique(np.asarray(s.labels, dtype=np.int64))
+        uniq = uniq[(uniq >= 0) & (uniq < len(cw))]
+        if uniq.size == 0:
+            ws[i] = 1.0
+            continue
+        ws[i] = float(np.max(cw[uniq] * class_sampler_weights[uniq]))
 
-        kept_indices.append(idx)
-        if len(kept_indices) >= max_keep:
-            break
-
-    new_boxes = [boxes[i] for i in kept_indices]
-    new_labels = [labels[i] for i in kept_indices]
-    return new_boxes, new_labels
+    ws = ws / max(ws.mean(), 1e-12)
+    ws = np.clip(ws, 0.25, 4.5)
+    return torch.as_tensor(ws, dtype=torch.double)
 
 
 def seed_everything(seed: int) -> None:
@@ -91,80 +92,84 @@ def seed_everything(seed: int) -> None:
     torch.cuda.manual_seed_all(seed)
 
 
-def load_annotation(path: Path) -> dict:
-    with path.open("r", encoding="utf-8") as f:
+def imread_unicode(path: Path) -> Optional[np.ndarray]:
+    if not path.exists():
+        return None
+    arr = np.fromfile(str(path), dtype=np.uint8)
+    if arr.size == 0:
+        return None
+    return cv2.imdecode(arr, cv2.IMREAD_COLOR)
+
+
+def enhance_low_light_bgr(image_bgr: np.ndarray) -> np.ndarray:
+    gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
+    if float(gray.mean()) >= 82.0:
+        return image_bgr
+
+    lab = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2LAB)
+    l, a, b = cv2.split(lab)
+    clahe = cv2.createCLAHE(clipLimit=2.2, tileGridSize=(8, 8))
+    l = clahe.apply(l)
+    merged = cv2.merge([l, a, b])
+    out = cv2.cvtColor(merged, cv2.COLOR_LAB2BGR)
+
+    lut = np.array([((i / 255.0) ** 0.82) * 255.0 for i in range(256)], dtype=np.float32)
+    lut = np.clip(lut, 0, 255).astype(np.uint8)
+    out = cv2.LUT(out, lut)
+    return out
+
+
+def load_annotation(annotation_path: Path) -> dict:
+    with annotation_path.open("r", encoding="utf-8") as f:
         return json.load(f)
 
 
-def resolve_image_path(image_dir: Path, file_name: str, image_id: str) -> Optional[Path]:
-    candidates = [
-        image_dir / Path(file_name).name,
-        image_dir / file_name,
-        image_dir / image_id,
-    ]
-    for p in candidates:
-        if p.exists():
-            return p
-    return None
-
-
-def parse_samples(
-    annotation_path: Path,
-    image_dir: Path,
-    class_names: Optional[List[str]] = None,
-    max_objects_per_image: int = MAX_OBJECTS_PER_IMAGE,
-) -> Tuple[List[Sample], List[str]]:
-    from utils.process import imread_unicode
-
+def parse_samples(annotation_path: Path, image_dir: Path, class_names: Optional[List[str]] = None) -> Tuple[List[Sample], List[str]]:
     data = load_annotation(annotation_path)
-    classes = class_names if class_names is not None else list(data.get("classes", CLASS_NAMES))
-    cls_to_idx = {name: i for i, name in enumerate(classes)}
+    json_classes = data.get("classes", [])
+    classes = class_names if class_names is not None else (json_classes if json_classes else CLASS_NAMES)
+    class_to_idx = {c: i for i, c in enumerate(classes)}
 
     images = data.get("images", [])
     annotations = data.get("annotations", [])
+
     ann_by_image: Dict[str, List[dict]] = {}
     for ann in annotations:
-        image_id = str(ann.get("image_id"))
+        image_id = ann.get("image_id")
         ann_by_image.setdefault(image_id, []).append(ann)
 
     samples: List[Sample] = []
     for im in images:
         image_id = str(im.get("id"))
-        file_name = str(im.get("file_name", image_id))
-        image_path = resolve_image_path(image_dir, file_name=file_name, image_id=image_id)
-        if image_path is None:
-            continue
-        if imread_unicode(image_path) is None:
-            continue
+        file_name = Path(str(im.get("file_name", image_id))).name
+        image_path = image_dir / file_name
+        if not image_path.exists():
+            fallback = image_dir / image_id
+            if fallback.exists():
+                image_path = fallback
+            else:
+                continue
 
         boxes: List[List[float]] = []
         labels: List[int] = []
         for ann in ann_by_image.get(image_id, []):
-            cls_name = str(ann.get("class", ""))
-            if cls_name not in cls_to_idx:
+            cls_name = ann.get("class")
+            if cls_name not in class_to_idx:
                 continue
-            box = ann.get("bbox", [0, 0, 0, 0])
-            if len(box) != 4:
-                continue
-            x1, y1, x2, y2 = [float(v) for v in box]
+            x1, y1, x2, y2 = [float(v) for v in ann.get("bbox", [0, 0, 0, 0])]
             if x2 <= x1 or y2 <= y1:
                 continue
             boxes.append([x1, y1, x2, y2])
-            labels.append(cls_to_idx[cls_name])
+            labels.append(class_to_idx[cls_name])
 
-        boxes, labels = _apply_annotation_constraints(
-            boxes=boxes,
-            labels=labels,
-            max_objects_per_image=max_objects_per_image,
-        )
         samples.append(Sample(image_id=image_id, image_path=image_path, boxes=boxes, labels=labels))
 
     if not samples:
-        raise ValueError(f"No valid samples found in {annotation_path} for image_dir={image_dir}")
+        raise ValueError(f"No valid samples from {annotation_path} with image_dir={image_dir}")
     return samples, classes
 
 
-def make_pad_if_needed(img_size: int) -> A.BasicTransform:
+def make_pad_if_needed(img_size: int):
     params = inspect.signature(A.PadIfNeeded.__init__).parameters
     kwargs = {
         "min_height": img_size,
@@ -184,21 +189,51 @@ def make_pad_if_needed(img_size: int) -> A.BasicTransform:
 
 
 def get_train_transforms(img_size: int) -> A.Compose:
+    affine_params = inspect.signature(A.Affine.__init__).parameters
+    affine_kwargs = dict(
+        scale=(0.92, 1.08),
+        translate_percent=(-0.06, 0.06),
+        rotate=(-5, 5),
+        shear=(-1.5, 1.5),
+        p=0.25,
+    )
+    if "border_mode" in affine_params:
+        affine_kwargs["border_mode"] = cv2.BORDER_CONSTANT
+    elif "mode" in affine_params:
+        affine_kwargs["mode"] = cv2.BORDER_CONSTANT
+
+    if "fill" in affine_params:
+        affine_kwargs["fill"] = (114, 114, 114)
+        if "fill_mask" in affine_params:
+            affine_kwargs["fill_mask"] = 0
+    elif "value" in affine_params:
+        affine_kwargs["value"] = (114, 114, 114)
+        if "mask_value" in affine_params:
+            affine_kwargs["mask_value"] = 0
+    elif "cval" in affine_params:
+        affine_kwargs["cval"] = (114, 114, 114)
+        if "cval_mask" in affine_params:
+            affine_kwargs["cval_mask"] = 0
+
+    affine = A.Affine(**affine_kwargs)
+
     return A.Compose(
         [
             A.LongestMaxSize(max_size=img_size, interpolation=cv2.INTER_LINEAR),
             make_pad_if_needed(img_size),
             A.HorizontalFlip(p=0.5),
-            A.ColorJitter(brightness=0.12, contrast=0.12, saturation=0.1, hue=0.05, p=0.35),
             A.CLAHE(clip_limit=2.2, tile_grid_size=(8, 8), p=0.2),
+            A.RandomGamma(gamma_limit=(88, 122), p=0.25),
+            A.ColorJitter(brightness=0.12, contrast=0.12, saturation=0.1, hue=0.05, p=0.45),
+            affine,
             A.Normalize(mean=MEAN, std=STD),
             ToTensorV2(),
         ],
         bbox_params=A.BboxParams(
             format="pascal_voc",
             label_fields=["class_labels"],
-            min_area=1.0,
-            min_visibility=0.0,
+            min_area=4.0,
+            min_visibility=0.2,
             clip=True,
         ),
     )
@@ -223,7 +258,7 @@ def get_val_transforms(img_size: int) -> A.Compose:
 
 
 class DetectionDataset(Dataset):
-    def __init__(self, samples: List[Sample], transforms: A.Compose) -> None:
+    def __init__(self, samples: List[Sample], transforms: A.Compose):
         self.samples = samples
         self.transforms = transforms
 
@@ -231,22 +266,17 @@ class DetectionDataset(Dataset):
         return len(self.samples)
 
     def __getitem__(self, idx: int):
-        from utils.process import enhance_low_light_bgr, imread_unicode
-
         sample = self.samples[idx]
         image = imread_unicode(sample.image_path)
         if image is None:
-            raise FileNotFoundError(f"Failed to read image: {sample.image_path}")
-
+            raise FileNotFoundError(f"Cannot read image: {sample.image_path}")
         image = enhance_low_light_bgr(image)
         image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
 
-        transformed = self.transforms(
-            image=image,
-            bboxes=[list(b) for b in sample.boxes],
-            class_labels=list(sample.labels),
-        )
+        bboxes = [list(b) for b in sample.boxes]
+        class_labels = list(sample.labels)
 
+        transformed = self.transforms(image=image, bboxes=bboxes, class_labels=class_labels)
         img_t = transformed["image"].float()
         out_boxes = transformed["bboxes"]
         out_labels = transformed["class_labels"]
@@ -255,30 +285,34 @@ class DetectionDataset(Dataset):
             boxes_t = torch.zeros((0, 4), dtype=torch.float32)
             labels_t = torch.zeros((0,), dtype=torch.long)
         else:
-            boxes_t = torch.as_tensor(np.asarray(out_boxes, dtype=np.float32))
-            labels_t = torch.as_tensor(np.asarray(out_labels, dtype=np.int64))
+            boxes_t = torch.as_tensor(np.array(out_boxes, dtype=np.float32))
+            labels_t = torch.as_tensor(np.array(out_labels, dtype=np.int64))
 
-        target = {"boxes": boxes_t, "labels": labels_t, "image_id": sample.image_id}
+        target = {
+            "boxes": boxes_t,
+            "labels": labels_t,
+            "image_id": sample.image_id,
+        }
         return img_t, target
 
 
 def collate_fn(batch):
-    images = torch.stack([item[0] for item in batch], dim=0)
-    targets = [item[1] for item in batch]
+    images = torch.stack([x[0] for x in batch], dim=0)
+    targets = [x[1] for x in batch]
     return images, targets
 
 
 def move_targets_to_device(targets: List[dict], device: torch.device) -> List[dict]:
-    moved: List[dict] = []
+    out = []
     for t in targets:
-        moved.append(
+        out.append(
             {
-                "boxes": t["boxes"].to(device=device, dtype=torch.float32),
-                "labels": t["labels"].to(device=device, dtype=torch.long),
+                "boxes": t["boxes"].to(device),
+                "labels": t["labels"].to(device),
                 "image_id": t["image_id"],
             }
         )
-    return moved
+    return out
 
 
 def make_dataloader(
@@ -286,42 +320,32 @@ def make_dataloader(
     batch_size: int,
     shuffle: bool,
     num_workers: int,
-    pin_memory: bool,
+    sampler: Optional[WeightedRandomSampler] = None,
 ) -> DataLoader:
     return DataLoader(
-        dataset=dataset,
+        dataset,
         batch_size=batch_size,
-        shuffle=shuffle,
+        shuffle=(shuffle and sampler is None),
+        sampler=sampler,
         num_workers=num_workers,
-        pin_memory=pin_memory,
+        pin_memory=True,
         persistent_workers=(num_workers > 0),
-        collate_fn=collate_fn,
         drop_last=False,
+        collate_fn=collate_fn,
     )
-
-
-def _empty_train_metrics() -> Dict[str, float]:
-    return {
-        "loss": float("inf"),
-        "loss_obj": float("inf"),
-        "loss_noobj": float("inf"),
-        "loss_box": float("inf"),
-        "loss_cls": float("inf"),
-        "mean_iou_pos": 0.0,
-    }
 
 
 def train_one_epoch(
     model: nn.Module,
+    criterion: nn.Module,
     loader: DataLoader,
     optimizer: torch.optim.Optimizer,
-    scaler,
     device: torch.device,
+    scaler: torch.cuda.amp.GradScaler,
     amp_enabled: bool,
-    img_size: int,
 ) -> Dict[str, float]:
     model.train()
-    running = {"loss": 0.0, "loss_obj": 0.0, "loss_noobj": 0.0, "loss_box": 0.0, "loss_cls": 0.0, "mean_iou_pos": 0.0}
+    running = {"loss": 0.0, "loss_cls": 0.0, "loss_reg": 0.0, "loss_ctr": 0.0}
     steps = 0
 
     for images, targets in loader:
@@ -331,40 +355,37 @@ def train_one_epoch(
         optimizer.zero_grad(set_to_none=True)
         with torch.autocast(device_type=device.type, enabled=amp_enabled):
             outputs = model(images)
-            loss, loss_dict = compute_loss(
-                predictions=outputs,
-                targets_list=targets,
-                device=device,
-                stride=STRIDE,
-                img_size=img_size,
-            )
+            loss_dict = criterion(outputs, targets)
+            loss = loss_dict["loss"]
 
-        if not torch.isfinite(loss):
+        if torch.isnan(loss) or torch.isinf(loss):
             continue
 
         scaler.scale(loss).backward()
         scaler.step(optimizer)
         scaler.update()
 
-        for key in running:
-            running[key] += float(loss_dict[key])
+        running["loss"] += float(loss.detach().item())
+        running["loss_cls"] += float(loss_dict["loss_cls"].item())
+        running["loss_reg"] += float(loss_dict["loss_reg"].item())
+        running["loss_ctr"] += float(loss_dict["loss_ctr"].item())
         steps += 1
 
     if steps == 0:
-        return _empty_train_metrics()
+        return {k: float("inf") for k in running}
     return {k: v / steps for k, v in running.items()}
 
 
 @torch.no_grad()
 def validate_one_epoch(
     model: nn.Module,
+    criterion: nn.Module,
     loader: DataLoader,
     device: torch.device,
     amp_enabled: bool,
-    img_size: int,
 ) -> Dict[str, float]:
     model.eval()
-    running = {"loss": 0.0, "loss_obj": 0.0, "loss_noobj": 0.0, "loss_box": 0.0, "loss_cls": 0.0, "mean_iou_pos": 0.0}
+    running = {"loss": 0.0, "loss_cls": 0.0, "loss_reg": 0.0, "loss_ctr": 0.0}
     steps = 0
 
     for images, targets in loader:
@@ -373,172 +394,189 @@ def validate_one_epoch(
 
         with torch.autocast(device_type=device.type, enabled=amp_enabled):
             outputs = model(images)
-            loss, loss_dict = compute_loss(
-                predictions=outputs,
-                targets_list=targets,
-                device=device,
-                stride=STRIDE,
-                img_size=img_size,
-            )
+            loss_dict = criterion(outputs, targets)
+            loss = loss_dict["loss"]
 
-        if not torch.isfinite(loss):
-            continue
-
-        for key in running:
-            running[key] += float(loss_dict[key])
+        running["loss"] += float(loss.detach().item())
+        running["loss_cls"] += float(loss_dict["loss_cls"].item())
+        running["loss_reg"] += float(loss_dict["loss_reg"].item())
+        running["loss_ctr"] += float(loss_dict["loss_ctr"].item())
         steps += 1
 
     if steps == 0:
-        return _empty_train_metrics()
+        return {k: float("inf") for k in running}
     return {k: v / steps for k, v in running.items()}
 
 
+def build_optimizer(model: AnchorFreeDetector, lr_backbone: float, lr_head: float, weight_decay: float) -> torch.optim.Optimizer:
+    backbone_params = list(model.backbone_fpn.parameters())
+    head_params = list(model.head_s16.parameters()) + list(model.head_s32.parameters())
+
+    return AdamW(
+        [
+            {"params": backbone_params, "lr": lr_backbone},
+            {"params": head_params, "lr": lr_head},
+        ],
+        weight_decay=weight_decay,
+    )
+
+
+def save_checkpoint(
+    path: Path,
+    model: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    scheduler: CosineAnnealingLR,
+    epoch: int,
+    best_val_loss: float,
+    classes: List[str],
+    img_size: int,
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(
+        {
+            "model_state_dict": model.state_dict(),
+            "optimizer_state_dict": optimizer.state_dict(),
+            "scheduler_state_dict": scheduler.state_dict(),
+            "epoch": epoch,
+            "best_val_loss": best_val_loss,
+            "classes": classes,
+            "img_size": img_size,
+            "strides": STRIDES,
+        },
+        str(path),
+    )
+
+
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Train YOLOv2-style detector (single stride-32 grid).")
+    parser = argparse.ArgumentParser(description="Train FCOS-style anchor-free detector (ResNet34 + 2-level FPN).")
     parser.add_argument("--train_data", type=Path, required=True)
     parser.add_argument("--val_data", type=Path, required=True)
     parser.add_argument("--image_dir", type=Path, required=True)
     parser.add_argument("--val_image_dir", type=Path, required=True)
     parser.add_argument("--checkpoint_dir", type=Path, default=Path("./models"))
     parser.add_argument("--img_size", type=int, default=IMG_SIZE)
-    parser.add_argument("--batch_size", type=int, default=16)
-    parser.add_argument("--epochs", type=int, default=40)
-    parser.add_argument("--lr", type=float, default=2e-3)
+    parser.add_argument("--batch_size", type=int, default=20)
+    parser.add_argument("--epochs", type=int, default=35)
+    parser.add_argument("--lr_backbone", type=float, default=2e-4)
+    parser.add_argument("--lr_head", type=float, default=2e-3)
     parser.add_argument("--weight_decay", type=float, default=1e-4)
-    parser.add_argument("--backbone_lr_factor", type=float, default=0.1)
-    parser.add_argument("--warmup_epochs", type=int, default=3)
-    parser.add_argument("--num_workers", type=int, default=-1, help="DataLoader workers. Use -1 for auto.")
-    parser.add_argument("--max_objects_per_image", type=int, default=MAX_OBJECTS_PER_IMAGE)
+    parser.add_argument("--num_workers", type=int, default=6)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--resume", type=Path, default=None)
-    parser.add_argument("--device", type=str, default="auto", choices=["auto", "cuda", "cpu"])
+    parser.add_argument("--label_smoothing", type=float, default=LABEL_SMOOTHING)
+    parser.add_argument("--center_radius", type=float, default=1.3)
+    parser.add_argument("--no_scale_ranges", action="store_true")
+    parser.add_argument("--no_balanced_sampling", action="store_true")
+    parser.add_argument("--no_class_weights", action="store_true")
     parser.add_argument("--no_amp", action="store_true")
-    parser.add_argument("--no_pretrained", action="store_true")
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
-    if args.img_size % STRIDE != 0:
-        raise ValueError(f"--img_size must be divisible by STRIDE={STRIDE}, got {args.img_size}")
-
     seed_everything(args.seed)
-    device = resolve_device(args.device)
+    torch.backends.cudnn.benchmark = True
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    torch.set_float32_matmul_precision("high")
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     amp_enabled = (device.type == "cuda") and (not args.no_amp)
-    num_workers, max_safe_workers = resolve_num_workers(args.num_workers)
-    pin_memory = should_pin_memory(device)
 
-    if device.type == "cuda":
-        torch.backends.cudnn.benchmark = True
-        torch.backends.cuda.matmul.allow_tf32 = True
-        torch.backends.cudnn.allow_tf32 = True
-        torch.set_float32_matmul_precision("high")
-
-    train_samples, classes = parse_samples(
-        args.train_data,
-        args.image_dir,
-        class_names=None,
-        max_objects_per_image=max(1, int(args.max_objects_per_image)),
-    )
-    val_samples, _ = parse_samples(
-        args.val_data,
-        args.val_image_dir,
-        class_names=classes,
-        max_objects_per_image=max(1, int(args.max_objects_per_image)),
-    )
+    train_samples, classes = parse_samples(args.train_data, args.image_dir, class_names=None)
+    val_samples, _ = parse_samples(args.val_data, args.val_image_dir, class_names=classes)
     num_classes = len(classes)
 
     train_ds = DetectionDataset(train_samples, transforms=get_train_transforms(args.img_size))
     val_ds = DetectionDataset(val_samples, transforms=get_val_transforms(args.img_size))
 
-    train_loader = make_dataloader(
-        dataset=train_ds,
-        batch_size=max(1, args.batch_size),
-        shuffle=True,
-        num_workers=num_workers,
-        pin_memory=pin_memory,
-    )
-    val_loader = make_dataloader(
-        dataset=val_ds,
-        batch_size=max(1, args.batch_size),
-        shuffle=False,
-        num_workers=num_workers,
-        pin_memory=pin_memory,
-    )
+    class_weights = None if args.no_class_weights else compute_class_weights(num_classes=num_classes)
+    train_sampler = None
+    if not args.no_balanced_sampling and class_weights is not None:
+        sample_weights = build_sample_weights(train_samples, class_weights)
+        train_sampler = WeightedRandomSampler(
+            weights=sample_weights,
+            num_samples=len(sample_weights),
+            replacement=True,
+        )
 
-    model = YOLOv2Detector(
+    train_loader = make_dataloader(
+        train_ds,
+        batch_size=args.batch_size,
+        shuffle=True,
+        num_workers=args.num_workers,
+        sampler=train_sampler,
+    )
+    val_loader = make_dataloader(val_ds, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers)
+
+    model = AnchorFreeDetector(num_classes=num_classes, pretrained=True).to(device).to(memory_format=torch.channels_last)
+    criterion = DetectionLoss(
         num_classes=num_classes,
-        pretrained=not args.no_pretrained,
-    ).to(device).to(memory_format=torch.channels_last)
-    optimizer = get_optimizer(
-        model=model,
-        lr=args.lr,
-        weight_decay=args.weight_decay,
-        backbone_lr_factor=args.backbone_lr_factor,
-    )
-    scheduler = get_scheduler(
-        optimizer=optimizer,
-        epochs=args.epochs,
-        warmup_epochs=args.warmup_epochs,
-    )
-    scaler = create_grad_scaler(device=device, enabled=amp_enabled)
+        strides=STRIDES,
+        class_weights=class_weights,
+        label_smoothing=float(args.label_smoothing),
+        center_radius=float(args.center_radius),
+        use_scale_ranges=not args.no_scale_ranges,
+    ).to(device)
+    optimizer = build_optimizer(model, lr_backbone=args.lr_backbone, lr_head=args.lr_head, weight_decay=args.weight_decay)
+    scheduler = CosineAnnealingLR(optimizer, T_max=max(args.epochs, 1))
+    scaler = torch.cuda.amp.GradScaler(enabled=amp_enabled)
 
     start_epoch = 1
     best_val_loss = float("inf")
     if args.resume is not None and args.resume.exists():
-        loaded_epoch, loaded_best = load_checkpoint(
-            path=args.resume,
-            model=model,
-            optimizer=optimizer,
-            scheduler=scheduler,
-            map_location=device,
-        )
-        start_epoch = loaded_epoch + 1
-        best_val_loss = loaded_best
+        ckpt = torch.load(str(args.resume), map_location=device)
+        model.load_state_dict(ckpt["model_state_dict"], strict=True)
+        if "optimizer_state_dict" in ckpt:
+            optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+        if "scheduler_state_dict" in ckpt:
+            scheduler.load_state_dict(ckpt["scheduler_state_dict"])
+        start_epoch = int(ckpt.get("epoch", 0)) + 1
+        best_val_loss = float(ckpt.get("best_val_loss", float("inf")))
 
     args.checkpoint_dir.mkdir(parents=True, exist_ok=True)
     best_path = args.checkpoint_dir / "best.pth"
     last_path = args.checkpoint_dir / "last.pth"
 
-    print(f"Device: {device_summary(device)}, AMP: {amp_enabled}")
-    if args.num_workers >= 0 and args.num_workers != num_workers:
-        print(f"Requested num_workers={args.num_workers} exceeds safe limit; using {num_workers}.")
-    print(f"DataLoader workers: {num_workers} (max safe: {max_safe_workers}), pin_memory: {pin_memory}")
+    print(f"Device: {device}, AMP: {amp_enabled}")
     print(f"Train samples: {len(train_ds)}, Val samples: {len(val_ds)}, Classes: {classes}")
+    print(f"Balanced sampling: {not args.no_balanced_sampling}")
+    print(f"Class weights enabled: {not args.no_class_weights}")
+    if class_weights is not None:
+        print(f"Class weights: {[round(x, 4) for x in class_weights.tolist()]}")
 
     for epoch in range(start_epoch, args.epochs + 1):
         train_metrics = train_one_epoch(
             model=model,
+            criterion=criterion,
             loader=train_loader,
             optimizer=optimizer,
-            scaler=scaler,
             device=device,
+            scaler=scaler,
             amp_enabled=amp_enabled,
-            img_size=args.img_size,
         )
         val_metrics = validate_one_epoch(
             model=model,
+            criterion=criterion,
             loader=val_loader,
             device=device,
             amp_enabled=amp_enabled,
-            img_size=args.img_size,
         )
         scheduler.step()
 
         print(
             f"Epoch {epoch:03d}/{args.epochs:03d} | "
             f"train_loss={train_metrics['loss']:.4f} "
-            f"(obj={train_metrics['loss_obj']:.4f}, noobj={train_metrics['loss_noobj']:.4f}, "
-            f"box={train_metrics['loss_box']:.4f}, cls={train_metrics['loss_cls']:.4f}, iou={train_metrics['mean_iou_pos']:.4f}) | "
+            f"(cls={train_metrics['loss_cls']:.4f}, reg={train_metrics['loss_reg']:.4f}, ctr={train_metrics['loss_ctr']:.4f}) | "
             f"val_loss={val_metrics['loss']:.4f}"
         )
 
         save_checkpoint(
             path=last_path,
-            epoch=epoch,
             model=model,
             optimizer=optimizer,
             scheduler=scheduler,
+            epoch=epoch,
             best_val_loss=best_val_loss,
             classes=classes,
             img_size=args.img_size,
@@ -548,10 +586,10 @@ def main() -> None:
             best_val_loss = val_metrics["loss"]
             save_checkpoint(
                 path=best_path,
-                epoch=epoch,
                 model=model,
                 optimizer=optimizer,
                 scheduler=scheduler,
+                epoch=epoch,
                 best_val_loss=best_val_loss,
                 classes=classes,
                 img_size=args.img_size,
@@ -561,10 +599,10 @@ def main() -> None:
     if not best_path.exists():
         save_checkpoint(
             path=best_path,
-            epoch=args.epochs,
             model=model,
             optimizer=optimizer,
             scheduler=scheduler,
+            epoch=args.epochs,
             best_val_loss=best_val_loss,
             classes=classes,
             img_size=args.img_size,
