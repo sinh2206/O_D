@@ -14,6 +14,7 @@ import numpy as np
 import torch
 from albumentations.pytorch import ToTensorV2
 from torch import nn
+from torch.nn.utils import clip_grad_norm_
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
@@ -26,6 +27,8 @@ from utils.config import (
     CLASS_SAMPLER_WEIGHTS,
     IMG_SIZE,
     LABEL_SMOOTHING,
+    LAMBDA_CTR,
+    LAMBDA_REG_L1,
     MEAN,
     NUM_CLASSES,
     STD,
@@ -33,6 +36,7 @@ from utils.config import (
 )
 from utils.loss import DetectionLoss
 from utils.model import AnchorFreeDetector
+from utils.runtime import create_grad_scaler, resolve_device, resolve_num_workers, should_pin_memory
 
 VALID_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 
@@ -219,12 +223,20 @@ def get_train_transforms(img_size: int) -> A.Compose:
 
     return A.Compose(
         [
+            A.OneOf(
+                [
+                    A.NoOp(p=1.0),
+                    A.RandomSizedBBoxSafeCrop(height=img_size, width=img_size, erosion_rate=0.05, p=1.0),
+                ],
+                p=0.25,
+            ),
             A.LongestMaxSize(max_size=img_size, interpolation=cv2.INTER_LINEAR),
             make_pad_if_needed(img_size),
             A.HorizontalFlip(p=0.5),
             A.CLAHE(clip_limit=2.2, tile_grid_size=(8, 8), p=0.2),
             A.RandomGamma(gamma_limit=(88, 122), p=0.25),
             A.ColorJitter(brightness=0.12, contrast=0.12, saturation=0.1, hue=0.05, p=0.45),
+            A.MotionBlur(blur_limit=3, p=0.12),
             affine,
             A.Normalize(mean=MEAN, std=STD),
             ToTensorV2(),
@@ -320,6 +332,7 @@ def make_dataloader(
     batch_size: int,
     shuffle: bool,
     num_workers: int,
+    pin_memory: bool,
     sampler: Optional[WeightedRandomSampler] = None,
 ) -> DataLoader:
     return DataLoader(
@@ -328,7 +341,7 @@ def make_dataloader(
         shuffle=(shuffle and sampler is None),
         sampler=sampler,
         num_workers=num_workers,
-        pin_memory=True,
+        pin_memory=bool(pin_memory),
         persistent_workers=(num_workers > 0),
         drop_last=False,
         collate_fn=collate_fn,
@@ -343,6 +356,7 @@ def train_one_epoch(
     device: torch.device,
     scaler: torch.cuda.amp.GradScaler,
     amp_enabled: bool,
+    grad_clip_norm: float = 0.0,
 ) -> Dict[str, float]:
     model.train()
     running = {"loss": 0.0, "loss_cls": 0.0, "loss_reg": 0.0, "loss_ctr": 0.0}
@@ -362,6 +376,9 @@ def train_one_epoch(
             continue
 
         scaler.scale(loss).backward()
+        if grad_clip_norm and grad_clip_norm > 0:
+            scaler.unscale_(optimizer)
+            clip_grad_norm_(model.parameters(), max_norm=float(grad_clip_norm))
         scaler.step(optimizer)
         scaler.update()
 
@@ -456,15 +473,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--checkpoint_dir", type=Path, default=Path("./models"))
     parser.add_argument("--img_size", type=int, default=IMG_SIZE)
     parser.add_argument("--batch_size", type=int, default=20)
-    parser.add_argument("--epochs", type=int, default=35)
+    parser.add_argument("--epochs", type=int, default=45)
     parser.add_argument("--lr_backbone", type=float, default=2e-4)
     parser.add_argument("--lr_head", type=float, default=2e-3)
     parser.add_argument("--weight_decay", type=float, default=1e-4)
-    parser.add_argument("--num_workers", type=int, default=6)
+    parser.add_argument("--num_workers", type=int, default=-1)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--resume", type=Path, default=None)
     parser.add_argument("--label_smoothing", type=float, default=LABEL_SMOOTHING)
-    parser.add_argument("--center_radius", type=float, default=1.3)
+    parser.add_argument("--center_radius", type=float, default=1.6)
+    parser.add_argument("--lambda_ctr", type=float, default=LAMBDA_CTR)
+    parser.add_argument("--lambda_reg_l1", type=float, default=LAMBDA_REG_L1)
+    parser.add_argument("--grad_clip_norm", type=float, default=10.0)
     parser.add_argument("--no_scale_ranges", action="store_true")
     parser.add_argument("--no_balanced_sampling", action="store_true")
     parser.add_argument("--no_class_weights", action="store_true")
@@ -480,8 +500,10 @@ def main() -> None:
     torch.backends.cudnn.allow_tf32 = True
     torch.set_float32_matmul_precision("high")
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = resolve_device("auto")
     amp_enabled = (device.type == "cuda") and (not args.no_amp)
+    resolved_workers, max_safe_workers = resolve_num_workers(int(args.num_workers))
+    pin_memory = should_pin_memory(device)
 
     train_samples, classes = parse_samples(args.train_data, args.image_dir, class_names=None)
     val_samples, _ = parse_samples(args.val_data, args.val_image_dir, class_names=classes)
@@ -504,10 +526,17 @@ def main() -> None:
         train_ds,
         batch_size=args.batch_size,
         shuffle=True,
-        num_workers=args.num_workers,
+        num_workers=resolved_workers,
+        pin_memory=pin_memory,
         sampler=train_sampler,
     )
-    val_loader = make_dataloader(val_ds, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers)
+    val_loader = make_dataloader(
+        val_ds,
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=resolved_workers,
+        pin_memory=pin_memory,
+    )
 
     model = AnchorFreeDetector(num_classes=num_classes, pretrained=True).to(device).to(memory_format=torch.channels_last)
     criterion = DetectionLoss(
@@ -516,11 +545,13 @@ def main() -> None:
         class_weights=class_weights,
         label_smoothing=float(args.label_smoothing),
         center_radius=float(args.center_radius),
+        lambda_ctr=float(args.lambda_ctr),
+        lambda_reg_l1=float(args.lambda_reg_l1),
         use_scale_ranges=not args.no_scale_ranges,
     ).to(device)
     optimizer = build_optimizer(model, lr_backbone=args.lr_backbone, lr_head=args.lr_head, weight_decay=args.weight_decay)
     scheduler = CosineAnnealingLR(optimizer, T_max=max(args.epochs, 1))
-    scaler = torch.cuda.amp.GradScaler(enabled=amp_enabled)
+    scaler = create_grad_scaler(device=device, enabled=amp_enabled)
 
     start_epoch = 1
     best_val_loss = float("inf")
@@ -539,6 +570,7 @@ def main() -> None:
     last_path = args.checkpoint_dir / "last.pth"
 
     print(f"Device: {device}, AMP: {amp_enabled}")
+    print(f"DataLoader workers: {resolved_workers} (max_safe={max_safe_workers}), pin_memory={pin_memory}")
     print(f"Train samples: {len(train_ds)}, Val samples: {len(val_ds)}, Classes: {classes}")
     print(f"Balanced sampling: {not args.no_balanced_sampling}")
     print(f"Class weights enabled: {not args.no_class_weights}")
@@ -554,6 +586,7 @@ def main() -> None:
             device=device,
             scaler=scaler,
             amp_enabled=amp_enabled,
+            grad_clip_norm=float(args.grad_clip_norm),
         )
         val_metrics = validate_one_epoch(
             model=model,

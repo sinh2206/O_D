@@ -26,12 +26,13 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 import torch
 
 try:
-    from .config import CLASS_NAMES, CONF_THRESH, IMG_SIZE, NMS_IOU_THRESH, NUM_CLASSES, STRIDES
+    from .config import CLASS_NAMES, CONF_THRESH, IMG_SIZE, NMS_IOU_THRESH, NMS_IOU_THRESH_BY_CLASS, NUM_CLASSES, STRIDES
 except Exception:
     # Safe fallbacks when config.py is not present.
     CLASS_NAMES = ["person", "car", "dog", "cat", "chair"]
     CONF_THRESH = 0.5
     NMS_IOU_THRESH = 0.35
+    NMS_IOU_THRESH_BY_CLASS = []
     IMG_SIZE = 320
     NUM_CLASSES = 5
     STRIDES = [16, 32]
@@ -352,6 +353,8 @@ def class_wise_nms(
     boxes: torch.Tensor,
     scores: torch.Tensor,
     class_ids: torch.Tensor,
+    class_names: Optional[Sequence[str]] = None,
+    per_class_nms_thresh: Optional[Sequence[float]] = None,
     nms_thresh: float = NMS_IOU_THRESH,
 ) -> torch.Tensor:
     """
@@ -371,7 +374,12 @@ def class_wise_nms(
         if idx.numel() == 0:
             continue
 
-        cls_keep_rel = nms_single_class(boxes[idx], scores[idx], iou_thresh=float(nms_thresh))
+        cls_idx = int(cls.item())
+        cls_iou_thresh = float(nms_thresh)
+        if per_class_nms_thresh is not None and cls_idx >= 0 and cls_idx < len(per_class_nms_thresh):
+            cls_iou_thresh = float(per_class_nms_thresh[cls_idx])
+
+        cls_keep_rel = nms_single_class(boxes[idx], scores[idx], iou_thresh=cls_iou_thresh)
         keep_global.append(idx[cls_keep_rel])
 
     if not keep_global:
@@ -516,6 +524,8 @@ def postprocess_single_image(
         boxes=boxes,
         scores=scores,
         class_ids=cls_ids,
+        class_names=class_names,
+        per_class_nms_thresh=NMS_IOU_THRESH_BY_CLASS,
         nms_thresh=nms_thresh,
     )
 
