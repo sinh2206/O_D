@@ -130,6 +130,54 @@ def sanitize_predictions(predictions: List[dict], image_dir: Path, class_names: 
     return sanitized
 
 
+def _is_fully_inside(inner_bbox: List[int], outer_bbox: List[int]) -> bool:
+    return (
+        inner_bbox[0] >= outer_bbox[0]
+        and inner_bbox[1] >= outer_bbox[1]
+        and inner_bbox[2] <= outer_bbox[2]
+        and inner_bbox[3] <= outer_bbox[3]
+    )
+
+
+def apply_prediction_constraints(predictions: List[dict], max_objects_per_image: int) -> List[dict]:
+    max_keep = max(1, int(max_objects_per_image))
+    constrained: List[dict] = []
+
+    for pred in predictions:
+        boxes = list(pred.get("boxes", []))
+        boxes = sorted(boxes, key=lambda x: float(x.get("confidence", 0.0)), reverse=True)
+
+        kept: List[dict] = []
+        for box in boxes:
+            cls_name = str(box.get("class", ""))
+            bbox = box.get("bbox", [])
+            if not isinstance(bbox, list) or len(bbox) != 4:
+                continue
+
+            should_drop = False
+            for existing in kept:
+                if str(existing.get("class", "")) != cls_name:
+                    continue
+                ex_bbox = existing.get("bbox", [])
+                if not isinstance(ex_bbox, list) or len(ex_bbox) != 4:
+                    continue
+                # Không giữ 2 box cùng class nếu một box nằm hoàn toàn trong box còn lại.
+                if _is_fully_inside(bbox, ex_bbox) or _is_fully_inside(ex_bbox, bbox):
+                    should_drop = True
+                    break
+
+            if should_drop:
+                continue
+
+            kept.append(box)
+            if len(kept) >= max_keep:
+                break
+
+        constrained.append({"image_id": pred.get("image_id"), "boxes": kept})
+
+    return constrained
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Predict with YOLOv2-style detector and export JSON.")
     parser.add_argument("--image_dir", type=Path, required=True)
@@ -152,6 +200,7 @@ def parse_args() -> argparse.Namespace:
         default=",".join(str(x) for x in CLASS_CONF_THRESH),
         help="Per-class thresholds in CLASS_NAMES order, e.g. '0.30,0.30,0.30,0.30,0.30'.",
     )
+    parser.add_argument("--max_objects_per_image", type=int, default=20)
     parser.add_argument("--preview_dir", type=Path, default=Path("results"))
     parser.add_argument("--preview_count", type=int, default=50)
     parser.add_argument("--device", type=str, default="auto", choices=["auto", "cuda", "cpu"])
@@ -208,6 +257,10 @@ def main() -> None:
         predictions=predictions,
         image_dir=args.image_dir,
         class_names=class_names,
+    )
+    predictions = apply_prediction_constraints(
+        predictions=predictions,
+        max_objects_per_image=args.max_objects_per_image,
     )
 
     save_predictions_json(predictions=predictions, output_path=args.output)
