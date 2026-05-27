@@ -15,10 +15,8 @@ CLASS_FREQ_PRIOR_TRAIN = [0.5477, 0.1258, 0.0966, 0.0783, 0.1516]
 CLASS_FREQ_PRIOR_VAL = [0.5314, 0.1400, 0.1019, 0.0871, 0.1395]
 
 # Training priorities to boost recall for person/car/dog/cat and suppress chair.
-# - dog is raised to reduce miss rate on small/low-contrast samples.
-# - car is raised to reduce fragmented double-box predictions.
-CLASS_LOSS_WEIGHTS = [1.22, 1.28, 1.35, 1.12, 0.62]
-CLASS_SAMPLER_WEIGHTS = [1.14, 1.22, 1.30, 1.10, 0.68]
+CLASS_LOSS_WEIGHTS = [1.15, 1.20, 1.12, 1.10, 0.70]
+CLASS_SAMPLER_WEIGHTS = [1.10, 1.18, 1.10, 1.08, 0.72]
 
 STRIDES = [16, 32]
 FPN_CHANNELS = 128
@@ -26,14 +24,11 @@ FPN_CHANNELS = 128
 MEAN = [0.485, 0.456, 0.406]
 STD = [0.229, 0.224, 0.225]
 
-CONF_THRESH = 0.32
-NMS_IOU_THRESH = 0.40
-# Per-class NMS IoU thresholds used in postprocess:
-# person, car, dog, cat, chair
-NMS_IOU_THRESH_PER_CLASS = [0.55, 0.30, 0.45, 0.45, 0.35]
+CONF_THRESH = 0.35
+NMS_IOU_THRESH = 0.35
 # Per-class confidence thresholds used after decode/NMS:
 # person, car, dog, cat, chair
-CLASS_CONF_THRESH = [0.34, 0.38, 0.30, 0.38, 0.72]
+CLASS_CONF_THRESH = [0.38, 0.40, 0.40, 0.40, 0.72]
 CHAIR_SUPPRESS_WITH_PERSON_IOU = 0.55
 
 FOCAL_ALPHA = 0.25

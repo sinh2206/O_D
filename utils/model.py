@@ -4,7 +4,7 @@
 Anchor-Free feature extractor and detection head.
 
 Architecture summary (input 320x320):
-- Backbone: ResNet-34 pretrained (no avgpool/fc)
+- Backbone: ResNet-18 pretrained (no avgpool/fc)
   stem -> layer1 -> layer2 -> layer3(C3, stride 16, 256ch) -> layer4(C4, stride 32, 512ch)
 - Neck: 2-level FPN
   lateral3: 1x1 conv (256 -> 128)
@@ -45,13 +45,13 @@ class ConvBNLeaky(nn.Module):
         return self.block(x)
 
 
-class ResNet34FPN2L(nn.Module):
+class ResNet18FPN2L(nn.Module):
     """Backbone + 2-level FPN feature extractor (stride 16/32)."""
 
     def __init__(self, fpn_channels: int = FPN_CHANNELS, pretrained: bool = True):
         super().__init__()
 
-        backbone = self._build_resnet34(pretrained=pretrained)
+        backbone = self._build_resnet18(pretrained=pretrained)
 
         # Backbone stages.
         self.stem = nn.Sequential(backbone.conv1, backbone.bn1, backbone.relu, backbone.maxpool)
@@ -69,19 +69,19 @@ class ResNet34FPN2L(nn.Module):
         self.fpn_out4 = ConvBNLeaky(fpn_channels, fpn_channels, k=3, s=1, p=1)
 
     @staticmethod
-    def _build_resnet34(pretrained: bool):
+    def _build_resnet18(pretrained: bool):
         if not pretrained:
-            return models.resnet34(weights=None)
+            return models.resnet18(weights=None)
 
         try:
-            return models.resnet34(weights="IMAGENET1K_V1")
+            return models.resnet18(weights="IMAGENET1K_V1")
         except Exception:
             try:
-                from torchvision.models import ResNet34_Weights
+                from torchvision.models import ResNet18_Weights
 
-                return models.resnet34(weights=ResNet34_Weights.IMAGENET1K_V1)
+                return models.resnet18(weights=ResNet18_Weights.IMAGENET1K_V1)
             except Exception:
-                return models.resnet34(weights=None)
+                return models.resnet18(weights=None)
 
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         x = self.stem(x)
@@ -163,7 +163,7 @@ class AnchorFreeHead(nn.Module):
 
 class AnchorFreeDetector(nn.Module):
     """
-    Full detector: ResNet34 + FPN(2 levels) + per-level anchor-free heads.
+    Full detector: ResNet18 + FPN(2 levels) + per-level anchor-free heads.
 
     Multi-scale forward output:
     {
@@ -190,7 +190,7 @@ class AnchorFreeDetector(nn.Module):
         self.num_classes = num_classes
         self.legacy_single_output = legacy_single_output
 
-        self.backbone_fpn = ResNet34FPN2L(fpn_channels=feat_channels, pretrained=pretrained)
+        self.backbone_fpn = ResNet18FPN2L(fpn_channels=feat_channels, pretrained=pretrained)
         self.head_s16 = AnchorFreeHead(in_ch=feat_channels, num_classes=num_classes, num_convs=2)
         self.head_s32 = AnchorFreeHead(in_ch=feat_channels, num_classes=num_classes, num_convs=2)
 

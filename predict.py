@@ -1,8 +1,7 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import argparse
 import json
-import math
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
@@ -17,15 +16,14 @@ from utils.config import (
     CONF_THRESH,
     IMG_SIZE,
     MEAN,
-    NMS_IOU_THRESH_PER_CLASS,
+    NMS_IOU_THRESH,
+    NUM_CLASSES,
     STD,
 )
 from utils.model import AnchorFreeDetector
 from utils.nms import LetterboxMeta, postprocess_batch
 
 VALID_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
-DEFAULT_VAL_IMAGE_DIR = Path("public/val/images")
-DEFAULT_RESULTS_DIR = Path("results")
 
 
 def imread_unicode(path: Path) -> Optional[np.ndarray]:
@@ -84,7 +82,28 @@ def letterbox_preprocess(image_bgr: np.ndarray, img_size: int) -> Tuple[torch.Te
 
 
 def collect_images(image_dir: Path) -> List[Path]:
-    return [p for p in sorted(image_dir.iterdir()) if p.is_file() and p.suffix.lower() in VALID_EXTS]
+    imgs = [p for p in sorted(image_dir.iterdir()) if p.is_file() and p.suffix.lower() in VALID_EXTS]
+    return imgs
+
+
+def draw_prediction(image_bgr: np.ndarray, boxes: Sequence[dict], class_names: Sequence[str]) -> np.ndarray:
+    out = image_bgr.copy()
+    cls_to_idx = {c: i for i, c in enumerate(class_names)}
+
+    for obj in boxes:
+        cls_name = str(obj["class"])
+        score = float(obj["confidence"])
+        x1, y1, x2, y2 = [int(round(v)) for v in obj["bbox"]]
+        idx = cls_to_idx.get(cls_name, 0)
+        color = (
+            int((53 * (idx + 1)) % 255),
+            int((97 * (idx + 1)) % 255),
+            int((193 * (idx + 1)) % 255),
+        )
+        cv2.rectangle(out, (x1, y1), (x2, y2), color, 2)
+        label = f"{cls_name}:{score:.2f}"
+        cv2.putText(out, label, (x1, max(14, y1 - 4)), cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1, cv2.LINE_AA)
+    return out
 
 
 def box_iou(a: Sequence[float], b: Sequence[float]) -> float:
@@ -144,133 +163,6 @@ def suppress_chair_inside_person(predictions: List[dict], iou_thresh: float) -> 
     return out
 
 
-def _is_fully_inside(inner: List[int], outer: List[int]) -> bool:
-    return bool(
-        inner[0] >= outer[0]
-        and inner[1] >= outer[1]
-        and inner[2] <= outer[2]
-        and inner[3] <= outer[3]
-    )
-
-
-def _suppress_same_class_contained_int(boxes: List[dict]) -> List[dict]:
-    ordered = sorted(boxes, key=lambda b: float(b.get("confidence", 0.0)), reverse=True)
-    kept: List[dict] = []
-    for box in ordered:
-        cls = str(box.get("class", ""))
-        bb = box.get("bbox", [])
-        if not isinstance(bb, list) or len(bb) != 4:
-            continue
-        bb = [int(v) for v in bb]
-        drop = False
-        for k in kept:
-            if str(k.get("class", "")) != cls:
-                continue
-            kb = [int(v) for v in k["bbox"]]
-            if _is_fully_inside(bb, kb) or _is_fully_inside(kb, bb):
-                drop = True
-                break
-        if not drop:
-            keep_box = dict(box)
-            keep_box["bbox"] = bb
-            kept.append(keep_box)
-    return kept
-
-
-def sanitize_predictions_for_export(
-    predictions: List[dict],
-    image_dir: Path,
-    class_names: Sequence[str],
-) -> List[dict]:
-    valid_classes = set(class_names)
-    out: List[dict] = []
-    image_size_cache: Dict[str, Tuple[int, int]] = {}
-
-    for pred in predictions:
-        image_id = str(pred.get("image_id", ""))
-        if not image_id:
-            continue
-
-        if image_id not in image_size_cache:
-            image = imread_unicode(image_dir / image_id)
-            if image is None:
-                image_size_cache[image_id] = (0, 0)
-            else:
-                h, w = image.shape[:2]
-                image_size_cache[image_id] = (int(w), int(h))
-
-        w, h = image_size_cache[image_id]
-        if w <= 0 or h <= 0:
-            continue
-
-        cleaned: List[dict] = []
-        for box in pred.get("boxes", []):
-            cls_name = str(box.get("class", ""))
-            if cls_name not in valid_classes:
-                continue
-
-            conf = float(box.get("confidence", 0.0))
-            if not math.isfinite(conf):
-                continue
-            conf = max(0.0, min(1.0, conf))
-
-            bbox = box.get("bbox", [])
-            if not isinstance(bbox, list) or len(bbox) != 4:
-                continue
-            try:
-                x1, y1, x2, y2 = [float(v) for v in bbox]
-            except (TypeError, ValueError):
-                continue
-            if not all(math.isfinite(v) for v in (x1, y1, x2, y2)):
-                continue
-
-            x1 = max(0.0, min(float(w), x1))
-            x2 = max(0.0, min(float(w), x2))
-            y1 = max(0.0, min(float(h), y1))
-            y2 = max(0.0, min(float(h), y2))
-
-            ix1 = int(math.floor(x1))
-            iy1 = int(math.floor(y1))
-            ix2 = int(math.ceil(x2))
-            iy2 = int(math.ceil(y2))
-
-            ix1 = max(0, min(w - 1, ix1))
-            iy1 = max(0, min(h - 1, iy1))
-            ix2 = max(0, min(w, ix2))
-            iy2 = max(0, min(h, iy2))
-
-            if ix2 <= ix1:
-                if ix1 < w:
-                    ix2 = ix1 + 1
-                else:
-                    continue
-            if iy2 <= iy1:
-                if iy1 < h:
-                    iy2 = iy1 + 1
-                else:
-                    continue
-
-            if ix2 > w:
-                ix2 = w
-            if iy2 > h:
-                iy2 = h
-            if ix2 <= ix1 or iy2 <= iy1:
-                continue
-
-            cleaned.append(
-                {
-                    "class": cls_name,
-                    "confidence": float(conf),
-                    "bbox": [int(ix1), int(iy1), int(ix2), int(iy2)],
-                }
-            )
-
-        cleaned = _suppress_same_class_contained_int(cleaned)
-        out.append({"image_id": image_id, "boxes": cleaned})
-
-    return out
-
-
 @torch.no_grad()
 def run_inference(
     model: AnchorFreeDetector,
@@ -279,7 +171,7 @@ def run_inference(
     batch_size: int,
     img_size: int,
     conf_thresh: float,
-    nms_thresh: Sequence[float],
+    nms_thresh: float,
     class_names: Sequence[str],
 ) -> List[dict]:
     results: List[dict] = []
@@ -325,6 +217,24 @@ def run_inference(
     return results
 
 
+def save_preview_images(predictions: List[dict], image_dir: Path, preview_dir: Path, limit: int, class_names: Sequence[str]) -> int:
+    preview_dir.mkdir(parents=True, exist_ok=True)
+    saved = 0
+
+    for pred in predictions[:limit]:
+        image_id = pred["image_id"]
+        img_path = image_dir / image_id
+        image = imread_unicode(img_path)
+        if image is None:
+            continue
+
+        vis = draw_prediction(image, pred.get("boxes", []), class_names=class_names)
+        out_path = preview_dir / image_id
+        if imwrite_unicode(out_path, vis):
+            saved += 1
+    return saved
+
+
 def load_checkpoint_model(checkpoint_path: Path, device: torch.device) -> Tuple[AnchorFreeDetector, List[str], int]:
     ckpt = torch.load(str(checkpoint_path), map_location=device)
     classes = ckpt.get("classes", CLASS_NAMES)
@@ -339,298 +249,46 @@ def load_checkpoint_model(checkpoint_path: Path, device: torch.device) -> Tuple[
     return model, list(classes), img_size
 
 
-def draw_prediction(image_bgr: np.ndarray, boxes: Sequence[dict], class_names: Sequence[str]) -> np.ndarray:
-    out = image_bgr.copy()
-    cls_to_idx = {c: i for i, c in enumerate(class_names)}
-
-    for obj in boxes:
-        cls_name = str(obj["class"])
-        score = float(obj["confidence"])
-        x1, y1, x2, y2 = [int(round(v)) for v in obj["bbox"]]
-        idx = cls_to_idx.get(cls_name, 0)
-        color = (
-            int((53 * (idx + 1)) % 255),
-            int((97 * (idx + 1)) % 255),
-            int((193 * (idx + 1)) % 255),
-        )
-        cv2.rectangle(out, (x1, y1), (x2, y2), color, 2)
-        label = f"{cls_name}:{score:.2f}"
-        cv2.putText(out, label, (x1, max(14, y1 - 4)), cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1, cv2.LINE_AA)
-    return out
-
-
-def save_preview_images(predictions: List[dict], image_dir: Path, preview_dir: Path, limit: int, class_names: Sequence[str]) -> int:
-    preview_dir.mkdir(parents=True, exist_ok=True)
-    saved = 0
-
-    for pred in predictions[:limit]:
-        image_id = pred["image_id"]
-        image = imread_unicode(image_dir / image_id)
-        if image is None:
-            continue
-
-        vis = draw_prediction(image, pred.get("boxes", []), class_names=class_names)
-        if imwrite_unicode(preview_dir / image_id, vis):
-            saved += 1
-    return saved
-
-
-def clean_results_images(results_dir: Path) -> None:
-    if not results_dir.exists():
-        return
-    for p in results_dir.iterdir():
-        if not p.is_file():
-            continue
-        if p.suffix.lower() in VALID_EXTS:
-            p.unlink()
-            continue
-        if p.name.startswith("hardcase_") and p.suffix.lower() == ".json":
-            p.unlink()
-
-
-def _load_ground_truth(annotation_path: Path, expected_classes: Sequence[str]) -> Dict[str, List[dict]]:
-    with annotation_path.open("r", encoding="utf-8") as f:
-        data = json.load(f)
-
-    classes = data.get("classes", [])
-    if list(classes) != list(expected_classes):
-        raise ValueError(f"Class mismatch in {annotation_path}. Expected {list(expected_classes)}, got {classes}")
-
-    images = data.get("images", [])
-    annotations = data.get("annotations", [])
-    image_ids = {str(x.get("id")) for x in images}
-
-    gt_by_image: Dict[str, List[dict]] = {iid: [] for iid in image_ids}
-    for ann in annotations:
-        image_id = str(ann.get("image_id", ""))
-        cls_name = str(ann.get("class", ""))
-        bbox = ann.get("bbox", [])
-        if image_id not in gt_by_image or cls_name not in classes:
-            continue
-        if not isinstance(bbox, list) or len(bbox) != 4:
-            continue
-        x1, y1, x2, y2 = [int(v) for v in bbox]
-        if x2 <= x1 or y2 <= y1:
-            continue
-        gt_by_image[image_id].append({"class": cls_name, "bbox": [x1, y1, x2, y2]})
-
-    return gt_by_image
-
-
-def _score_one_image(
-    gt_boxes: Sequence[dict],
-    pred_boxes: Sequence[dict],
-    class_names: Sequence[str],
-    iou_thresh: float,
-) -> Dict[str, float]:
-    fn_total = 0
-    fp_total = 0
-    tp_total = 0
-    loc_penalty = 0.0
-
-    for cls_name in class_names:
-        gt_c = [g for g in gt_boxes if str(g.get("class", "")) == cls_name]
-        pd_c = [p for p in pred_boxes if str(p.get("class", "")) == cls_name]
-        pd_c = sorted(pd_c, key=lambda x: float(x.get("confidence", 0.0)), reverse=True)
-
-        matched_gt: set[int] = set()
-        for p in pd_c:
-            pb = p.get("bbox", [0, 0, 0, 0])
-            best_iou = 0.0
-            best_idx = -1
-            for gi, g in enumerate(gt_c):
-                if gi in matched_gt:
-                    continue
-                iou = box_iou(pb, g["bbox"])
-                if iou > best_iou:
-                    best_iou = iou
-                    best_idx = gi
-            if best_idx >= 0 and best_iou >= iou_thresh:
-                matched_gt.add(best_idx)
-                tp_total += 1
-                loc_penalty += (1.0 - best_iou) * 0.5
-            else:
-                fp_total += 1
-
-        fn_total += max(0, len(gt_c) - len(matched_gt))
-
-    gt_count = len(gt_boxes)
-    pred_count = len(pred_boxes)
-    error_score = 3.0 * fn_total + 1.5 * fp_total + loc_penalty
-    error_ratio = error_score / max(1.0, float(gt_count + pred_count))
-
-    return {
-        "error_score": float(error_score),
-        "error_ratio": float(error_ratio),
-        "fn": float(fn_total),
-        "fp": float(fp_total),
-        "tp": float(tp_total),
-        "gt_count": float(gt_count),
-        "pred_count": float(pred_count),
-    }
-
-
-def _draw_gt_and_pred(image_bgr: np.ndarray, gt_boxes: Sequence[dict], pred_boxes: Sequence[dict]) -> np.ndarray:
-    out = image_bgr.copy()
-
-    for g in gt_boxes:
-        x1, y1, x2, y2 = [int(v) for v in g["bbox"]]
-        cls_name = str(g.get("class", ""))
-        cv2.rectangle(out, (x1, y1), (x2, y2), (0, 220, 70), 2)
-        cv2.putText(out, f"GT:{cls_name}", (x1, max(14, y1 - 4)), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (0, 220, 70), 1, cv2.LINE_AA)
-
-    for p in pred_boxes:
-        x1, y1, x2, y2 = [int(v) for v in p["bbox"]]
-        cls_name = str(p.get("class", ""))
-        conf = float(p.get("confidence", 0.0))
-        cv2.rectangle(out, (x1, y1), (x2, y2), (30, 30, 255), 2)
-        cv2.putText(out, f"PD:{cls_name}:{conf:.2f}", (x1, min(max(y2 + 14, 14), out.shape[0] - 4)), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (30, 30, 255), 1, cv2.LINE_AA)
-
-    return out
-
-
-def _clean_hardcase_outputs(results_dir: Path) -> None:
-    if not results_dir.exists():
-        return
-    for p in results_dir.iterdir():
-        if not p.is_file():
-            continue
-        if not p.name.startswith("hardcase_"):
-            continue
-        if p.suffix.lower() in VALID_EXTS or p.suffix.lower() == ".json":
-            p.unlink()
-
-
-def export_hard_cases(
-    predictions: List[dict],
-    image_dir: Path,
-    val_annotation: Path,
-    class_names: Sequence[str],
-    results_dir: Path,
-    top_k: int,
-    iou_thresh: float,
-) -> Tuple[int, Path]:
-    gt_by_image = _load_ground_truth(val_annotation, expected_classes=class_names)
-    pred_by_image: Dict[str, List[dict]] = {str(x.get("image_id", "")): list(x.get("boxes", [])) for x in predictions}
-
-    scored: List[dict] = []
-    for image_id, gt_boxes in gt_by_image.items():
-        pred_boxes = pred_by_image.get(image_id, [])
-        metrics = _score_one_image(
-            gt_boxes=gt_boxes,
-            pred_boxes=pred_boxes,
-            class_names=class_names,
-            iou_thresh=iou_thresh,
-        )
-        scored.append(
-            {
-                "image_id": image_id,
-                "error_score": float(metrics["error_score"]),
-                "error_ratio": float(metrics["error_ratio"]),
-                "fn": int(metrics["fn"]),
-                "fp": int(metrics["fp"]),
-                "tp": int(metrics["tp"]),
-                "gt_count": int(metrics["gt_count"]),
-                "pred_count": int(metrics["pred_count"]),
-            }
-        )
-
-    scored.sort(key=lambda x: (x["error_ratio"], x["error_score"], x["fn"], x["fp"]), reverse=True)
-    top_items = scored[: max(0, int(top_k))]
-
-    results_dir.mkdir(parents=True, exist_ok=True)
-    _clean_hardcase_outputs(results_dir)
-
-    saved = 0
-    for rank, item in enumerate(top_items, start=1):
-        image_id = item["image_id"]
-        image = imread_unicode(image_dir / image_id)
-        if image is None:
-            continue
-
-        gt_boxes = gt_by_image.get(image_id, [])
-        pred_boxes = pred_by_image.get(image_id, [])
-
-        vis = _draw_gt_and_pred(image, gt_boxes, pred_boxes)
-        cv2.putText(
-            vis,
-            f"rank={rank} err={item['error_score']:.3f} ratio={item['error_ratio']:.3f} fn={item['fn']} fp={item['fp']}",
-            (8, max(20, vis.shape[0] - 12)),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.48,
-            (255, 255, 255),
-            1,
-            cv2.LINE_AA,
-        )
-
-        out_name = f"hardcase_{rank:03d}_{image_id}"
-        if imwrite_unicode(results_dir / out_name, vis):
-            saved += 1
-
-    summary_path = results_dir / "hardcase_summary.json"
-    with summary_path.open("w", encoding="utf-8") as f:
-        json.dump(top_items, f, ensure_ascii=False, indent=2)
-
-    return saved, summary_path
-
-
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Predict val set and export integer-bbox results.")
-    parser.add_argument("--image_dir", type=Path, default=DEFAULT_VAL_IMAGE_DIR)
-    parser.add_argument("--output", type=Path, default=DEFAULT_RESULTS_DIR / "val_predictions.json")
+    parser = argparse.ArgumentParser(description="Predict with anchor-free detector and export JSON.")
+    parser.add_argument("--image_dir", type=Path, required=True)
+    parser.add_argument("--output", type=Path, default=Path("predictions.json"))
     parser.add_argument(
         "--checkpoint",
         "--model_path",
         dest="checkpoint",
         type=Path,
         default=Path("models/best.pth"),
-        help="Path to trained model checkpoint (.pth).",
+        help="Path to trained model checkpoint (.pth). '--model_path' is kept as a backward-compatible alias.",
     )
     parser.add_argument("--img_size", type=int, default=IMG_SIZE)
     parser.add_argument("--batch_size", type=int, default=24)
     parser.add_argument("--conf_thresh", type=float, default=CONF_THRESH)
-    parser.add_argument(
-        "--nms_thresh",
-        type=str,
-        default=",".join(str(x) for x in NMS_IOU_THRESH_PER_CLASS),
-        help="Per-class NMS IoU thresholds in CLASS_NAMES order.",
-    )
+    parser.add_argument("--nms_thresh", type=float, default=NMS_IOU_THRESH)
     parser.add_argument(
         "--class_conf",
         type=str,
         default=",".join(str(x) for x in CLASS_CONF_THRESH),
-        help="Per-class confidence thresholds in CLASS_NAMES order.",
+        help="Per-class thresholds in CLASS_NAMES order, e.g. '0.38,0.40,0.40,0.40,0.72'",
     )
     parser.add_argument("--chair_suppress_iou", type=float, default=CHAIR_SUPPRESS_WITH_PERSON_IOU)
-    parser.add_argument("--results_dir", type=Path, default=DEFAULT_RESULTS_DIR)
-    parser.add_argument("--preview_count", type=int, default=-1, help="Number of processed val images to export to results. -1 means all.")
+    parser.add_argument("--preview_dir", type=Path, default=Path("results"))
+    parser.add_argument("--preview_count", type=int, default=50)
     parser.add_argument("--device", type=str, default="auto", choices=["auto", "cuda", "cpu"])
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
-
     if not args.checkpoint.exists():
         raise FileNotFoundError(f"Checkpoint not found: {args.checkpoint}")
     if not args.image_dir.exists():
         raise FileNotFoundError(f"Image directory not found: {args.image_dir}")
 
-    expected_val_dir = DEFAULT_VAL_IMAGE_DIR.resolve()
-    if args.image_dir.resolve() != expected_val_dir:
-        raise ValueError(
-            f"--image_dir must be '{DEFAULT_VAL_IMAGE_DIR}'. Got: {args.image_dir}"
-        )
-    if args.results_dir.resolve() != DEFAULT_RESULTS_DIR.resolve():
-        raise ValueError(f"--results_dir must be '{DEFAULT_RESULTS_DIR}'. Got: {args.results_dir}")
-    if args.output.resolve().parent != DEFAULT_RESULTS_DIR.resolve():
-        raise ValueError(f"--output must be inside '{DEFAULT_RESULTS_DIR}'. Got: {args.output}")
-
     if args.device == "auto":
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     else:
         device = torch.device(args.device)
-
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
     torch.set_float32_matmul_precision("high")
@@ -644,10 +302,6 @@ def main() -> None:
     if len(class_conf) != len(class_names):
         raise ValueError(f"--class_conf must have {len(class_names)} values (got {len(class_conf)}).")
 
-    nms_thresh = [float(x.strip()) for x in str(args.nms_thresh).split(",") if x.strip()]
-    if len(nms_thresh) != len(class_names):
-        raise ValueError(f"--nms_thresh must have {len(class_names)} values (got {len(nms_thresh)}).")
-
     image_paths = collect_images(args.image_dir)
     if not image_paths:
         raise ValueError(f"No images found in: {args.image_dir}")
@@ -659,32 +313,28 @@ def main() -> None:
         batch_size=max(1, args.batch_size),
         img_size=img_size,
         conf_thresh=float(args.conf_thresh),
-        nms_thresh=nms_thresh,
+        nms_thresh=float(args.nms_thresh),
         class_names=class_names,
     )
     predictions = apply_class_thresholds(predictions, class_names=class_names, class_conf_thresh=class_conf)
     predictions = suppress_chair_inside_person(predictions, iou_thresh=float(args.chair_suppress_iou))
-    predictions = sanitize_predictions_for_export(predictions=predictions, image_dir=args.image_dir, class_names=class_names)
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
     with args.output.open("w", encoding="utf-8") as f:
         json.dump(predictions, f, ensure_ascii=False, indent=2)
 
-    clean_results_images(args.results_dir)
-    preview_limit = len(predictions) if int(args.preview_count) < 0 else min(len(predictions), max(0, int(args.preview_count)))
     saved = save_preview_images(
         predictions=predictions,
         image_dir=args.image_dir,
-        preview_dir=args.results_dir,
-        limit=preview_limit,
+        preview_dir=args.preview_dir,
+        limit=max(0, args.preview_count),
         class_names=class_names,
     )
 
     print(f"Device: {device}")
     print(f"Predicted images: {len(predictions)}")
     print(f"Saved JSON: {args.output}")
-    print(f"Integer bbox export: enabled")
-    print(f"Saved processed val images: {saved} -> {args.results_dir}")
+    print(f"Saved preview images: {saved} -> {args.preview_dir}")
 
 
 if __name__ == "__main__":
