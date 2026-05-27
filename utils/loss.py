@@ -32,7 +32,6 @@ try:
         LAMBDA_CLS,
         LAMBDA_CTR,
         LAMBDA_REG,
-        LAMBDA_REG_L1,
         NUM_CLASSES,
         STRIDES,
     )
@@ -46,7 +45,6 @@ except Exception:
     LAMBDA_CLS = 1.0
     LAMBDA_REG = 1.0
     LAMBDA_CTR = 0.5
-    LAMBDA_REG_L1 = 0.0
 
 EPS = 1e-8
 DEFAULT_CENTER_RADIUS = 1.5
@@ -310,20 +308,19 @@ def _default_scale_ranges(strides: Sequence[int]) -> List[Tuple[float, float]]:
     """
     FCOS-like object size ranges (max(l,t,r,b) in pixels) per level.
 
-    For strides [16, 32] -> [(0, 96), (48, inf)] (with overlap).
+    For strides [16, 32] -> [(0, 64), (64, inf)]
     """
     ranges: List[Tuple[float, float]] = []
-    overlap_factor = 1.5
     for i, s in enumerate(strides):
         if i == 0:
             lower = 0.0
         else:
-            lower = float(4.0 * strides[i - 1]) / overlap_factor
+            lower = float(4.0 * strides[i - 1])
 
         if i == len(strides) - 1:
             upper = 1e8
         else:
-            upper = float(4.0 * s) * overlap_factor
+            upper = float(4.0 * s)
 
         ranges.append((lower, upper))
     return ranges
@@ -566,7 +563,6 @@ def compute_loss(
     lambda_cls: float = LAMBDA_CLS,
     lambda_reg: float = LAMBDA_REG,
     lambda_ctr: float = LAMBDA_CTR,
-    lambda_reg_l1: float = LAMBDA_REG_L1,
     focal_alpha: float = FOCAL_ALPHA,
     focal_gamma: float = FOCAL_GAMMA,
     class_weights: Optional[torch.Tensor] = None,
@@ -654,9 +650,7 @@ def compute_loss(
 
             pred_boxes = tlbr_to_xyxy(pts_pos, reg_pos)
             tgt_boxes = tlbr_to_xyxy(pts_pos, tgt_pos)
-            reg_giou = giou_loss(pred_boxes, tgt_boxes, reduction="sum")
-            reg_l1 = F.smooth_l1_loss(reg_pos, tgt_pos, reduction="sum")
-            total_reg = total_reg + reg_giou + float(lambda_reg_l1) * reg_l1
+            total_reg = total_reg + giou_loss(pred_boxes, tgt_boxes, reduction="sum")
 
             if ctr_levels is not None:
                 ctr_logits = ctr_levels[lvl].permute(0, 2, 3, 1).reshape(-1)
@@ -706,7 +700,6 @@ class DetectionLoss(nn.Module):
         lambda_cls: float = LAMBDA_CLS,
         lambda_reg: float = LAMBDA_REG,
         lambda_ctr: float = LAMBDA_CTR,
-        lambda_reg_l1: float = LAMBDA_REG_L1,
         focal_alpha: float = FOCAL_ALPHA,
         focal_gamma: float = FOCAL_GAMMA,
         class_weights: Optional[torch.Tensor] = None,
@@ -720,7 +713,6 @@ class DetectionLoss(nn.Module):
         self.lambda_cls = float(lambda_cls)
         self.lambda_reg = float(lambda_reg)
         self.lambda_ctr = float(lambda_ctr)
-        self.lambda_reg_l1 = float(lambda_reg_l1)
         self.focal_alpha = float(focal_alpha)
         self.focal_gamma = float(focal_gamma)
         if class_weights is None:
@@ -740,7 +732,6 @@ class DetectionLoss(nn.Module):
             lambda_cls=self.lambda_cls,
             lambda_reg=self.lambda_reg,
             lambda_ctr=self.lambda_ctr,
-            lambda_reg_l1=self.lambda_reg_l1,
             focal_alpha=self.focal_alpha,
             focal_gamma=self.focal_gamma,
             class_weights=self.class_weights if self.class_weights.numel() > 0 else None,

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import inspect
 import json
 import random
@@ -14,9 +15,7 @@ import numpy as np
 import torch
 from albumentations.pytorch import ToTensorV2
 from torch import nn
-from torch.nn.utils import clip_grad_norm_
 from torch.optim import AdamW
-from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
 
 from utils.config import (
@@ -27,8 +26,6 @@ from utils.config import (
     CLASS_SAMPLER_WEIGHTS,
     IMG_SIZE,
     LABEL_SMOOTHING,
-    LAMBDA_CTR,
-    LAMBDA_REG_L1,
     MEAN,
     NUM_CLASSES,
     STD,
@@ -36,7 +33,7 @@ from utils.config import (
 )
 from utils.loss import DetectionLoss
 from utils.model import AnchorFreeDetector
-from utils.runtime import create_grad_scaler, resolve_device, resolve_num_workers, should_pin_memory
+from utils.runtime import create_grad_scaler, get_scheduler, resolve_device, resolve_num_workers, should_pin_memory
 
 VALID_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 
@@ -47,6 +44,32 @@ class Sample:
     image_path: Path
     boxes: List[List[float]]
     labels: List[int]
+
+
+class ModelEMA:
+    """Exponential Moving Average of model weights for stabler validation."""
+
+    def __init__(self, model: nn.Module, decay: float = 0.9995):
+        self.decay = float(decay)
+        self.ema = copy.deepcopy(model).eval()
+        for p in self.ema.parameters():
+            p.requires_grad_(False)
+
+    @torch.no_grad()
+    def update(self, model: nn.Module) -> None:
+        model_state = model.state_dict()
+        ema_state = self.ema.state_dict()
+        for k, v in ema_state.items():
+            if k not in model_state:
+                continue
+            src = model_state[k].detach()
+            if not torch.is_floating_point(v):
+                v.copy_(src)
+                continue
+            v.mul_(self.decay).add_(src, alpha=1.0 - self.decay)
+
+    def state_dict(self) -> Dict[str, torch.Tensor]:
+        return self.ema.state_dict()
 
 
 def compute_class_weights(num_classes: int) -> torch.Tensor:
@@ -223,20 +246,12 @@ def get_train_transforms(img_size: int) -> A.Compose:
 
     return A.Compose(
         [
-            A.OneOf(
-                [
-                    A.NoOp(p=1.0),
-                    A.RandomSizedBBoxSafeCrop(height=img_size, width=img_size, erosion_rate=0.05, p=1.0),
-                ],
-                p=0.25,
-            ),
             A.LongestMaxSize(max_size=img_size, interpolation=cv2.INTER_LINEAR),
             make_pad_if_needed(img_size),
             A.HorizontalFlip(p=0.5),
             A.CLAHE(clip_limit=2.2, tile_grid_size=(8, 8), p=0.2),
             A.RandomGamma(gamma_limit=(88, 122), p=0.25),
             A.ColorJitter(brightness=0.12, contrast=0.12, saturation=0.1, hue=0.05, p=0.45),
-            A.MotionBlur(blur_limit=3, p=0.12),
             affine,
             A.Normalize(mean=MEAN, std=STD),
             ToTensorV2(),
@@ -341,7 +356,7 @@ def make_dataloader(
         shuffle=(shuffle and sampler is None),
         sampler=sampler,
         num_workers=num_workers,
-        pin_memory=bool(pin_memory),
+        pin_memory=pin_memory,
         persistent_workers=(num_workers > 0),
         drop_last=False,
         collate_fn=collate_fn,
@@ -354,9 +369,10 @@ def train_one_epoch(
     loader: DataLoader,
     optimizer: torch.optim.Optimizer,
     device: torch.device,
-    scaler: torch.cuda.amp.GradScaler,
+    scaler,
     amp_enabled: bool,
-    grad_clip_norm: float = 0.0,
+    grad_clip_norm: float = 5.0,
+    ema: Optional[ModelEMA] = None,
 ) -> Dict[str, float]:
     model.train()
     running = {"loss": 0.0, "loss_cls": 0.0, "loss_reg": 0.0, "loss_ctr": 0.0}
@@ -376,11 +392,13 @@ def train_one_epoch(
             continue
 
         scaler.scale(loss).backward()
-        if grad_clip_norm and grad_clip_norm > 0:
+        if grad_clip_norm > 0:
             scaler.unscale_(optimizer)
-            clip_grad_norm_(model.parameters(), max_norm=float(grad_clip_norm))
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=float(grad_clip_norm))
         scaler.step(optimizer)
         scaler.update()
+        if ema is not None:
+            ema.update(model)
 
         running["loss"] += float(loss.detach().item())
         running["loss_cls"] += float(loss_dict["loss_cls"].item())
@@ -442,30 +460,32 @@ def save_checkpoint(
     path: Path,
     model: nn.Module,
     optimizer: torch.optim.Optimizer,
-    scheduler: CosineAnnealingLR,
+    scheduler: Optional[torch.optim.lr_scheduler.LRScheduler],
     epoch: int,
     best_val_loss: float,
     classes: List[str],
     img_size: int,
+    ema_state_dict: Optional[Dict[str, torch.Tensor]] = None,
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    torch.save(
-        {
-            "model_state_dict": model.state_dict(),
-            "optimizer_state_dict": optimizer.state_dict(),
-            "scheduler_state_dict": scheduler.state_dict(),
-            "epoch": epoch,
-            "best_val_loss": best_val_loss,
-            "classes": classes,
-            "img_size": img_size,
-            "strides": STRIDES,
-        },
-        str(path),
-    )
+    payload: Dict[str, object] = {
+        "model_state_dict": model.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+        "epoch": epoch,
+        "best_val_loss": best_val_loss,
+        "classes": classes,
+        "img_size": img_size,
+        "strides": STRIDES,
+    }
+    if scheduler is not None:
+        payload["scheduler_state_dict"] = scheduler.state_dict()
+    if ema_state_dict is not None:
+        payload["ema_state_dict"] = ema_state_dict
+    torch.save(payload, str(path))
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Train FCOS-style anchor-free detector (ResNet34 + 2-level FPN).")
+    parser = argparse.ArgumentParser(description="Train anchor-free detector (ResNet34 + FPN) with stronger recall and stability.")
     parser.add_argument("--train_data", type=Path, required=True)
     parser.add_argument("--val_data", type=Path, required=True)
     parser.add_argument("--image_dir", type=Path, required=True)
@@ -473,22 +493,25 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--checkpoint_dir", type=Path, default=Path("./models"))
     parser.add_argument("--img_size", type=int, default=IMG_SIZE)
     parser.add_argument("--batch_size", type=int, default=20)
-    parser.add_argument("--epochs", type=int, default=45)
+    parser.add_argument("--epochs", type=int, default=25)
     parser.add_argument("--lr_backbone", type=float, default=2e-4)
     parser.add_argument("--lr_head", type=float, default=2e-3)
     parser.add_argument("--weight_decay", type=float, default=1e-4)
-    parser.add_argument("--num_workers", type=int, default=-1)
+    parser.add_argument("--num_workers", type=int, default=-1, help="Use -1 for auto safe value (recommended on Colab).")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--resume", type=Path, default=None)
     parser.add_argument("--label_smoothing", type=float, default=LABEL_SMOOTHING)
-    parser.add_argument("--center_radius", type=float, default=1.6)
-    parser.add_argument("--lambda_ctr", type=float, default=LAMBDA_CTR)
-    parser.add_argument("--lambda_reg_l1", type=float, default=LAMBDA_REG_L1)
-    parser.add_argument("--grad_clip_norm", type=float, default=10.0)
+    parser.add_argument("--center_radius", type=float, default=1.3)
     parser.add_argument("--no_scale_ranges", action="store_true")
     parser.add_argument("--no_balanced_sampling", action="store_true")
     parser.add_argument("--no_class_weights", action="store_true")
     parser.add_argument("--no_amp", action="store_true")
+    parser.add_argument("--warmup_epochs", type=int, default=3)
+    parser.add_argument("--grad_clip_norm", type=float, default=5.0)
+    parser.add_argument("--ema_decay", type=float, default=0.9995)
+    parser.add_argument("--no_ema", action="store_true")
+    parser.add_argument("--early_stopping_patience", type=int, default=8)
+    parser.add_argument("--early_stopping_min_delta", type=float, default=1e-4)
     return parser.parse_args()
 
 
@@ -502,8 +525,8 @@ def main() -> None:
 
     device = resolve_device("auto")
     amp_enabled = (device.type == "cuda") and (not args.no_amp)
-    resolved_workers, max_safe_workers = resolve_num_workers(int(args.num_workers))
     pin_memory = should_pin_memory(device)
+    num_workers, max_workers = resolve_num_workers(args.num_workers)
 
     train_samples, classes = parse_samples(args.train_data, args.image_dir, class_names=None)
     val_samples, _ = parse_samples(args.val_data, args.val_image_dir, class_names=classes)
@@ -526,7 +549,7 @@ def main() -> None:
         train_ds,
         batch_size=args.batch_size,
         shuffle=True,
-        num_workers=resolved_workers,
+        num_workers=num_workers,
         pin_memory=pin_memory,
         sampler=train_sampler,
     )
@@ -534,7 +557,7 @@ def main() -> None:
         val_ds,
         batch_size=args.batch_size,
         shuffle=False,
-        num_workers=resolved_workers,
+        num_workers=num_workers,
         pin_memory=pin_memory,
     )
 
@@ -545,16 +568,16 @@ def main() -> None:
         class_weights=class_weights,
         label_smoothing=float(args.label_smoothing),
         center_radius=float(args.center_radius),
-        lambda_ctr=float(args.lambda_ctr),
-        lambda_reg_l1=float(args.lambda_reg_l1),
         use_scale_ranges=not args.no_scale_ranges,
     ).to(device)
     optimizer = build_optimizer(model, lr_backbone=args.lr_backbone, lr_head=args.lr_head, weight_decay=args.weight_decay)
-    scheduler = CosineAnnealingLR(optimizer, T_max=max(args.epochs, 1))
+    scheduler = get_scheduler(optimizer, epochs=args.epochs, warmup_epochs=args.warmup_epochs)
     scaler = create_grad_scaler(device=device, enabled=amp_enabled)
+    ema = None if args.no_ema else ModelEMA(model, decay=float(args.ema_decay))
 
     start_epoch = 1
     best_val_loss = float("inf")
+    no_improve_epochs = 0
     if args.resume is not None and args.resume.exists():
         ckpt = torch.load(str(args.resume), map_location=device)
         model.load_state_dict(ckpt["model_state_dict"], strict=True)
@@ -562,6 +585,8 @@ def main() -> None:
             optimizer.load_state_dict(ckpt["optimizer_state_dict"])
         if "scheduler_state_dict" in ckpt:
             scheduler.load_state_dict(ckpt["scheduler_state_dict"])
+        if ema is not None and "ema_state_dict" in ckpt:
+            ema.ema.load_state_dict(ckpt["ema_state_dict"], strict=True)
         start_epoch = int(ckpt.get("epoch", 0)) + 1
         best_val_loss = float(ckpt.get("best_val_loss", float("inf")))
 
@@ -570,10 +595,11 @@ def main() -> None:
     last_path = args.checkpoint_dir / "last.pth"
 
     print(f"Device: {device}, AMP: {amp_enabled}")
-    print(f"DataLoader workers: {resolved_workers} (max_safe={max_safe_workers}), pin_memory={pin_memory}")
+    print(f"Workers: {num_workers} (safe max: {max_workers}), pin_memory={pin_memory}")
     print(f"Train samples: {len(train_ds)}, Val samples: {len(val_ds)}, Classes: {classes}")
     print(f"Balanced sampling: {not args.no_balanced_sampling}")
     print(f"Class weights enabled: {not args.no_class_weights}")
+    print(f"EMA enabled: {ema is not None}, early_stopping_patience={args.early_stopping_patience}")
     if class_weights is not None:
         print(f"Class weights: {[round(x, 4) for x in class_weights.tolist()]}")
 
@@ -587,9 +613,11 @@ def main() -> None:
             scaler=scaler,
             amp_enabled=amp_enabled,
             grad_clip_norm=float(args.grad_clip_norm),
+            ema=ema,
         )
+        eval_model = ema.ema if ema is not None else model
         val_metrics = validate_one_epoch(
-            model=model,
+            model=eval_model,
             criterion=criterion,
             loader=val_loader,
             device=device,
@@ -613,32 +641,47 @@ def main() -> None:
             best_val_loss=best_val_loss,
             classes=classes,
             img_size=args.img_size,
+            ema_state_dict=(ema.state_dict() if ema is not None else None),
         )
 
-        if val_metrics["loss"] < best_val_loss:
+        improved = val_metrics["loss"] < (best_val_loss - float(args.early_stopping_min_delta))
+        if improved:
             best_val_loss = val_metrics["loss"]
+            no_improve_epochs = 0
+            best_state_model = ema.ema if ema is not None else model
             save_checkpoint(
                 path=best_path,
-                model=model,
+                model=best_state_model,
                 optimizer=optimizer,
                 scheduler=scheduler,
                 epoch=epoch,
                 best_val_loss=best_val_loss,
                 classes=classes,
                 img_size=args.img_size,
+                ema_state_dict=(ema.state_dict() if ema is not None else None),
             )
             print(f"Saved best checkpoint: {best_path} (val_loss={best_val_loss:.4f})")
+        else:
+            no_improve_epochs += 1
+            if args.early_stopping_patience > 0 and no_improve_epochs >= args.early_stopping_patience:
+                print(
+                    f"Early stopping at epoch {epoch}: no val_loss improvement for "
+                    f"{no_improve_epochs} epoch(s)."
+                )
+                break
 
     if not best_path.exists():
+        best_state_model = ema.ema if ema is not None else model
         save_checkpoint(
             path=best_path,
-            model=model,
+            model=best_state_model,
             optimizer=optimizer,
             scheduler=scheduler,
             epoch=args.epochs,
             best_val_loss=best_val_loss,
             classes=classes,
             img_size=args.img_size,
+            ema_state_dict=(ema.state_dict() if ema is not None else None),
         )
 
     print(f"Training done. Best model: {best_path}")

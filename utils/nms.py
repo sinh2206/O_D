@@ -21,18 +21,26 @@ Pipeline:
 """
 
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 import torch
 
 try:
-    from .config import CLASS_NAMES, CONF_THRESH, IMG_SIZE, NMS_IOU_THRESH, NMS_IOU_THRESH_BY_CLASS, NUM_CLASSES, STRIDES
+    from .config import (
+        CLASS_NAMES,
+        CONF_THRESH,
+        IMG_SIZE,
+        NMS_IOU_THRESH,
+        NMS_IOU_THRESH_PER_CLASS,
+        NUM_CLASSES,
+        STRIDES,
+    )
 except Exception:
     # Safe fallbacks when config.py is not present.
     CLASS_NAMES = ["person", "car", "dog", "cat", "chair"]
     CONF_THRESH = 0.5
     NMS_IOU_THRESH = 0.35
-    NMS_IOU_THRESH_BY_CLASS = []
+    NMS_IOU_THRESH_PER_CLASS = [0.35, 0.35, 0.35, 0.35, 0.35]
     IMG_SIZE = 320
     NUM_CLASSES = 5
     STRIDES = [16, 32]
@@ -349,13 +357,22 @@ def nms_single_class(boxes: torch.Tensor, scores: torch.Tensor, iou_thresh: floa
     return torch.tensor(keep, dtype=torch.long, device=boxes.device)
 
 
+def _resolve_class_nms_thresh(
+    nms_thresh: Union[float, Sequence[float]],
+    class_index: int,
+) -> float:
+    if isinstance(nms_thresh, (list, tuple)):
+        if class_index < 0 or class_index >= len(nms_thresh):
+            return float(NMS_IOU_THRESH)
+        return float(nms_thresh[class_index])
+    return float(nms_thresh)
+
+
 def class_wise_nms(
     boxes: torch.Tensor,
     scores: torch.Tensor,
     class_ids: torch.Tensor,
-    class_names: Optional[Sequence[str]] = None,
-    per_class_nms_thresh: Optional[Sequence[float]] = None,
-    nms_thresh: float = NMS_IOU_THRESH,
+    nms_thresh: Union[float, Sequence[float]] = NMS_IOU_THRESH,
 ) -> torch.Tensor:
     """
     Apply NMS independently for each class id.
@@ -374,12 +391,9 @@ def class_wise_nms(
         if idx.numel() == 0:
             continue
 
-        cls_idx = int(cls.item())
-        cls_iou_thresh = float(nms_thresh)
-        if per_class_nms_thresh is not None and cls_idx >= 0 and cls_idx < len(per_class_nms_thresh):
-            cls_iou_thresh = float(per_class_nms_thresh[cls_idx])
-
-        cls_keep_rel = nms_single_class(boxes[idx], scores[idx], iou_thresh=cls_iou_thresh)
+        cls_i = int(cls.item())
+        cls_thresh = _resolve_class_nms_thresh(nms_thresh=nms_thresh, class_index=cls_i)
+        cls_keep_rel = nms_single_class(boxes[idx], scores[idx], iou_thresh=cls_thresh)
         keep_global.append(idx[cls_keep_rel])
 
     if not keep_global:
@@ -440,13 +454,6 @@ def suppress_same_class_contained(
     scores: torch.Tensor,
     class_ids: torch.Tensor,
 ) -> torch.Tensor:
-    """
-    Remove duplicates where two boxes of the same class have full containment.
-    Keep higher-score box when containment occurs.
-
-    Returns:
-        kept indices relative to input tensors.
-    """
     if boxes.numel() == 0:
         return torch.zeros((0,), dtype=torch.long, device=boxes.device)
 
@@ -457,7 +464,6 @@ def suppress_same_class_contained(
         idx = int(idx_t.item())
         cls = int(class_ids[idx].item())
         box = boxes[idx]
-
         drop = False
         for k in kept:
             if int(class_ids[k].item()) != cls:
@@ -466,7 +472,6 @@ def suppress_same_class_contained(
             if _is_fully_inside(box, keep_box) or _is_fully_inside(keep_box, box):
                 drop = True
                 break
-
         if not drop:
             kept.append(idx)
 
@@ -484,7 +489,7 @@ def postprocess_single_image(
     num_classes: int = NUM_CLASSES,
     img_size: int = IMG_SIZE,
     conf_thresh: float = CONF_THRESH,
-    nms_thresh: float = NMS_IOU_THRESH,
+    nms_thresh: Union[float, Sequence[float]] = NMS_IOU_THRESH_PER_CLASS,
     reg_decode: str = "auto",
     center_combine: str = "mul",
     background_index: Optional[int] = None,
@@ -524,8 +529,6 @@ def postprocess_single_image(
         boxes=boxes,
         scores=scores,
         class_ids=cls_ids,
-        class_names=class_names,
-        per_class_nms_thresh=NMS_IOU_THRESH_BY_CLASS,
         nms_thresh=nms_thresh,
     )
 
@@ -573,7 +576,7 @@ def postprocess_batch(
     num_classes: int = NUM_CLASSES,
     img_size: int = IMG_SIZE,
     conf_thresh: float = CONF_THRESH,
-    nms_thresh: float = NMS_IOU_THRESH,
+    nms_thresh: Union[float, Sequence[float]] = NMS_IOU_THRESH_PER_CLASS,
     reg_decode: str = "auto",
     center_combine: str = "mul",
     background_index: Optional[int] = None,

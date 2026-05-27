@@ -4,6 +4,7 @@ from .config import (
     FPN_CHANNELS,
     IMG_SIZE,
     NMS_IOU_THRESH,
+    NMS_IOU_THRESH_PER_CLASS,
     NUM_CLASSES,
     STRIDES,
 )
@@ -14,6 +15,7 @@ __all__ = [
     "FPN_CHANNELS",
     "IMG_SIZE",
     "NMS_IOU_THRESH",
+    "NMS_IOU_THRESH_PER_CLASS",
     "NUM_CLASSES",
     "STRIDES",
 ]
