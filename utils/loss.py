@@ -28,10 +28,10 @@ try:
     from .config import (
         FOCAL_ALPHA,
         FOCAL_GAMMA,
-        LABEL_SMOOTHING,
         LAMBDA_CLS,
         LAMBDA_CTR,
         LAMBDA_REG,
+        LABEL_SMOOTHING,
         NUM_CLASSES,
         STRIDES,
     )
@@ -41,10 +41,10 @@ except Exception:
     STRIDES = [16, 32]
     FOCAL_GAMMA = 2.0
     FOCAL_ALPHA = 0.25
-    LABEL_SMOOTHING = 0.03
     LAMBDA_CLS = 1.0
     LAMBDA_REG = 1.0
     LAMBDA_CTR = 0.5
+    LABEL_SMOOTHING = 0.05
 
 EPS = 1e-8
 DEFAULT_CENTER_RADIUS = 1.5
@@ -164,8 +164,8 @@ def focal_sigmoid_loss(
     alpha_t = alpha * targets + (1.0 - alpha) * (1.0 - targets)
     loss = alpha_t * (1.0 - p_t).pow(gamma) * ce
     if class_weights is not None:
-        w = class_weights.to(device=logits.device, dtype=logits.dtype).view(1, -1)
-        loss = loss * w
+        cw = class_weights.to(device=logits.device, dtype=logits.dtype).view(1, -1)
+        loss = loss * cw
 
     if reduction == "sum":
         return loss.sum()
@@ -341,7 +341,7 @@ def _assign_level_targets(
 
     Returns flat tensors over points (P):
       - cls_idx: (P,)      class id or background id
-      - cls_onehot: (P,C)  for sigmoid focal mode
+      - cls_onehot: kept for compatibility but unused in softmax-bg mode
       - reg_tlbr: (P,4)
       - ctr: (P,)
       - pos_mask: (P,)
@@ -357,9 +357,6 @@ def _assign_level_targets(
     pos_mask = torch.zeros((p,), device=device, dtype=torch.bool)
 
     if gt_boxes.numel() == 0:
-        if not use_softmax_bg:
-            # In sigmoid mode negatives are all-zero one-hot.
-            cls_idx.fill_(-1)
         return {
             "cls_idx": cls_idx,
             "cls_onehot": cls_onehot,
@@ -429,17 +426,10 @@ def _assign_level_targets(
 
         cls_onehot[pos_idx, assigned_labels] = 1.0
 
-        if use_softmax_bg:
-            cls_idx[pos_idx] = assigned_labels
-        else:
-            cls_idx[pos_idx] = assigned_labels
+        cls_idx[pos_idx] = assigned_labels
 
-    if use_softmax_bg:
-        # Negatives stay as background class.
-        cls_idx[~pos] = bg_index
-    else:
-        # Negatives stay one-hot all zeros (sigmoid focal).
-        cls_idx[~pos] = -1
+    # Negatives stay as background class.
+    cls_idx[~pos] = bg_index
 
     return {
         "cls_idx": cls_idx,
@@ -461,11 +451,13 @@ def build_targets(
     """
     Build multi-level targets from model outputs and raw GT targets.
 
+    `num_classes` is the number of foreground classes. The classification head
+    must output `num_classes + 1` channels, where the last channel is background.
+
     Returns:
       {
         "cls_targets":  list of tensors
           - softmax mode: (B,H,W) class index in [0..C] (C is background)
-          - sigmoid mode: (B,H,W,C) one-hot foreground labels
         "reg_targets":  list[(B,H,W,4)]  in order (t,l,b,r)
         "ctr_targets":  list[(B,H,W)]
         "pos_masks":    list[(B,H,W)] bool
@@ -482,9 +474,13 @@ def build_targets(
     batch_size = cls_levels[0].shape[0]
     device = cls_levels[0].device
 
-    # If class channels are C+1, use softmax focal with explicit background.
     c_out = cls_levels[0].shape[1]
-    use_softmax_bg = (c_out == int(num_classes) + 1)
+    use_softmax_bg = True
+    if c_out != int(num_classes) + 1:
+        raise ValueError(
+            f"Model classification head must output num_classes + 1 channels "
+            f"({int(num_classes) + 1}); got {c_out}."
+        )
     bg_index = int(num_classes)
 
     targets_list = _normalize_targets(targets, batch_size=batch_size, device=device)
@@ -505,10 +501,7 @@ def build_targets(
         points = build_level_points(h, w, float(stride), device=device)
         points_all.append(points)
 
-        if use_softmax_bg:
-            cls_lvl = torch.full((batch_size, h * w), fill_value=bg_index, device=device, dtype=torch.long)
-        else:
-            cls_lvl = torch.zeros((batch_size, h * w, num_classes), device=device, dtype=torch.float32)
+        cls_lvl = torch.full((batch_size, h * w), fill_value=bg_index, device=device, dtype=torch.long)
 
         reg_lvl = torch.zeros((batch_size, h * w, 4), device=device, dtype=torch.float32)
         ctr_lvl = torch.zeros((batch_size, h * w), device=device, dtype=torch.float32)
@@ -527,18 +520,12 @@ def build_targets(
                 center_radius=float(center_radius),
             )
 
-            if use_softmax_bg:
-                cls_lvl[b] = assigned["cls_idx"]
-            else:
-                cls_lvl[b] = assigned["cls_onehot"]
+            cls_lvl[b] = assigned["cls_idx"]
             reg_lvl[b] = assigned["reg_tlbr"]
             ctr_lvl[b] = assigned["ctr"]
             pos_lvl[b] = assigned["pos_mask"]
 
-        if use_softmax_bg:
-            cls_targets.append(cls_lvl.view(batch_size, h, w))
-        else:
-            cls_targets.append(cls_lvl.view(batch_size, h, w, num_classes))
+        cls_targets.append(cls_lvl.view(batch_size, h, w))
 
         reg_targets.append(reg_lvl.view(batch_size, h, w, 4))
         ctr_targets.append(ctr_lvl.view(batch_size, h, w))
@@ -575,7 +562,7 @@ def compute_loss(
 
     Expects model outputs like:
       {
-        "cls_logits": [B,C,H,W, ...],
+        "cls_logits": [B,C+1,H,W, ...],  # last channel is background
         "reg_preds": [B,4,H,W, ...],   # (t,l,b,r) non-negative preferred
         "center_logits": [B,1,H,W, ...] (optional),
         "strides": [16,32,...]
@@ -594,7 +581,6 @@ def compute_loss(
         use_scale_ranges=use_scale_ranges,
     )
 
-    use_softmax_bg = bool(target_pack["use_softmax_bg"])
     bg_index = int(target_pack["bg_index"])
 
     total_cls = cls_levels[0].new_tensor(0.0)
@@ -614,27 +600,15 @@ def compute_loss(
         ctr_tgt = target_pack["ctr_targets"][lvl].reshape(-1)
 
         # Classification loss.
-        if use_softmax_bg:
-            cls_tgt = target_pack["cls_targets"][lvl].reshape(-1)
-            cls_loss = focal_softmax_loss(
-                logits=cls_logits,
-                target_idx=cls_tgt,
-                bg_index=bg_index,
-                alpha=focal_alpha,
-                gamma=focal_gamma,
-                reduction="sum",
-            )
-        else:
-            cls_tgt = target_pack["cls_targets"][lvl].reshape(-1, int(num_classes))
-            cls_loss = focal_sigmoid_loss(
-                logits=cls_logits,
-                targets=cls_tgt,
-                alpha=focal_alpha,
-                gamma=focal_gamma,
-                class_weights=class_weights,
-                label_smoothing=label_smoothing,
-                reduction="sum",
-            )
+        cls_tgt = target_pack["cls_targets"][lvl].reshape(-1)
+        cls_loss = focal_softmax_loss(
+            logits=cls_logits,
+            target_idx=cls_tgt,
+            bg_index=bg_index,
+            alpha=focal_alpha,
+            gamma=focal_gamma,
+            reduction="sum",
+        )
         total_cls = total_cls + cls_loss
 
         # Regression and centerness only on positives.

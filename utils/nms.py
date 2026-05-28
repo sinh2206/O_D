@@ -21,19 +21,32 @@ Pipeline:
 """
 
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import torch
 
 try:
-    from .config import CLASS_NAMES, CONF_THRESH, IMG_SIZE, MAX_OBJECTS_PER_IMAGE, NMS_IOU_THRESH, NMS_IOU_THRESH_PER_CLASS, NUM_CLASSES, STRIDES
+    from .config import (
+        AGNOSTIC_NMS_IOU_THRESH,
+        CLASS_NAMES,
+        CONF_THRESH,
+        CROSS_CLASS_CONTAIN_THRESH,
+        CROSS_CLASS_IOU_THRESH,
+        IMG_SIZE,
+        NMS_IOU_THRESH,
+        NUM_CLASSES,
+        SAME_CLASS_CONTAIN_THRESH,
+        STRIDES,
+    )
 except Exception:
     # Safe fallbacks when config.py is not present.
     CLASS_NAMES = ["person", "car", "dog", "cat", "chair"]
     CONF_THRESH = 0.5
     NMS_IOU_THRESH = 0.35
-    MAX_OBJECTS_PER_IMAGE = 15
-    NMS_IOU_THRESH_PER_CLASS = [0.35, 0.35, 0.35, 0.35, 0.35]
+    AGNOSTIC_NMS_IOU_THRESH = 0.75
+    CROSS_CLASS_IOU_THRESH = 0.85
+    CROSS_CLASS_CONTAIN_THRESH = 0.9
+    SAME_CLASS_CONTAIN_THRESH = 0.82
     IMG_SIZE = 320
     NUM_CLASSES = 5
     STRIDES = [16, 32]
@@ -323,6 +336,23 @@ def _box_iou_xyxy(one: torch.Tensor, many: torch.Tensor) -> torch.Tensor:
     return inter / union
 
 
+def _intersection_over_small(one: torch.Tensor, many: torch.Tensor) -> torch.Tensor:
+    """Intersection over min(area_one, area_many)."""
+    xx1 = torch.maximum(one[0], many[:, 0])
+    yy1 = torch.maximum(one[1], many[:, 1])
+    xx2 = torch.minimum(one[2], many[:, 2])
+    yy2 = torch.minimum(one[3], many[:, 3])
+
+    inter_w = (xx2 - xx1).clamp(min=0)
+    inter_h = (yy2 - yy1).clamp(min=0)
+    inter = inter_w * inter_h
+
+    area_one = (one[2] - one[0]).clamp(min=0) * (one[3] - one[1]).clamp(min=0)
+    area_many = (many[:, 2] - many[:, 0]).clamp(min=0) * (many[:, 3] - many[:, 1]).clamp(min=0)
+    denom = torch.minimum(area_one.expand_as(area_many), area_many).clamp(min=1e-6)
+    return inter / denom
+
+
 def nms_single_class(boxes: torch.Tensor, scores: torch.Tensor, iou_thresh: float) -> torch.Tensor:
     """
     Pure PyTorch NMS for one class.
@@ -354,7 +384,7 @@ def class_wise_nms(
     boxes: torch.Tensor,
     scores: torch.Tensor,
     class_ids: torch.Tensor,
-    nms_thresh: Union[float, Sequence[float]] = NMS_IOU_THRESH,
+    nms_thresh: float = NMS_IOU_THRESH,
 ) -> torch.Tensor:
     """
     Apply NMS independently for each class id.
@@ -373,16 +403,7 @@ def class_wise_nms(
         if idx.numel() == 0:
             continue
 
-        cls_i = int(cls.item())
-        if isinstance(nms_thresh, (list, tuple)):
-            if 0 <= cls_i < len(nms_thresh):
-                cls_thresh = float(nms_thresh[cls_i])
-            else:
-                cls_thresh = float(NMS_IOU_THRESH)
-        else:
-            cls_thresh = float(nms_thresh)
-
-        cls_keep_rel = nms_single_class(boxes[idx], scores[idx], iou_thresh=cls_thresh)
+        cls_keep_rel = nms_single_class(boxes[idx], scores[idx], iou_thresh=float(nms_thresh))
         keep_global.append(idx[cls_keep_rel])
 
     if not keep_global:
@@ -392,6 +413,85 @@ def class_wise_nms(
     # Return in global confidence order.
     keep = keep[torch.argsort(scores[keep], descending=True)]
     return keep
+
+
+def class_agnostic_nms(boxes: torch.Tensor, scores: torch.Tensor, iou_thresh: float) -> torch.Tensor:
+    """Apply one more NMS pass without class separation."""
+    return nms_single_class(boxes=boxes, scores=scores, iou_thresh=float(iou_thresh))
+
+
+def suppress_cross_class_duplicates(
+    boxes: torch.Tensor,
+    scores: torch.Tensor,
+    class_ids: torch.Tensor,
+    iou_thresh: float,
+    contain_thresh: float,
+) -> torch.Tensor:
+    """
+    Remove lower-score boxes from different classes when they almost fully overlap.
+
+    This helps with errors like 'chair' predicted inside a high-confidence 'person'.
+    """
+    if boxes.numel() == 0:
+        return torch.zeros((0,), dtype=torch.long, device=boxes.device)
+
+    order = torch.argsort(scores, descending=True)
+    keep: List[int] = []
+
+    for idx in order.tolist():
+        cand_box = boxes[idx]
+        cand_cls = class_ids[idx]
+        drop = False
+        if keep:
+            kept_idx = torch.tensor(keep, dtype=torch.long, device=boxes.device)
+            kept_boxes = boxes[kept_idx]
+            kept_cls = class_ids[kept_idx]
+            cross_cls = kept_cls != cand_cls
+            if torch.any(cross_cls):
+                cross_boxes = kept_boxes[cross_cls]
+                iou = _box_iou_xyxy(cand_box, cross_boxes)
+                ios = _intersection_over_small(cand_box, cross_boxes)
+                if torch.any((iou > float(iou_thresh)) | (ios > float(contain_thresh))):
+                    drop = True
+        if not drop:
+            keep.append(idx)
+
+    return torch.tensor(keep, dtype=torch.long, device=boxes.device)
+
+
+def suppress_same_class_containment(
+    boxes: torch.Tensor,
+    scores: torch.Tensor,
+    class_ids: torch.Tensor,
+    contain_thresh: float,
+) -> torch.Tensor:
+    """
+    Remove lower-score duplicates of the same class when one box is almost contained in another.
+    """
+    if boxes.numel() == 0:
+        return torch.zeros((0,), dtype=torch.long, device=boxes.device)
+
+    order = torch.argsort(scores, descending=True)
+    keep: List[int] = []
+
+    for idx in order.tolist():
+        cand_box = boxes[idx]
+        cand_cls = class_ids[idx]
+        drop = False
+        if keep:
+            kept_idx = torch.tensor(keep, dtype=torch.long, device=boxes.device)
+            kept_boxes = boxes[kept_idx]
+            kept_cls = class_ids[kept_idx]
+            same_cls = kept_cls == cand_cls
+            if torch.any(same_cls):
+                same_boxes = kept_boxes[same_cls]
+                ios = _intersection_over_small(cand_box, same_boxes)
+                if torch.any(ios > float(contain_thresh)):
+                    drop = True
+        if not drop:
+            keep.append(idx)
+
+    return torch.tensor(keep, dtype=torch.long, device=boxes.device)
 
 
 def remap_boxes_to_original(boxes: torch.Tensor, meta: LetterboxMeta) -> torch.Tensor:
@@ -429,63 +529,6 @@ def filter_small_boxes(boxes: torch.Tensor, min_size: float = 2.0) -> torch.Tens
     return (w >= float(min_size)) & (h >= float(min_size))
 
 
-def _is_fully_inside(inner: torch.Tensor, outer: torch.Tensor) -> bool:
-    return bool(
-        inner[0] >= outer[0]
-        and inner[1] >= outer[1]
-        and inner[2] <= outer[2]
-        and inner[3] <= outer[3]
-    )
-
-
-def suppress_same_class_contained(
-    boxes: torch.Tensor,
-    scores: torch.Tensor,
-    class_ids: torch.Tensor,
-) -> torch.Tensor:
-    """
-    Keep the higher-confidence box when two boxes of the same class fully contain one another.
-    """
-    if boxes.numel() == 0:
-        return torch.zeros((0,), dtype=torch.long, device=boxes.device)
-
-    order = torch.argsort(scores, descending=True)
-    kept: List[int] = []
-
-    for idx_t in order:
-        idx = int(idx_t.item())
-        cls = int(class_ids[idx].item())
-        box = boxes[idx]
-
-        drop = False
-        for kept_idx in kept:
-            if int(class_ids[kept_idx].item()) != cls:
-                continue
-            kept_box = boxes[kept_idx]
-            if _is_fully_inside(box, kept_box) or _is_fully_inside(kept_box, box):
-                drop = True
-                break
-
-        if not drop:
-            kept.append(idx)
-
-    if not kept:
-        return torch.zeros((0,), dtype=torch.long, device=boxes.device)
-    return torch.as_tensor(kept, dtype=torch.long, device=boxes.device)
-
-
-def limit_boxes_per_image(
-    boxes: torch.Tensor,
-    scores: torch.Tensor,
-    class_ids: torch.Tensor,
-    max_objects: int = MAX_OBJECTS_PER_IMAGE,
-) -> torch.Tensor:
-    if boxes.numel() == 0 or max_objects <= 0:
-        return torch.zeros((0,), dtype=torch.long, device=boxes.device)
-    order = torch.argsort(scores, descending=True)
-    return order[: min(int(max_objects), int(order.numel()))]
-
-
 def postprocess_single_image(
     outputs: Dict[str, Any],
     image_id: str,
@@ -495,12 +538,15 @@ def postprocess_single_image(
     num_classes: int = NUM_CLASSES,
     img_size: int = IMG_SIZE,
     conf_thresh: float = CONF_THRESH,
-    nms_thresh: Union[float, Sequence[float]] = NMS_IOU_THRESH_PER_CLASS,
+    nms_thresh: float = NMS_IOU_THRESH,
     reg_decode: str = "auto",
     center_combine: str = "mul",
     background_index: Optional[int] = None,
     min_box_size: float = 2.0,
-    max_objects: int = MAX_OBJECTS_PER_IMAGE,
+    agnostic_nms_thresh: float = AGNOSTIC_NMS_IOU_THRESH,
+    same_class_contain_thresh: float = SAME_CLASS_CONTAIN_THRESH,
+    cross_class_iou_thresh: float = CROSS_CLASS_IOU_THRESH,
+    cross_class_contain_thresh: float = CROSS_CLASS_CONTAIN_THRESH,
 ) -> Dict[str, Any]:
     """
     Full decode + NMS + remap pipeline for one image.
@@ -543,6 +589,35 @@ def postprocess_single_image(
     scores = scores[keep]
     cls_ids = cls_ids[keep]
 
+    if agnostic_nms_thresh > 0:
+        keep = class_agnostic_nms(boxes=boxes, scores=scores, iou_thresh=agnostic_nms_thresh)
+        boxes = boxes[keep]
+        scores = scores[keep]
+        cls_ids = cls_ids[keep]
+
+    if same_class_contain_thresh > 0:
+        keep = suppress_same_class_containment(
+            boxes=boxes,
+            scores=scores,
+            class_ids=cls_ids,
+            contain_thresh=max(0.0, same_class_contain_thresh),
+        )
+        boxes = boxes[keep]
+        scores = scores[keep]
+        cls_ids = cls_ids[keep]
+
+    if cross_class_iou_thresh > 0 or cross_class_contain_thresh > 0:
+        keep = suppress_cross_class_duplicates(
+            boxes=boxes,
+            scores=scores,
+            class_ids=cls_ids,
+            iou_thresh=max(0.0, cross_class_iou_thresh),
+            contain_thresh=max(0.0, cross_class_contain_thresh),
+        )
+        boxes = boxes[keep]
+        scores = scores[keep]
+        cls_ids = cls_ids[keep]
+
     if letterbox_meta is not None:
         boxes = remap_boxes_to_original(boxes, letterbox_meta)
 
@@ -550,16 +625,6 @@ def postprocess_single_image(
     boxes = boxes[valid]
     scores = scores[valid]
     cls_ids = cls_ids[valid]
-
-    keep_contained = suppress_same_class_contained(boxes=boxes, scores=scores, class_ids=cls_ids)
-    boxes = boxes[keep_contained]
-    scores = scores[keep_contained]
-    cls_ids = cls_ids[keep_contained]
-
-    keep_top = limit_boxes_per_image(boxes=boxes, scores=scores, class_ids=cls_ids, max_objects=max_objects)
-    boxes = boxes[keep_top]
-    scores = scores[keep_top]
-    cls_ids = cls_ids[keep_top]
 
     pred_boxes: List[Dict[str, Any]] = []
     for b, s, c in zip(boxes.tolist(), scores.tolist(), cls_ids.tolist()):
@@ -588,12 +653,15 @@ def postprocess_batch(
     num_classes: int = NUM_CLASSES,
     img_size: int = IMG_SIZE,
     conf_thresh: float = CONF_THRESH,
-    nms_thresh: Union[float, Sequence[float]] = NMS_IOU_THRESH_PER_CLASS,
+    nms_thresh: float = NMS_IOU_THRESH,
     reg_decode: str = "auto",
     center_combine: str = "mul",
     background_index: Optional[int] = None,
     min_box_size: float = 2.0,
-    max_objects: int = MAX_OBJECTS_PER_IMAGE,
+    agnostic_nms_thresh: float = AGNOSTIC_NMS_IOU_THRESH,
+    same_class_contain_thresh: float = SAME_CLASS_CONTAIN_THRESH,
+    cross_class_iou_thresh: float = CROSS_CLASS_IOU_THRESH,
+    cross_class_contain_thresh: float = CROSS_CLASS_CONTAIN_THRESH,
 ) -> List[Dict[str, Any]]:
     """Batch wrapper for JSON-ready predictions."""
     bsz = outputs["cls_logits"][0].shape[0]
@@ -622,7 +690,10 @@ def postprocess_batch(
                 center_combine=center_combine,
                 background_index=background_index,
                 min_box_size=min_box_size,
-                max_objects=max_objects,
+                agnostic_nms_thresh=agnostic_nms_thresh,
+                same_class_contain_thresh=same_class_contain_thresh,
+                cross_class_iou_thresh=cross_class_iou_thresh,
+                cross_class_contain_thresh=cross_class_contain_thresh,
             )
         )
     return results

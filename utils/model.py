@@ -129,6 +129,8 @@ class AnchorFreeHead(nn.Module):
         self.cls_tower = nn.Sequential(*cls_layers)
         self.reg_tower = nn.Sequential(*reg_layers)
 
+        # `num_classes` is the number of output channels. For softmax+background
+        # training, pass len(class_names) + 1 so the last channel is background.
         self.cls_out = nn.Conv2d(in_ch, num_classes, kernel_size=1)
         self.reg_out = nn.Conv2d(in_ch, 4, kernel_size=1)
         self.center_out = nn.Conv2d(in_ch, 1, kernel_size=1)
@@ -187,6 +189,7 @@ class AnchorFreeDetector(nn.Module):
     ):
         super().__init__()
 
+        # `num_classes` here means output channels for the classification head.
         self.num_classes = num_classes
         self.legacy_single_output = legacy_single_output
 

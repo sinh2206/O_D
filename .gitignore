@@ -1,0 +1,6 @@
+results/
+example/
+example.py
+
+__pycache__/
+*.pyc
