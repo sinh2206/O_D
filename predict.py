@@ -96,6 +96,16 @@ def infer_output_num_classes(state_dict: Dict[str, torch.Tensor]) -> int:
     raise ValueError("Cannot infer output_num_classes from checkpoint state_dict.")
 
 
+def require_cuda_t4() -> None:
+    """Fail fast unless the runtime has a CUDA T4 GPU."""
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA GPU is required. This script is configured to run on a T4, not CPU.")
+
+    device_name = torch.cuda.get_device_name(0)
+    if "T4" not in device_name and "Tesla T4" not in device_name:
+        raise RuntimeError(f"Expected a T4 GPU, but found: {device_name}")
+
+
 def select_topk_images_by_objects(annotation_path: Path, image_dir: Path, top_k: int) -> List[Path]:
     data = load_annotation(annotation_path)
     images = data.get("images", [])
@@ -481,7 +491,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--val_data", type=Path, default=Path("public/annotations/val.json"))
     parser.add_argument("--train_image_dir", type=Path, default=Path("public/train/images"))
     parser.add_argument("--val_image_dir", type=Path, default=Path("public/val/images"))
-    parser.add_argument("--device", type=str, default="auto", choices=["auto", "cuda", "cpu"])
+    parser.add_argument("--device", type=str, default="auto", choices=["auto", "cuda"])
     return parser.parse_args()
 
 
@@ -492,10 +502,16 @@ def main() -> None:
     if args.image_dir is None and int(args.top_k_objects) <= 0 and int(args.error_top_k) <= 0:
         args.error_top_k = 100
 
+    require_cuda_t4()
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+
     if args.device == "auto":
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        device = torch.device("cuda:0")
     else:
         device = torch.device(args.device)
+    if device.type != "cuda":
+        raise RuntimeError("predict.py must run on CUDA T4; CPU execution is disabled.")
 
     model, ckpt_classes, ckpt_img_size, output_num_classes = load_checkpoint_model(args.checkpoint, device=device)
     class_names = ckpt_classes if ckpt_classes else CLASS_NAMES
@@ -583,6 +599,7 @@ def main() -> None:
     )
 
     print(f"Device: {device}")
+    print(f"GPU: {torch.cuda.get_device_name(0)}")
     print(f"Predicted images: {len(predictions)}")
     print(f"Saved JSON: {args.output}")
     print(f"Saved preview images: {saved} -> {args.preview_dir}")

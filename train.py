@@ -105,7 +105,7 @@ def apply_colab_fast_profile(args: argparse.Namespace) -> None:
     CPU overhead and a smaller input size.
     """
     args.img_size = min(int(args.img_size), 256) if int(args.img_size) > 0 else 256
-    args.batch_size = max(int(args.batch_size), 48)
+    args.batch_size = 32
     args.num_workers = min(max(int(args.num_workers), 2), 2)
     args.prefetch_factor = max(int(args.prefetch_factor), 4)
     args.no_balanced_sampling = True
@@ -114,6 +114,16 @@ def apply_colab_fast_profile(args: argparse.Namespace) -> None:
     args.label_smoothing = 0.0
     args.center_radius = min(float(args.center_radius), 1.0)
     args.no_lowlight_enhance = True
+
+
+def require_cuda_t4() -> None:
+    """Fail fast unless the runtime has a CUDA T4 GPU."""
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA GPU is required. This script is configured to run on a T4, not CPU.")
+
+    device_name = torch.cuda.get_device_name(0)
+    if "T4" not in device_name and "Tesla T4" not in device_name:
+        raise RuntimeError(f"Expected a T4 GPU, but found: {device_name}")
 
 
 def imread_unicode(path: Path) -> Optional[np.ndarray]:
@@ -549,12 +559,12 @@ def main() -> None:
     except Exception:
         pass
     cv2.setNumThreads(0)
-    if torch.cuda.is_available():
-        torch.backends.cuda.matmul.allow_tf32 = True
-        torch.backends.cudnn.allow_tf32 = True
+    require_cuda_t4()
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    amp_enabled = (device.type == "cuda") and (not args.no_amp)
+    device = torch.device("cuda:0")
+    amp_enabled = not args.no_amp
 
     train_samples, classes = parse_samples(args.train_data, args.image_dir, class_names=None)
     val_samples, _ = parse_samples(args.val_data, args.val_image_dir, class_names=classes)
@@ -653,6 +663,7 @@ def main() -> None:
     last_path = args.checkpoint_dir / "last.pth"
 
     print(f"Device: {device}, AMP: {amp_enabled}, channels_last=True")
+    print(f"GPU: {torch.cuda.get_device_name(0)}")
     print(f"Fast Colab profile: {args.fast_colab}")
     print(f"Train samples: {len(train_ds)}, Val samples: {len(val_ds)}, Classes: {classes}")
     print(f"Model output classes (incl bg): {output_num_classes}")
