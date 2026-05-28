@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
@@ -15,8 +16,10 @@ from utils.config import (
     CLASS_NAMES,
     CONF_THRESH,
     IMG_SIZE,
+    MAX_OBJECTS_PER_IMAGE,
     MEAN,
     NMS_IOU_THRESH,
+    NMS_IOU_THRESH_PER_CLASS,
     NUM_CLASSES,
     STD,
 )
@@ -24,6 +27,8 @@ from utils.model import AnchorFreeDetector
 from utils.nms import LetterboxMeta, postprocess_batch
 
 VALID_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
+DEFAULT_VAL_IMAGE_DIR = Path("public/val/images")
+DEFAULT_RESULTS_DIR = Path("results")
 
 
 def imread_unicode(path: Path) -> Optional[np.ndarray]:
@@ -86,6 +91,138 @@ def collect_images(image_dir: Path) -> List[Path]:
     return imgs
 
 
+def _round_half_up(value: float) -> int:
+    return int(math.floor(float(value) + 0.5))
+
+
+def _is_fully_inside(inner: Sequence[int], outer: Sequence[int]) -> bool:
+    return bool(
+        inner[0] >= outer[0]
+        and inner[1] >= outer[1]
+        and inner[2] <= outer[2]
+        and inner[3] <= outer[3]
+    )
+
+
+def _suppress_same_class_contained_int(boxes: List[dict]) -> List[dict]:
+    ordered = sorted(boxes, key=lambda b: float(b.get("confidence", 0.0)), reverse=True)
+    kept: List[dict] = []
+
+    for box in ordered:
+        cls = str(box.get("class", ""))
+        bbox = box.get("bbox", [])
+        if not isinstance(bbox, list) or len(bbox) != 4:
+            continue
+
+        bbox_i = [int(v) for v in bbox]
+        drop = False
+        for kept_box in kept:
+            if str(kept_box.get("class", "")) != cls:
+                continue
+            kept_bbox = [int(v) for v in kept_box["bbox"]]
+            if _is_fully_inside(bbox_i, kept_bbox) or _is_fully_inside(kept_bbox, bbox_i):
+                drop = True
+                break
+
+        if not drop:
+            new_box = dict(box)
+            new_box["bbox"] = bbox_i
+            kept.append(new_box)
+
+    return kept
+
+
+def sanitize_predictions_for_export(
+    predictions: List[dict],
+    image_dir: Path,
+    class_names: Sequence[str],
+    max_objects: int = MAX_OBJECTS_PER_IMAGE,
+) -> List[dict]:
+    valid_classes = set(class_names)
+    out: List[dict] = []
+
+    for pred in predictions:
+        image_id = str(pred.get("image_id", ""))
+        if not image_id:
+            continue
+
+        image = imread_unicode(image_dir / image_id)
+        if image is None:
+            continue
+        h, w = image.shape[:2]
+        if h <= 0 or w <= 0:
+            continue
+
+        cleaned: List[dict] = []
+        for box in pred.get("boxes", []):
+            cls_name = str(box.get("class", ""))
+            if cls_name not in valid_classes:
+                continue
+
+            conf = float(box.get("confidence", 0.0))
+            if not math.isfinite(conf):
+                continue
+            conf = max(0.0, min(1.0, conf))
+
+            bbox = box.get("bbox", [])
+            if not isinstance(bbox, list) or len(bbox) != 4:
+                continue
+            try:
+                x1, y1, x2, y2 = [float(v) for v in bbox]
+            except (TypeError, ValueError):
+                continue
+            if not all(math.isfinite(v) for v in (x1, y1, x2, y2)):
+                continue
+
+            x1 = max(0.0, min(float(w), x1))
+            x2 = max(0.0, min(float(w), x2))
+            y1 = max(0.0, min(float(h), y1))
+            y2 = max(0.0, min(float(h), y2))
+
+            ix1 = _round_half_up(x1)
+            iy1 = _round_half_up(y1)
+            ix2 = _round_half_up(x2)
+            iy2 = _round_half_up(y2)
+
+            ix1 = max(0, min(w - 1, ix1))
+            iy1 = max(0, min(h - 1, iy1))
+            ix2 = max(0, min(w, ix2))
+            iy2 = max(0, min(h, iy2))
+
+            if ix2 <= ix1:
+                if ix1 < w:
+                    ix2 = ix1 + 1
+                else:
+                    continue
+            if iy2 <= iy1:
+                if iy1 < h:
+                    iy2 = iy1 + 1
+                else:
+                    continue
+
+            cleaned.append(
+                {
+                    "class": cls_name,
+                    "confidence": float(conf),
+                    "bbox": [int(ix1), int(iy1), int(ix2), int(iy2)],
+                }
+            )
+
+        cleaned = _suppress_same_class_contained_int(cleaned)
+        cleaned = sorted(cleaned, key=lambda b: float(b.get("confidence", 0.0)), reverse=True)[: max(0, int(max_objects))]
+        out.append({"image_id": image_id, "boxes": cleaned})
+
+    return out
+
+
+def clean_results_dir(results_dir: Path) -> None:
+    if not results_dir.exists():
+        return
+    for p in results_dir.iterdir():
+        if p.is_file() and p.suffix.lower() in VALID_EXTS:
+            p.unlink()
+
+
 def draw_prediction(image_bgr: np.ndarray, boxes: Sequence[dict], class_names: Sequence[str]) -> np.ndarray:
     out = image_bgr.copy()
     cls_to_idx = {c: i for i, c in enumerate(class_names)}
@@ -93,7 +230,7 @@ def draw_prediction(image_bgr: np.ndarray, boxes: Sequence[dict], class_names: S
     for obj in boxes:
         cls_name = str(obj["class"])
         score = float(obj["confidence"])
-        x1, y1, x2, y2 = [int(round(v)) for v in obj["bbox"]]
+        x1, y1, x2, y2 = [int(v) for v in obj["bbox"]]
         idx = cls_to_idx.get(cls_name, 0)
         color = (
             int((53 * (idx + 1)) % 255),
@@ -173,6 +310,7 @@ def run_inference(
     conf_thresh: float,
     nms_thresh: float,
     class_names: Sequence[str],
+    max_objects: int = MAX_OBJECTS_PER_IMAGE,
 ) -> List[dict]:
     results: List[dict] = []
     amp_enabled = device.type == "cuda"
@@ -211,6 +349,7 @@ def run_inference(
             reg_decode="auto",
             center_combine="mul",
             min_box_size=2.0,
+            max_objects=max_objects,
         )
         results.extend(batch_results)
 
@@ -234,7 +373,6 @@ def save_preview_images(predictions: List[dict], image_dir: Path, preview_dir: P
             saved += 1
     return saved
 
-
 def load_checkpoint_model(checkpoint_path: Path, device: torch.device) -> Tuple[AnchorFreeDetector, List[str], int]:
     ckpt = torch.load(str(checkpoint_path), map_location=device)
     classes = ckpt.get("classes", CLASS_NAMES)
@@ -250,9 +388,9 @@ def load_checkpoint_model(checkpoint_path: Path, device: torch.device) -> Tuple[
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Predict with anchor-free detector and export JSON.")
-    parser.add_argument("--image_dir", type=Path, required=True)
-    parser.add_argument("--output", type=Path, default=Path("predictions.json"))
+    parser = argparse.ArgumentParser(description="Predict val set and export integer-bbox results.")
+    parser.add_argument("--image_dir", type=Path, default=DEFAULT_VAL_IMAGE_DIR)
+    parser.add_argument("--output", type=Path, default=DEFAULT_RESULTS_DIR / "val_predictions.json")
     parser.add_argument(
         "--checkpoint",
         "--model_path",
@@ -264,7 +402,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--img_size", type=int, default=IMG_SIZE)
     parser.add_argument("--batch_size", type=int, default=24)
     parser.add_argument("--conf_thresh", type=float, default=CONF_THRESH)
-    parser.add_argument("--nms_thresh", type=float, default=NMS_IOU_THRESH)
+    parser.add_argument(
+        "--nms_thresh",
+        type=str,
+        default=",".join(str(x) for x in NMS_IOU_THRESH_PER_CLASS),
+        help="Per-class NMS IoU thresholds in CLASS_NAMES order.",
+    )
     parser.add_argument(
         "--class_conf",
         type=str,
@@ -272,8 +415,8 @@ def parse_args() -> argparse.Namespace:
         help="Per-class thresholds in CLASS_NAMES order, e.g. '0.38,0.40,0.40,0.40,0.72'",
     )
     parser.add_argument("--chair_suppress_iou", type=float, default=CHAIR_SUPPRESS_WITH_PERSON_IOU)
-    parser.add_argument("--preview_dir", type=Path, default=Path("results"))
-    parser.add_argument("--preview_count", type=int, default=50)
+    parser.add_argument("--preview_dir", type=Path, default=DEFAULT_RESULTS_DIR)
+    parser.add_argument("--preview_count", type=int, default=-1, help="Use -1 to export all processed val images.")
     parser.add_argument("--device", type=str, default="auto", choices=["auto", "cuda", "cpu"])
     return parser.parse_args()
 
@@ -284,6 +427,13 @@ def main() -> None:
         raise FileNotFoundError(f"Checkpoint not found: {args.checkpoint}")
     if not args.image_dir.exists():
         raise FileNotFoundError(f"Image directory not found: {args.image_dir}")
+
+    if args.image_dir.resolve() != DEFAULT_VAL_IMAGE_DIR.resolve():
+        raise ValueError(f"--image_dir must be '{DEFAULT_VAL_IMAGE_DIR}'. Got: {args.image_dir}")
+    if args.output.resolve().parent != DEFAULT_RESULTS_DIR.resolve():
+        raise ValueError(f"--output must be inside '{DEFAULT_RESULTS_DIR}'. Got: {args.output}")
+    if args.preview_dir.resolve() != DEFAULT_RESULTS_DIR.resolve():
+        raise ValueError(f"--preview_dir must be '{DEFAULT_RESULTS_DIR}'. Got: {args.preview_dir}")
 
     if args.device == "auto":
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -306,6 +456,12 @@ def main() -> None:
     if not image_paths:
         raise ValueError(f"No images found in: {args.image_dir}")
 
+    clean_results_dir(args.preview_dir)
+
+    nms_thresh = [float(x.strip()) for x in str(args.nms_thresh).split(",") if x.strip()]
+    if len(nms_thresh) != len(class_names):
+        raise ValueError(f"--nms_thresh must have {len(class_names)} values (got {len(nms_thresh)}).")
+
     predictions = run_inference(
         model=model,
         image_paths=image_paths,
@@ -313,21 +469,29 @@ def main() -> None:
         batch_size=max(1, args.batch_size),
         img_size=img_size,
         conf_thresh=float(args.conf_thresh),
-        nms_thresh=float(args.nms_thresh),
+        nms_thresh=nms_thresh,
         class_names=class_names,
+        max_objects=MAX_OBJECTS_PER_IMAGE,
     )
     predictions = apply_class_thresholds(predictions, class_names=class_names, class_conf_thresh=class_conf)
     predictions = suppress_chair_inside_person(predictions, iou_thresh=float(args.chair_suppress_iou))
+    predictions = sanitize_predictions_for_export(
+        predictions=predictions,
+        image_dir=args.image_dir,
+        class_names=class_names,
+        max_objects=MAX_OBJECTS_PER_IMAGE,
+    )
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
     with args.output.open("w", encoding="utf-8") as f:
         json.dump(predictions, f, ensure_ascii=False, indent=2)
 
+    preview_limit = len(predictions) if int(args.preview_count) < 0 else max(0, min(len(predictions), int(args.preview_count)))
     saved = save_preview_images(
         predictions=predictions,
         image_dir=args.image_dir,
         preview_dir=args.preview_dir,
-        limit=max(0, args.preview_count),
+        limit=preview_limit,
         class_names=class_names,
     )
 

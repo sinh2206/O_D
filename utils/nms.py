@@ -21,17 +21,19 @@ Pipeline:
 """
 
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 import torch
 
 try:
-    from .config import CLASS_NAMES, CONF_THRESH, IMG_SIZE, NMS_IOU_THRESH, NUM_CLASSES, STRIDES
+    from .config import CLASS_NAMES, CONF_THRESH, IMG_SIZE, MAX_OBJECTS_PER_IMAGE, NMS_IOU_THRESH, NMS_IOU_THRESH_PER_CLASS, NUM_CLASSES, STRIDES
 except Exception:
     # Safe fallbacks when config.py is not present.
     CLASS_NAMES = ["person", "car", "dog", "cat", "chair"]
     CONF_THRESH = 0.5
     NMS_IOU_THRESH = 0.35
+    MAX_OBJECTS_PER_IMAGE = 15
+    NMS_IOU_THRESH_PER_CLASS = [0.35, 0.35, 0.35, 0.35, 0.35]
     IMG_SIZE = 320
     NUM_CLASSES = 5
     STRIDES = [16, 32]
@@ -352,7 +354,7 @@ def class_wise_nms(
     boxes: torch.Tensor,
     scores: torch.Tensor,
     class_ids: torch.Tensor,
-    nms_thresh: float = NMS_IOU_THRESH,
+    nms_thresh: Union[float, Sequence[float]] = NMS_IOU_THRESH,
 ) -> torch.Tensor:
     """
     Apply NMS independently for each class id.
@@ -371,7 +373,16 @@ def class_wise_nms(
         if idx.numel() == 0:
             continue
 
-        cls_keep_rel = nms_single_class(boxes[idx], scores[idx], iou_thresh=float(nms_thresh))
+        cls_i = int(cls.item())
+        if isinstance(nms_thresh, (list, tuple)):
+            if 0 <= cls_i < len(nms_thresh):
+                cls_thresh = float(nms_thresh[cls_i])
+            else:
+                cls_thresh = float(NMS_IOU_THRESH)
+        else:
+            cls_thresh = float(nms_thresh)
+
+        cls_keep_rel = nms_single_class(boxes[idx], scores[idx], iou_thresh=cls_thresh)
         keep_global.append(idx[cls_keep_rel])
 
     if not keep_global:
@@ -418,6 +429,63 @@ def filter_small_boxes(boxes: torch.Tensor, min_size: float = 2.0) -> torch.Tens
     return (w >= float(min_size)) & (h >= float(min_size))
 
 
+def _is_fully_inside(inner: torch.Tensor, outer: torch.Tensor) -> bool:
+    return bool(
+        inner[0] >= outer[0]
+        and inner[1] >= outer[1]
+        and inner[2] <= outer[2]
+        and inner[3] <= outer[3]
+    )
+
+
+def suppress_same_class_contained(
+    boxes: torch.Tensor,
+    scores: torch.Tensor,
+    class_ids: torch.Tensor,
+) -> torch.Tensor:
+    """
+    Keep the higher-confidence box when two boxes of the same class fully contain one another.
+    """
+    if boxes.numel() == 0:
+        return torch.zeros((0,), dtype=torch.long, device=boxes.device)
+
+    order = torch.argsort(scores, descending=True)
+    kept: List[int] = []
+
+    for idx_t in order:
+        idx = int(idx_t.item())
+        cls = int(class_ids[idx].item())
+        box = boxes[idx]
+
+        drop = False
+        for kept_idx in kept:
+            if int(class_ids[kept_idx].item()) != cls:
+                continue
+            kept_box = boxes[kept_idx]
+            if _is_fully_inside(box, kept_box) or _is_fully_inside(kept_box, box):
+                drop = True
+                break
+
+        if not drop:
+            kept.append(idx)
+
+    if not kept:
+        return torch.zeros((0,), dtype=torch.long, device=boxes.device)
+    return torch.as_tensor(kept, dtype=torch.long, device=boxes.device)
+
+
+def limit_boxes_per_image(
+    boxes: torch.Tensor,
+    scores: torch.Tensor,
+    class_ids: torch.Tensor,
+    max_objects: int = MAX_OBJECTS_PER_IMAGE,
+) -> torch.Tensor:
+    if boxes.numel() == 0 or max_objects <= 0:
+        return torch.zeros((0,), dtype=torch.long, device=boxes.device)
+    order = torch.argsort(scores, descending=True)
+    return order[: min(int(max_objects), int(order.numel()))]
+
+
 def postprocess_single_image(
     outputs: Dict[str, Any],
     image_id: str,
@@ -427,11 +495,12 @@ def postprocess_single_image(
     num_classes: int = NUM_CLASSES,
     img_size: int = IMG_SIZE,
     conf_thresh: float = CONF_THRESH,
-    nms_thresh: float = NMS_IOU_THRESH,
+    nms_thresh: Union[float, Sequence[float]] = NMS_IOU_THRESH_PER_CLASS,
     reg_decode: str = "auto",
     center_combine: str = "mul",
     background_index: Optional[int] = None,
     min_box_size: float = 2.0,
+    max_objects: int = MAX_OBJECTS_PER_IMAGE,
 ) -> Dict[str, Any]:
     """
     Full decode + NMS + remap pipeline for one image.
@@ -482,6 +551,16 @@ def postprocess_single_image(
     scores = scores[valid]
     cls_ids = cls_ids[valid]
 
+    keep_contained = suppress_same_class_contained(boxes=boxes, scores=scores, class_ids=cls_ids)
+    boxes = boxes[keep_contained]
+    scores = scores[keep_contained]
+    cls_ids = cls_ids[keep_contained]
+
+    keep_top = limit_boxes_per_image(boxes=boxes, scores=scores, class_ids=cls_ids, max_objects=max_objects)
+    boxes = boxes[keep_top]
+    scores = scores[keep_top]
+    cls_ids = cls_ids[keep_top]
+
     pred_boxes: List[Dict[str, Any]] = []
     for b, s, c in zip(boxes.tolist(), scores.tolist(), cls_ids.tolist()):
         cls_idx = int(c)
@@ -509,11 +588,12 @@ def postprocess_batch(
     num_classes: int = NUM_CLASSES,
     img_size: int = IMG_SIZE,
     conf_thresh: float = CONF_THRESH,
-    nms_thresh: float = NMS_IOU_THRESH,
+    nms_thresh: Union[float, Sequence[float]] = NMS_IOU_THRESH_PER_CLASS,
     reg_decode: str = "auto",
     center_combine: str = "mul",
     background_index: Optional[int] = None,
     min_box_size: float = 2.0,
+    max_objects: int = MAX_OBJECTS_PER_IMAGE,
 ) -> List[Dict[str, Any]]:
     """Batch wrapper for JSON-ready predictions."""
     bsz = outputs["cls_logits"][0].shape[0]
@@ -542,6 +622,7 @@ def postprocess_batch(
                 center_combine=center_combine,
                 background_index=background_index,
                 min_box_size=min_box_size,
+                max_objects=max_objects,
             )
         )
     return results
