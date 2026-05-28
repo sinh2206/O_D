@@ -97,35 +97,6 @@ def seed_everything(seed: int) -> None:
     torch.cuda.manual_seed_all(seed)
 
 
-def apply_colab_fast_profile(args: argparse.Namespace) -> None:
-    """
-    Tune defaults for a Google Colab T4 runtime.
-
-    The goal is throughput. This trades augmentation richness for much lower
-    CPU overhead and a smaller input size.
-    """
-    args.img_size = min(int(args.img_size), 256) if int(args.img_size) > 0 else 256
-    args.batch_size = 32
-    args.num_workers = min(max(int(args.num_workers), 2), 2)
-    args.prefetch_factor = max(int(args.prefetch_factor), 4)
-    args.no_balanced_sampling = True
-    args.no_prior_class_weights = True
-    args.no_scale_ranges = True
-    args.label_smoothing = 0.0
-    args.center_radius = min(float(args.center_radius), 1.0)
-    args.no_lowlight_enhance = True
-
-
-def require_cuda_t4() -> None:
-    """Fail fast unless the runtime has a CUDA T4 GPU."""
-    if not torch.cuda.is_available():
-        raise RuntimeError("CUDA GPU is required. This script is configured to run on a T4, not CPU.")
-
-    device_name = torch.cuda.get_device_name(0)
-    if "T4" not in device_name and "Tesla T4" not in device_name:
-        raise RuntimeError(f"Expected a T4 GPU, but found: {device_name}")
-
-
 def imread_unicode(path: Path) -> Optional[np.ndarray]:
     if not path.exists():
         return None
@@ -138,20 +109,6 @@ def imread_unicode(path: Path) -> Optional[np.ndarray]:
 def load_annotation(annotation_path: Path) -> dict:
     with annotation_path.open("r", encoding="utf-8") as f:
         return json.load(f)
-
-
-def infer_output_num_classes(state_dict: Dict[str, torch.Tensor]) -> int:
-    """
-    Infer classification head output channels from a model state dict.
-
-    We inspect the classification head weights because the checkpoint may come
-    from either the legacy C-channel model or the new C+1 softmax-bg model.
-    """
-    for key in ("head_s16.cls_out.weight", "head_s32.cls_out.weight"):
-        tensor = state_dict.get(key)
-        if tensor is not None and hasattr(tensor, "shape") and len(tensor.shape) >= 1:
-            return int(tensor.shape[0])
-    raise ValueError("Cannot infer output_num_classes from checkpoint state_dict.")
 
 
 def parse_samples(annotation_path: Path, image_dir: Path, class_names: Optional[List[str]] = None) -> Tuple[List[Sample], List[str]]:
@@ -218,24 +175,7 @@ def make_pad_if_needed(img_size: int):
     return A.PadIfNeeded(**kwargs)
 
 
-def get_train_transforms(img_size: int, fast_mode: bool = False) -> A.Compose:
-    if fast_mode:
-        return A.Compose(
-            [
-                A.Resize(height=img_size, width=img_size, interpolation=cv2.INTER_LINEAR),
-                A.HorizontalFlip(p=0.5),
-                A.Normalize(mean=MEAN, std=STD),
-                ToTensorV2(),
-            ],
-            bbox_params=A.BboxParams(
-                format="pascal_voc",
-                label_fields=["class_labels"],
-                min_area=4.0,
-                min_visibility=0.2,
-                clip=True,
-            ),
-        )
-
+def get_train_transforms(img_size: int) -> A.Compose:
     affine_params = inspect.signature(A.Affine.__init__).parameters
     affine_kwargs = dict(
         scale=(0.92, 1.08),
@@ -286,11 +226,11 @@ def get_train_transforms(img_size: int, fast_mode: bool = False) -> A.Compose:
     )
 
 
-def get_val_transforms(img_size: int, fast_mode: bool = False) -> A.Compose:
+def get_val_transforms(img_size: int) -> A.Compose:
     return A.Compose(
         [
-            A.Resize(height=img_size, width=img_size, interpolation=cv2.INTER_LINEAR) if fast_mode else A.LongestMaxSize(max_size=img_size, interpolation=cv2.INTER_LINEAR),
-            make_pad_if_needed(img_size) if not fast_mode else A.NoOp(),
+            A.LongestMaxSize(max_size=img_size, interpolation=cv2.INTER_LINEAR),
+            make_pad_if_needed(img_size),
             A.Normalize(mean=MEAN, std=STD),
             ToTensorV2(),
         ],
@@ -305,10 +245,9 @@ def get_val_transforms(img_size: int, fast_mode: bool = False) -> A.Compose:
 
 
 class DetectionDataset(Dataset):
-    def __init__(self, samples: List[Sample], transforms: A.Compose, use_low_light_enhance: bool = True):
+    def __init__(self, samples: List[Sample], transforms: A.Compose):
         self.samples = samples
         self.transforms = transforms
-        self.use_low_light_enhance = bool(use_low_light_enhance)
 
     def __len__(self) -> int:
         return len(self.samples)
@@ -318,8 +257,7 @@ class DetectionDataset(Dataset):
         image = imread_unicode(sample.image_path)
         if image is None:
             raise FileNotFoundError(f"Cannot read image: {sample.image_path}")
-        if self.use_low_light_enhance:
-            image = enhance_low_light_bgr(image)
+        image = enhance_low_light_bgr(image)
         image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
 
         bboxes = [list(b) for b in sample.boxes]
@@ -356,8 +294,8 @@ def move_targets_to_device(targets: List[dict], device: torch.device) -> List[di
     for t in targets:
         out.append(
             {
-                "boxes": t["boxes"].to(device, non_blocking=True),
-                "labels": t["labels"].to(device, non_blocking=True),
+                "boxes": t["boxes"].to(device),
+                "labels": t["labels"].to(device),
                 "image_id": t["image_id"],
             }
         )
@@ -370,10 +308,9 @@ def make_dataloader(
     shuffle: bool,
     num_workers: int,
     sampler: Optional[WeightedRandomSampler] = None,
-    prefetch_factor: int = 4,
 ) -> DataLoader:
-    loader_kwargs = dict(
-        dataset=dataset,
+    return DataLoader(
+        dataset,
         batch_size=batch_size,
         shuffle=(shuffle and sampler is None),
         sampler=sampler,
@@ -382,11 +319,6 @@ def make_dataloader(
         persistent_workers=(num_workers > 0),
         drop_last=False,
         collate_fn=collate_fn,
-    )
-    if num_workers > 0:
-        loader_kwargs["prefetch_factor"] = max(2, int(prefetch_factor))
-    return DataLoader(
-        **loader_kwargs,
     )
 
 
@@ -404,11 +336,11 @@ def train_one_epoch(
     steps = 0
 
     for images, targets in loader:
-        images = images.to(device, non_blocking=True, memory_format=torch.channels_last)
+        images = images.to(device, non_blocking=True)
         targets = move_targets_to_device(targets, device)
 
         optimizer.zero_grad(set_to_none=True)
-        with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=amp_enabled):
+        with torch.autocast(device_type=device.type, enabled=amp_enabled):
             outputs = model(images)
             loss_dict = criterion(outputs, targets)
             loss = loss_dict["loss"]
@@ -444,10 +376,10 @@ def validate_one_epoch(
     steps = 0
 
     for images, targets in loader:
-        images = images.to(device, non_blocking=True, memory_format=torch.channels_last)
+        images = images.to(device, non_blocking=True)
         targets = move_targets_to_device(targets, device)
 
-        with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=amp_enabled):
+        with torch.autocast(device_type=device.type, enabled=amp_enabled):
             outputs = model(images)
             loss_dict = criterion(outputs, targets)
             loss = loss_dict["loss"]
@@ -467,19 +399,12 @@ def build_optimizer(model: AnchorFreeDetector, lr_backbone: float, lr_head: floa
     backbone_params = list(model.backbone_fpn.parameters())
     head_params = list(model.head_s16.parameters()) + list(model.head_s32.parameters())
 
-    adamw_kwargs = {"weight_decay": weight_decay}
-    adamw_sig = inspect.signature(AdamW.__init__).parameters
-    if torch.cuda.is_available() and "fused" in adamw_sig:
-        adamw_kwargs["fused"] = True
-    elif "foreach" in adamw_sig:
-        adamw_kwargs["foreach"] = True
-
     return AdamW(
         [
             {"params": backbone_params, "lr": lr_backbone},
             {"params": head_params, "lr": lr_head},
         ],
-        **adamw_kwargs,
+        weight_decay=weight_decay,
     )
 
 
@@ -492,7 +417,6 @@ def save_checkpoint(
     best_val_loss: float,
     classes: List[str],
     img_size: int,
-    output_num_classes: int,
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(
@@ -504,7 +428,6 @@ def save_checkpoint(
             "best_val_loss": best_val_loss,
             "classes": classes,
             "img_size": img_size,
-            "output_num_classes": int(output_num_classes),
             "strides": STRIDES,
         },
         str(path),
@@ -520,12 +443,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--checkpoint_dir", type=Path, default=Path("./models"))
     parser.add_argument("--img_size", type=int, default=IMG_SIZE)
     parser.add_argument("--batch_size", type=int, default=32)
-    parser.add_argument("--epochs", type=int, default=20)
-    parser.add_argument("--lr_backbone", type=float, default=2e-4)
-    parser.add_argument("--lr_head", type=float, default=2e-3)
+    parser.add_argument("--epochs", type=int, default=50)
+    parser.add_argument("--lr_backbone", type=float, default=3e-4)
+    parser.add_argument("--lr_head", type=float, default=3e-3)
     parser.add_argument("--weight_decay", type=float, default=1e-4)
-    parser.add_argument("--num_workers", type=int, default=4)
-    parser.add_argument("--prefetch_factor", type=int, default=4)
+    parser.add_argument("--num_workers", type=int, default=2)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--resume", type=Path, default=None)
     parser.add_argument("--label_smoothing", type=float, default=0.03)
@@ -534,59 +456,29 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no_balanced_sampling", action="store_true")
     parser.add_argument("--no_prior_class_weights", action="store_true")
     parser.add_argument("--no_amp", action="store_true")
-    parser.add_argument("--compile", action="store_true", help="Use torch.compile to improve steady-state throughput.")
-    parser.add_argument(
-        "--fast_colab",
-        action="store_true",
-        help="Throughput profile for Google Colab T4: smaller input size, light aug, fewer CPU workers.",
-    )
-    parser.add_argument(
-        "--no_lowlight_enhance",
-        action="store_true",
-        help="Disable CPU low-light enhancement in the training dataloader for higher throughput.",
-    )
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
-    if args.fast_colab:
-        apply_colab_fast_profile(args)
     seed_everything(args.seed)
     torch.backends.cudnn.benchmark = True
-    try:
-        torch.set_float32_matmul_precision("high")
-    except Exception:
-        pass
-    cv2.setNumThreads(0)
-    require_cuda_t4()
-    torch.backends.cuda.matmul.allow_tf32 = True
-    torch.backends.cudnn.allow_tf32 = True
 
-    device = torch.device("cuda:0")
-    amp_enabled = not args.no_amp
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    amp_enabled = (device.type == "cuda") and (not args.no_amp)
 
     train_samples, classes = parse_samples(args.train_data, args.image_dir, class_names=None)
     val_samples, _ = parse_samples(args.val_data, args.val_image_dir, class_names=classes)
     num_classes = len(classes)
 
-    train_ds = DetectionDataset(
-        train_samples,
-        transforms=get_train_transforms(args.img_size, fast_mode=args.fast_colab),
-        use_low_light_enhance=not args.no_lowlight_enhance,
-    )
-    val_ds = DetectionDataset(
-        val_samples,
-        transforms=get_val_transforms(args.img_size, fast_mode=args.fast_colab),
-        use_low_light_enhance=not args.no_lowlight_enhance,
-    )
+    train_ds = DetectionDataset(train_samples, transforms=get_train_transforms(args.img_size))
+    val_ds = DetectionDataset(val_samples, transforms=get_val_transforms(args.img_size))
 
     class_weights = compute_class_weights(
         train_samples,
         num_classes=num_classes,
         use_dataset_prior=not args.no_prior_class_weights,
     )
-    output_num_classes = num_classes + 1
     train_sampler = None
     if not args.no_balanced_sampling:
         sample_weights = build_sample_weights(train_samples, class_weights)
@@ -602,18 +494,10 @@ def main() -> None:
         shuffle=True,
         num_workers=args.num_workers,
         sampler=train_sampler,
-        prefetch_factor=args.prefetch_factor,
     )
-    val_loader = make_dataloader(
-        val_ds,
-        batch_size=args.batch_size,
-        shuffle=False,
-        num_workers=args.num_workers,
-        prefetch_factor=args.prefetch_factor,
-    )
+    val_loader = make_dataloader(val_ds, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers)
 
-    model = AnchorFreeDetector(num_classes=output_num_classes, pretrained=True).to(device)
-    model = model.to(memory_format=torch.channels_last)
+    model = AnchorFreeDetector(num_classes=num_classes, pretrained=True).to(device)
     criterion = DetectionLoss(
         num_classes=num_classes,
         strides=STRIDES,
@@ -622,53 +506,28 @@ def main() -> None:
         center_radius=float(args.center_radius),
         use_scale_ranges=not args.no_scale_ranges,
     ).to(device)
-
-    start_epoch = 1
-    best_val_loss = float("inf")
-    resume_optimizer_state = None
-    resume_scheduler_state = None
-    if args.resume is not None and args.resume.exists():
-        ckpt = torch.load(str(args.resume), map_location=device)
-        resume_output_num_classes = int(ckpt.get("output_num_classes", infer_output_num_classes(ckpt["model_state_dict"])))
-        if resume_output_num_classes != output_num_classes:
-            raise ValueError(
-                f"Resume checkpoint uses output_num_classes={resume_output_num_classes}, "
-                f"but current run expects {output_num_classes}. "
-                f"Legacy checkpoints must be retrained for the new softmax+background format."
-            )
-        model.load_state_dict(ckpt["model_state_dict"], strict=True)
-        resume_optimizer_state = ckpt.get("optimizer_state_dict")
-        resume_scheduler_state = ckpt.get("scheduler_state_dict")
-        start_epoch = int(ckpt.get("epoch", 0)) + 1
-        best_val_loss = float(ckpt.get("best_val_loss", float("inf")))
-
-    if args.compile:
-        try:
-            model = torch.compile(model, mode="reduce-overhead")
-            print("torch.compile enabled.")
-        except Exception as exc:
-            print(f"torch.compile unavailable, continuing without it: {exc}")
-
     optimizer = build_optimizer(model, lr_backbone=args.lr_backbone, lr_head=args.lr_head, weight_decay=args.weight_decay)
     scheduler = CosineAnnealingLR(optimizer, T_max=max(args.epochs, 1))
     scaler = torch.cuda.amp.GradScaler(enabled=amp_enabled)
 
-    if resume_optimizer_state is not None:
-        optimizer.load_state_dict(resume_optimizer_state)
-    if resume_scheduler_state is not None:
-        scheduler.load_state_dict(resume_scheduler_state)
+    start_epoch = 1
+    best_val_loss = float("inf")
+    if args.resume is not None and args.resume.exists():
+        ckpt = torch.load(str(args.resume), map_location=device)
+        model.load_state_dict(ckpt["model_state_dict"], strict=True)
+        if "optimizer_state_dict" in ckpt:
+            optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+        if "scheduler_state_dict" in ckpt:
+            scheduler.load_state_dict(ckpt["scheduler_state_dict"])
+        start_epoch = int(ckpt.get("epoch", 0)) + 1
+        best_val_loss = float(ckpt.get("best_val_loss", float("inf")))
 
     args.checkpoint_dir.mkdir(parents=True, exist_ok=True)
     best_path = args.checkpoint_dir / "best.pth"
     last_path = args.checkpoint_dir / "last.pth"
 
-    print(f"Device: {device}, AMP: {amp_enabled}, channels_last=True")
-    print(f"GPU: {torch.cuda.get_device_name(0)}")
-    print(f"Fast Colab profile: {args.fast_colab}")
+    print(f"Device: {device}, AMP: {amp_enabled}")
     print(f"Train samples: {len(train_ds)}, Val samples: {len(val_ds)}, Classes: {classes}")
-    print(f"Model output classes (incl bg): {output_num_classes}")
-    print(f"DataLoader workers: {args.num_workers}, prefetch_factor: {args.prefetch_factor}")
-    print(f"Low-light enhance: {not args.no_lowlight_enhance}")
     print(f"Class weight mode: {'dataset_prior(train+val)' if not args.no_prior_class_weights else 'empirical_train'}")
     print(f"Class weights: {class_weights.tolist()}")
 
@@ -707,7 +566,6 @@ def main() -> None:
             best_val_loss=best_val_loss,
             classes=classes,
             img_size=args.img_size,
-            output_num_classes=output_num_classes,
         )
 
         if val_metrics["loss"] < best_val_loss:
@@ -721,7 +579,6 @@ def main() -> None:
                 best_val_loss=best_val_loss,
                 classes=classes,
                 img_size=args.img_size,
-                output_num_classes=output_num_classes,
             )
             print(f"Saved best checkpoint: {best_path} (val_loss={best_val_loss:.4f})")
 
@@ -735,7 +592,6 @@ def main() -> None:
             best_val_loss=best_val_loss,
             classes=classes,
             img_size=args.img_size,
-            output_num_classes=output_num_classes,
         )
 
     print(f"Training done. Best model: {best_path}")
