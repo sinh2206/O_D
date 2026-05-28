@@ -259,9 +259,10 @@ def get_val_transforms(img_size: int) -> A.Compose:
 
 
 class DetectionDataset(Dataset):
-    def __init__(self, samples: List[Sample], transforms: A.Compose):
+    def __init__(self, samples: List[Sample], transforms: A.Compose, use_low_light_enhance: bool = True):
         self.samples = samples
         self.transforms = transforms
+        self.use_low_light_enhance = bool(use_low_light_enhance)
 
     def __len__(self) -> int:
         return len(self.samples)
@@ -271,7 +272,8 @@ class DetectionDataset(Dataset):
         image = imread_unicode(sample.image_path)
         if image is None:
             raise FileNotFoundError(f"Cannot read image: {sample.image_path}")
-        image = enhance_low_light_bgr(image)
+        if self.use_low_light_enhance:
+            image = enhance_low_light_bgr(image)
         image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
 
         bboxes = [list(b) for b in sample.boxes]
@@ -308,8 +310,8 @@ def move_targets_to_device(targets: List[dict], device: torch.device) -> List[di
     for t in targets:
         out.append(
             {
-                "boxes": t["boxes"].to(device),
-                "labels": t["labels"].to(device),
+                "boxes": t["boxes"].to(device, non_blocking=True),
+                "labels": t["labels"].to(device, non_blocking=True),
                 "image_id": t["image_id"],
             }
         )
@@ -322,9 +324,10 @@ def make_dataloader(
     shuffle: bool,
     num_workers: int,
     sampler: Optional[WeightedRandomSampler] = None,
+    prefetch_factor: int = 4,
 ) -> DataLoader:
-    return DataLoader(
-        dataset,
+    loader_kwargs = dict(
+        dataset=dataset,
         batch_size=batch_size,
         shuffle=(shuffle and sampler is None),
         sampler=sampler,
@@ -333,6 +336,11 @@ def make_dataloader(
         persistent_workers=(num_workers > 0),
         drop_last=False,
         collate_fn=collate_fn,
+    )
+    if num_workers > 0:
+        loader_kwargs["prefetch_factor"] = max(2, int(prefetch_factor))
+    return DataLoader(
+        **loader_kwargs,
     )
 
 
@@ -350,11 +358,11 @@ def train_one_epoch(
     steps = 0
 
     for images, targets in loader:
-        images = images.to(device, non_blocking=True)
+        images = images.to(device, non_blocking=True, memory_format=torch.channels_last)
         targets = move_targets_to_device(targets, device)
 
         optimizer.zero_grad(set_to_none=True)
-        with torch.autocast(device_type=device.type, enabled=amp_enabled):
+        with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=amp_enabled):
             outputs = model(images)
             loss_dict = criterion(outputs, targets)
             loss = loss_dict["loss"]
@@ -390,10 +398,10 @@ def validate_one_epoch(
     steps = 0
 
     for images, targets in loader:
-        images = images.to(device, non_blocking=True)
+        images = images.to(device, non_blocking=True, memory_format=torch.channels_last)
         targets = move_targets_to_device(targets, device)
 
-        with torch.autocast(device_type=device.type, enabled=amp_enabled):
+        with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=amp_enabled):
             outputs = model(images)
             loss_dict = criterion(outputs, targets)
             loss = loss_dict["loss"]
@@ -413,12 +421,19 @@ def build_optimizer(model: AnchorFreeDetector, lr_backbone: float, lr_head: floa
     backbone_params = list(model.backbone_fpn.parameters())
     head_params = list(model.head_s16.parameters()) + list(model.head_s32.parameters())
 
+    adamw_kwargs = {"weight_decay": weight_decay}
+    adamw_sig = inspect.signature(AdamW.__init__).parameters
+    if torch.cuda.is_available() and "fused" in adamw_sig:
+        adamw_kwargs["fused"] = True
+    elif "foreach" in adamw_sig:
+        adamw_kwargs["foreach"] = True
+
     return AdamW(
         [
             {"params": backbone_params, "lr": lr_backbone},
             {"params": head_params, "lr": lr_head},
         ],
-        weight_decay=weight_decay,
+        **adamw_kwargs,
     )
 
 
@@ -464,6 +479,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lr_head", type=float, default=2e-3)
     parser.add_argument("--weight_decay", type=float, default=1e-4)
     parser.add_argument("--num_workers", type=int, default=4)
+    parser.add_argument("--prefetch_factor", type=int, default=4)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--resume", type=Path, default=None)
     parser.add_argument("--label_smoothing", type=float, default=0.03)
@@ -472,6 +488,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no_balanced_sampling", action="store_true")
     parser.add_argument("--no_prior_class_weights", action="store_true")
     parser.add_argument("--no_amp", action="store_true")
+    parser.add_argument(
+        "--no_lowlight_enhance",
+        action="store_true",
+        help="Disable CPU low-light enhancement in the training dataloader for higher throughput.",
+    )
     return parser.parse_args()
 
 
@@ -479,6 +500,10 @@ def main() -> None:
     args = parse_args()
     seed_everything(args.seed)
     torch.backends.cudnn.benchmark = True
+    cv2.setNumThreads(0)
+    if torch.cuda.is_available():
+        torch.backends.cuda.matmul.allow_tf32 = False
+        torch.backends.cudnn.allow_tf32 = False
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     amp_enabled = (device.type == "cuda") and (not args.no_amp)
@@ -487,8 +512,16 @@ def main() -> None:
     val_samples, _ = parse_samples(args.val_data, args.val_image_dir, class_names=classes)
     num_classes = len(classes)
 
-    train_ds = DetectionDataset(train_samples, transforms=get_train_transforms(args.img_size))
-    val_ds = DetectionDataset(val_samples, transforms=get_val_transforms(args.img_size))
+    train_ds = DetectionDataset(
+        train_samples,
+        transforms=get_train_transforms(args.img_size),
+        use_low_light_enhance=not args.no_lowlight_enhance,
+    )
+    val_ds = DetectionDataset(
+        val_samples,
+        transforms=get_val_transforms(args.img_size),
+        use_low_light_enhance=not args.no_lowlight_enhance,
+    )
 
     class_weights = compute_class_weights(
         train_samples,
@@ -511,10 +544,18 @@ def main() -> None:
         shuffle=True,
         num_workers=args.num_workers,
         sampler=train_sampler,
+        prefetch_factor=args.prefetch_factor,
     )
-    val_loader = make_dataloader(val_ds, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers)
+    val_loader = make_dataloader(
+        val_ds,
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=args.num_workers,
+        prefetch_factor=args.prefetch_factor,
+    )
 
     model = AnchorFreeDetector(num_classes=output_num_classes, pretrained=True).to(device)
+    model = model.to(memory_format=torch.channels_last)
     criterion = DetectionLoss(
         num_classes=num_classes,
         strides=STRIDES,
@@ -550,9 +591,11 @@ def main() -> None:
     best_path = args.checkpoint_dir / "best.pth"
     last_path = args.checkpoint_dir / "last.pth"
 
-    print(f"Device: {device}, AMP: {amp_enabled}")
+    print(f"Device: {device}, AMP: {amp_enabled}, channels_last=True")
     print(f"Train samples: {len(train_ds)}, Val samples: {len(val_ds)}, Classes: {classes}")
     print(f"Model output classes (incl bg): {output_num_classes}")
+    print(f"DataLoader workers: {args.num_workers}, prefetch_factor: {args.prefetch_factor}")
+    print(f"Low-light enhance: {not args.no_lowlight_enhance}")
     print(f"Class weight mode: {'dataset_prior(train+val)' if not args.no_prior_class_weights else 'empirical_train'}")
     print(f"Class weights: {class_weights.tolist()}")
 
