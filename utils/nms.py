@@ -26,7 +26,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 import torch
 
 try:
-    from .config import CLASS_NAMES, CONF_THRESH, IMG_SIZE, NMS_IOU_THRESH, NUM_CLASSES, STRIDES
+    from .config import CLASS_NAMES, CONF_THRESH, IMG_SIZE, MAX_OBJECTS_PER_IMAGE, NMS_IOU_THRESH, NUM_CLASSES, STRIDES
 except Exception:
     # Safe fallbacks when config.py is not present.
     CLASS_NAMES = ["person", "car", "dog", "cat", "chair"]
@@ -35,6 +35,7 @@ except Exception:
     IMG_SIZE = 320
     NUM_CLASSES = 5
     STRIDES = [16, 32]
+    MAX_OBJECTS_PER_IMAGE = 15
 
 
 @dataclass
@@ -321,6 +322,52 @@ def _box_iou_xyxy(one: torch.Tensor, many: torch.Tensor) -> torch.Tensor:
     return inter / union
 
 
+def _is_fully_inside_xyxy(inner: torch.Tensor, outer: torch.Tensor) -> bool:
+    return bool(
+        float(inner[0]) >= float(outer[0])
+        and float(inner[1]) >= float(outer[1])
+        and float(inner[2]) <= float(outer[2])
+        and float(inner[3]) <= float(outer[3])
+    )
+
+
+def _suppress_same_class_contained(
+    boxes: torch.Tensor,
+    scores: torch.Tensor,
+    class_ids: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    if boxes.numel() == 0:
+        return boxes, scores, class_ids
+
+    order = torch.argsort(scores, descending=True)
+    keep: List[int] = []
+
+    for idx in order.tolist():
+        cls = int(class_ids[idx].item())
+        candidate = boxes[idx]
+        drop = False
+        for kept_idx in keep:
+            if int(class_ids[kept_idx].item()) != cls:
+                continue
+            kept_box = boxes[kept_idx]
+            if _is_fully_inside_xyxy(candidate, kept_box) or _is_fully_inside_xyxy(kept_box, candidate):
+                drop = True
+                break
+        if not drop:
+            keep.append(idx)
+
+    if not keep:
+        device = boxes.device
+        return (
+            torch.zeros((0, 4), dtype=boxes.dtype, device=device),
+            torch.zeros((0,), dtype=scores.dtype, device=device),
+            torch.zeros((0,), dtype=class_ids.dtype, device=device),
+        )
+
+    keep_idx = torch.tensor(keep, dtype=torch.long, device=boxes.device)
+    return boxes[keep_idx], scores[keep_idx], class_ids[keep_idx]
+
+
 def nms_single_class(boxes: torch.Tensor, scores: torch.Tensor, iou_thresh: float) -> torch.Tensor:
     """
     Pure PyTorch NMS for one class.
@@ -481,6 +528,14 @@ def postprocess_single_image(
     boxes = boxes[valid]
     scores = scores[valid]
     cls_ids = cls_ids[valid]
+
+    boxes, scores, cls_ids = _suppress_same_class_contained(boxes, scores, cls_ids)
+
+    if boxes.shape[0] > int(MAX_OBJECTS_PER_IMAGE):
+        topk = torch.argsort(scores, descending=True)[: int(MAX_OBJECTS_PER_IMAGE)]
+        boxes = boxes[topk]
+        scores = scores[topk]
+        cls_ids = cls_ids[topk]
 
     pred_boxes: List[Dict[str, Any]] = []
     for b, s, c in zip(boxes.tolist(), scores.tolist(), cls_ids.tolist()):

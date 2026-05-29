@@ -26,6 +26,7 @@ STD = [0.229, 0.224, 0.225]
 
 CONF_THRESH = 0.35
 NMS_IOU_THRESH = 0.35
+MAX_OBJECTS_PER_IMAGE = 15
 # Per-class confidence thresholds used after decode/NMS:
 # person, car, dog, cat, chair
 CLASS_CONF_THRESH = [0.38, 0.40, 0.40, 0.40, 0.72]

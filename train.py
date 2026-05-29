@@ -455,7 +455,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--val_image_dir", type=Path, required=True)
     parser.add_argument("--checkpoint_dir", type=Path, default=Path("./models"))
     parser.add_argument("--img_size", type=int, default=IMG_SIZE)
-    parser.add_argument("--batch_size", type=int, default=16)
+    parser.add_argument("--batch_size", type=int, default=12)
     parser.add_argument("--epochs", type=int, default=20)
     parser.add_argument("--lr_backbone", type=float, default=2e-4)
     parser.add_argument("--lr_head", type=float, default=2e-3)
