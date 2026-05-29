@@ -21,14 +21,16 @@ from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
 from utils.config import (
     CLASS_FREQ_PRIOR_TRAIN,
     CLASS_FREQ_PRIOR_VAL,
+    CLASS_LOSS_WEIGHTS,
     CLASS_NAMES,
+    CLASS_SAMPLER_WEIGHTS,
     IMG_SIZE,
+    LABEL_SMOOTHING,
     MEAN,
     NUM_CLASSES,
     STD,
     STRIDES,
 )
-from utils.image_ops import enhance_low_light_bgr
 from utils.loss import DetectionLoss
 from utils.model import AnchorFreeDetector
 
@@ -43,50 +45,43 @@ class Sample:
     labels: List[int]
 
 
-def compute_class_weights(samples: List[Sample], num_classes: int, use_dataset_prior: bool = True) -> torch.Tensor:
-    counts = np.zeros((num_classes,), dtype=np.float64)
-    for s in samples:
-        for y in s.labels:
-            if 0 <= int(y) < num_classes:
-                counts[int(y)] += 1.0
-
-    if use_dataset_prior and len(CLASS_FREQ_PRIOR_TRAIN) == num_classes and len(CLASS_FREQ_PRIOR_VAL) == num_classes:
-        prior_train = np.asarray(CLASS_FREQ_PRIOR_TRAIN, dtype=np.float64)
-        prior_val = np.asarray(CLASS_FREQ_PRIOR_VAL, dtype=np.float64)
-        prior = 0.5 * (prior_train + prior_val)
-        prior = np.clip(prior, 1e-6, None)
-        prior = prior / prior.sum()
-
-        # Safer weighting: inverse sqrt frequency (less aggressive than 1/freq).
-        weights = 1.0 / np.sqrt(prior)
-        weights = weights / max(weights.mean(), 1e-12)
-        weights = np.clip(weights, 0.5, 1.8)
+def compute_class_weights(num_classes: int) -> torch.Tensor:
+    if len(CLASS_FREQ_PRIOR_TRAIN) == num_classes and len(CLASS_FREQ_PRIOR_VAL) == num_classes:
+        p = 0.5 * (np.asarray(CLASS_FREQ_PRIOR_TRAIN, dtype=np.float64) + np.asarray(CLASS_FREQ_PRIOR_VAL, dtype=np.float64))
+        p = np.clip(p, 1e-6, None)
+        p = p / p.sum()
+        w = 1.0 / np.sqrt(p)
     else:
-        counts = np.maximum(counts, 1.0)
-        beta = 0.999
-        effective_num = 1.0 - np.power(beta, counts)
-        weights = (1.0 - beta) / np.maximum(effective_num, 1e-12)
-        weights = weights / max(weights.mean(), 1e-12)
-        weights = np.clip(weights, 0.7, 3.5)
-    return torch.as_tensor(weights, dtype=torch.float32)
+        w = np.ones((num_classes,), dtype=np.float64)
+
+    if len(CLASS_LOSS_WEIGHTS) == num_classes:
+        w = w * np.asarray(CLASS_LOSS_WEIGHTS, dtype=np.float64)
+
+    w = w / max(w.mean(), 1e-12)
+    w = np.clip(w, 0.55, 2.5)
+    return torch.as_tensor(w, dtype=torch.float32)
 
 
 def build_sample_weights(samples: List[Sample], class_weights: torch.Tensor) -> torch.Tensor:
     cw = class_weights.cpu().numpy().astype(np.float64)
+    class_sampler_weights = np.asarray(CLASS_SAMPLER_WEIGHTS, dtype=np.float64)
+    if class_sampler_weights.size != cw.size:
+        class_sampler_weights = np.ones_like(cw)
+
     ws = np.ones((len(samples),), dtype=np.float64)
     for i, s in enumerate(samples):
         if len(s.labels) == 0:
-            ws[i] = 1.0
+            ws[i] = 0.9
             continue
         uniq = np.unique(np.asarray(s.labels, dtype=np.int64))
         uniq = uniq[(uniq >= 0) & (uniq < len(cw))]
         if uniq.size == 0:
             ws[i] = 1.0
             continue
-        # Emphasize images containing rare classes.
-        ws[i] = float(np.max(cw[uniq]))
+        ws[i] = float(np.max(cw[uniq] * class_sampler_weights[uniq]))
+
     ws = ws / max(ws.mean(), 1e-12)
-    ws = np.clip(ws, 0.2, 6.0)
+    ws = np.clip(ws, 0.25, 4.5)
     return torch.as_tensor(ws, dtype=torch.double)
 
 
@@ -104,6 +99,24 @@ def imread_unicode(path: Path) -> Optional[np.ndarray]:
     if arr.size == 0:
         return None
     return cv2.imdecode(arr, cv2.IMREAD_COLOR)
+
+
+def enhance_low_light_bgr(image_bgr: np.ndarray) -> np.ndarray:
+    gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
+    if float(gray.mean()) >= 82.0:
+        return image_bgr
+
+    lab = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2LAB)
+    l, a, b = cv2.split(lab)
+    clahe = cv2.createCLAHE(clipLimit=2.2, tileGridSize=(8, 8))
+    l = clahe.apply(l)
+    merged = cv2.merge([l, a, b])
+    out = cv2.cvtColor(merged, cv2.COLOR_LAB2BGR)
+
+    lut = np.array([((i / 255.0) ** 0.82) * 255.0 for i in range(256)], dtype=np.float32)
+    lut = np.clip(lut, 0, 255).astype(np.uint8)
+    out = cv2.LUT(out, lut)
+    return out
 
 
 def load_annotation(annotation_path: Path) -> dict:
@@ -210,7 +223,7 @@ def get_train_transforms(img_size: int) -> A.Compose:
             make_pad_if_needed(img_size),
             A.HorizontalFlip(p=0.5),
             A.CLAHE(clip_limit=2.2, tile_grid_size=(8, 8), p=0.2),
-            A.RandomGamma(gamma_limit=(90, 120), p=0.2),
+            A.RandomGamma(gamma_limit=(88, 122), p=0.25),
             A.ColorJitter(brightness=0.12, contrast=0.12, saturation=0.1, hue=0.05, p=0.45),
             affine,
             A.Normalize(mean=MEAN, std=STD),
@@ -336,7 +349,7 @@ def train_one_epoch(
     steps = 0
 
     for images, targets in loader:
-        images = images.to(device, non_blocking=True)
+        images = images.to(device, non_blocking=True).to(memory_format=torch.channels_last)
         targets = move_targets_to_device(targets, device)
 
         optimizer.zero_grad(set_to_none=True)
@@ -376,7 +389,7 @@ def validate_one_epoch(
     steps = 0
 
     for images, targets in loader:
-        images = images.to(device, non_blocking=True)
+        images = images.to(device, non_blocking=True).to(memory_format=torch.channels_last)
         targets = move_targets_to_device(targets, device)
 
         with torch.autocast(device_type=device.type, enabled=amp_enabled):
@@ -442,19 +455,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--val_image_dir", type=Path, required=True)
     parser.add_argument("--checkpoint_dir", type=Path, default=Path("./models"))
     parser.add_argument("--img_size", type=int, default=IMG_SIZE)
-    parser.add_argument("--batch_size", type=int, default=24)
-    parser.add_argument("--epochs", type=int, default=25)
+    parser.add_argument("--batch_size", type=int, default=16)
+    parser.add_argument("--epochs", type=int, default=20)
     parser.add_argument("--lr_backbone", type=float, default=2e-4)
     parser.add_argument("--lr_head", type=float, default=2e-3)
     parser.add_argument("--weight_decay", type=float, default=1e-4)
     parser.add_argument("--num_workers", type=int, default=2)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--resume", type=Path, default=None)
-    parser.add_argument("--label_smoothing", type=float, default=0.03)
+    parser.add_argument("--label_smoothing", type=float, default=LABEL_SMOOTHING)
     parser.add_argument("--center_radius", type=float, default=1.3)
     parser.add_argument("--no_scale_ranges", action="store_true")
     parser.add_argument("--no_balanced_sampling", action="store_true")
-    parser.add_argument("--no_prior_class_weights", action="store_true")
+    parser.add_argument("--no_class_weights", action="store_true")
     parser.add_argument("--no_amp", action="store_true")
     return parser.parse_args()
 
@@ -463,6 +476,9 @@ def main() -> None:
     args = parse_args()
     seed_everything(args.seed)
     torch.backends.cudnn.benchmark = True
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    torch.set_float32_matmul_precision("high")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     amp_enabled = (device.type == "cuda") and (not args.no_amp)
@@ -474,13 +490,9 @@ def main() -> None:
     train_ds = DetectionDataset(train_samples, transforms=get_train_transforms(args.img_size))
     val_ds = DetectionDataset(val_samples, transforms=get_val_transforms(args.img_size))
 
-    class_weights = compute_class_weights(
-        train_samples,
-        num_classes=num_classes,
-        use_dataset_prior=not args.no_prior_class_weights,
-    )
+    class_weights = None if args.no_class_weights else compute_class_weights(num_classes=num_classes)
     train_sampler = None
-    if not args.no_balanced_sampling:
+    if not args.no_balanced_sampling and class_weights is not None:
         sample_weights = build_sample_weights(train_samples, class_weights)
         train_sampler = WeightedRandomSampler(
             weights=sample_weights,
@@ -497,7 +509,7 @@ def main() -> None:
     )
     val_loader = make_dataloader(val_ds, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers)
 
-    model = AnchorFreeDetector(num_classes=num_classes, pretrained=True).to(device)
+    model = AnchorFreeDetector(num_classes=num_classes, pretrained=True).to(device).to(memory_format=torch.channels_last)
     criterion = DetectionLoss(
         num_classes=num_classes,
         strides=STRIDES,
@@ -528,8 +540,10 @@ def main() -> None:
 
     print(f"Device: {device}, AMP: {amp_enabled}")
     print(f"Train samples: {len(train_ds)}, Val samples: {len(val_ds)}, Classes: {classes}")
-    print(f"Class weight mode: {'dataset_prior(train+val)' if not args.no_prior_class_weights else 'empirical_train'}")
-    print(f"Class weights: {class_weights.tolist()}")
+    print(f"Balanced sampling: {not args.no_balanced_sampling}")
+    print(f"Class weights enabled: {not args.no_class_weights}")
+    if class_weights is not None:
+        print(f"Class weights: {[round(x, 4) for x in class_weights.tolist()]}")
 
     for epoch in range(start_epoch, args.epochs + 1):
         train_metrics = train_one_epoch(

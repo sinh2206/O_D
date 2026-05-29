@@ -28,10 +28,10 @@ try:
     from .config import (
         FOCAL_ALPHA,
         FOCAL_GAMMA,
+        LABEL_SMOOTHING,
         LAMBDA_CLS,
         LAMBDA_CTR,
         LAMBDA_REG,
-        LABEL_SMOOTHING,
         NUM_CLASSES,
         STRIDES,
     )
@@ -41,10 +41,10 @@ except Exception:
     STRIDES = [16, 32]
     FOCAL_GAMMA = 2.0
     FOCAL_ALPHA = 0.25
+    LABEL_SMOOTHING = 0.03
     LAMBDA_CLS = 1.0
     LAMBDA_REG = 1.0
     LAMBDA_CTR = 0.5
-    LABEL_SMOOTHING = 0.05
 
 EPS = 1e-8
 DEFAULT_CENTER_RADIUS = 1.5
@@ -164,8 +164,8 @@ def focal_sigmoid_loss(
     alpha_t = alpha * targets + (1.0 - alpha) * (1.0 - targets)
     loss = alpha_t * (1.0 - p_t).pow(gamma) * ce
     if class_weights is not None:
-        cw = class_weights.to(device=logits.device, dtype=logits.dtype).view(1, -1)
-        loss = loss * cw
+        w = class_weights.to(device=logits.device, dtype=logits.dtype).view(1, -1)
+        loss = loss * w
 
     if reduction == "sum":
         return loss.sum()
