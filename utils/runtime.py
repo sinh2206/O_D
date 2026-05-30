@@ -104,7 +104,10 @@ def load_checkpoint(
 ) -> Tuple[int, float]:
     ckpt = torch.load(str(path), map_location=map_location)
     state_dict = ckpt.get("model_state_dict", ckpt)
-    model.load_state_dict(state_dict, strict=True)
+    try:
+        model.load_state_dict(state_dict, strict=True)
+    except RuntimeError:
+        model.load_state_dict(state_dict, strict=False)
 
     if optimizer is not None and "optimizer_state_dict" in ckpt:
         optimizer.load_state_dict(ckpt["optimizer_state_dict"])
@@ -127,7 +130,7 @@ def get_optimizer(
     for name, param in model.named_parameters():
         if not param.requires_grad:
             continue
-        if name.startswith("backbone."):
+        if name.startswith(("backbone.", "backbone_fpn.")):
             backbone_params.append(param)
         else:
             head_params.append(param)

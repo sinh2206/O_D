@@ -8,7 +8,7 @@ This module is synchronized with `utils/model.py` output format:
   "cls_logits": [Tensor(B,C,H,W), Tensor(B,C,H,W)],
   "reg_preds": [Tensor(B,4,H,W), Tensor(B,4,H,W)],   # (t,l,b,r)
   "center_logits": [Tensor(B,1,H,W), Tensor(B,1,H,W)] optional,
-  "strides": [16, 32]
+  "strides": [8, 16, 32]
 }
 
 Pipeline:
@@ -30,11 +30,11 @@ try:
 except Exception:
     # Safe fallbacks when config.py is not present.
     CLASS_NAMES = ["person", "car", "dog", "cat", "chair"]
-    CONF_THRESH = 0.25
+    CONF_THRESH = 0.20
     NMS_IOU_THRESH = 0.50
     IMG_SIZE = 320
     NUM_CLASSES = 5
-    STRIDES = [16, 32]
+    STRIDES = [8, 16, 32]
     MAX_OBJECTS_PER_IMAGE = 15
 
 
@@ -152,7 +152,7 @@ def decode_level(
     conf_thresh: float = CONF_THRESH,
     num_classes: int = NUM_CLASSES,
     reg_decode: str = "auto",
-    center_combine: str = "sqrt",
+    center_combine: str = "soft",
     background_index: Optional[int] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
@@ -189,6 +189,12 @@ def decode_level(
         center_combine = center_combine.lower()
         if center_combine == "sqrt":
             conf = torch.sqrt((cls_score * center).clamp(min=1e-12))
+        elif center_combine == "soft":
+            # Keep some centerness influence without collapsing confident class
+            # responses on crowded scenes.
+            conf = cls_score * (0.5 + 0.5 * center)
+        elif center_combine == "cls":
+            conf = cls_score
         else:
             conf = cls_score * center
     else:
@@ -240,7 +246,7 @@ def decode_multilevel(
     num_classes: int = NUM_CLASSES,
     strides: Optional[Sequence[int]] = None,
     reg_decode: str = "auto",
-    center_combine: str = "sqrt",
+    center_combine: str = "soft",
     background_index: Optional[int] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
@@ -477,7 +483,7 @@ def postprocess_single_image(
     conf_thresh: float = CONF_THRESH,
     nms_thresh: float = NMS_IOU_THRESH,
     reg_decode: str = "auto",
-    center_combine: str = "sqrt",
+    center_combine: str = "soft",
     background_index: Optional[int] = None,
     min_box_size: float = 2.0,
 ) -> Dict[str, Any]:
@@ -567,7 +573,7 @@ def postprocess_batch(
     conf_thresh: float = CONF_THRESH,
     nms_thresh: float = NMS_IOU_THRESH,
     reg_decode: str = "auto",
-    center_combine: str = "sqrt",
+    center_combine: str = "soft",
     background_index: Optional[int] = None,
     min_box_size: float = 2.0,
 ) -> List[Dict[str, Any]]:

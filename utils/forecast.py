@@ -78,20 +78,22 @@ class AnchorFreeForecastHead(nn.Module):
 
 
 class MultiScaleForecast(nn.Module):
-    """Two independent heads for stride16 and stride32 feature maps."""
+    """Three independent heads for stride8, stride16 and stride32 feature maps."""
 
     def __init__(self, in_ch: int = FPN_CHANNELS, num_classes: int = NUM_CLASSES):
         super().__init__()
+        self.head_s8 = AnchorFreeForecastHead(in_ch=in_ch, num_classes=num_classes)
         self.head_s16 = AnchorFreeForecastHead(in_ch=in_ch, num_classes=num_classes)
         self.head_s32 = AnchorFreeForecastHead(in_ch=in_ch, num_classes=num_classes)
 
-    def forward(self, p3_out: torch.Tensor, p4_out: torch.Tensor) -> Dict[str, Any]:
+    def forward(self, p2_out: torch.Tensor, p3_out: torch.Tensor, p4_out: torch.Tensor) -> Dict[str, Any]:
+        out8 = self.head_s8(p2_out)
         out16 = self.head_s16(p3_out)
         out32 = self.head_s32(p4_out)
         return {
-            "cls_logits": [out16["cls_logits"], out32["cls_logits"]],
-            "reg_preds": [out16["reg_preds"], out32["reg_preds"]],
-            "strides": [16, 32],
+            "cls_logits": [out8["cls_logits"], out16["cls_logits"], out32["cls_logits"]],
+            "reg_preds": [out8["reg_preds"], out16["reg_preds"], out32["reg_preds"]],
+            "strides": [8, 16, 32],
         }
 
 
@@ -183,7 +185,7 @@ def decode_multilevel(
     """
     cls_levels = outputs["cls_logits"]
     reg_levels = outputs["reg_preds"]
-    strides = outputs.get("strides", [16, 32])
+    strides = outputs.get("strides", [8, 16, 32])
 
     all_boxes: List[np.ndarray] = []
     all_scores: List[np.ndarray] = []

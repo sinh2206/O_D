@@ -39,7 +39,7 @@ try:
 except Exception:
     # Safe fallbacks so this module still works if config.py is not available.
     NUM_CLASSES = 5
-    STRIDES = [16, 32]
+    STRIDES = [8, 16, 32]
     FOCAL_GAMMA = 2.0
     FOCAL_ALPHA = 0.25
     LABEL_SMOOTHING = 0.03
@@ -166,7 +166,10 @@ def focal_sigmoid_loss(
     loss = alpha_t * (1.0 - p_t).pow(gamma) * ce
     if class_weights is not None:
         w = class_weights.to(device=logits.device, dtype=logits.dtype).view(1, -1)
-        loss = loss * w
+        # Weight positives more strongly, but do not amplify the vast number of
+        # negative locations for a class, which tends to suppress recall.
+        pos_mask = targets > 0.5
+        loss = torch.where(pos_mask, loss * w, loss)
 
     if reduction == "sum":
         return loss.sum()
@@ -309,7 +312,7 @@ def _default_scale_ranges(strides: Sequence[int]) -> List[Tuple[float, float]]:
     """
     FCOS-like object size ranges (max(l,t,r,b) in pixels) per level.
 
-    For strides [16, 32] -> [(0, 64), (64, inf)]
+    For strides [8, 16, 32] -> [(0, 32), (32, 64), (64, inf)]
     """
     ranges: List[Tuple[float, float]] = []
     for i, s in enumerate(strides):

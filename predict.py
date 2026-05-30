@@ -621,7 +621,7 @@ def suppress_chair_inside_person(predictions: List[dict], iou_thresh: float) -> 
                 if not _is_fully_inside(chair_box, person_box):
                     continue
                 person_area = _box_area(person_box)
-                if chair_area <= 0.60 * max(person_area, 1.0):
+                if chair_area <= 0.45 * max(person_area, 1.0):
                     remove = True
                     break
             if not remove:
@@ -676,7 +676,7 @@ def run_inference(
             conf_thresh=conf_thresh,
             nms_thresh=nms_thresh,
             reg_decode="auto",
-            center_combine="sqrt",
+            center_combine="soft",
             min_box_size=2.0,
         )
         results.extend(batch_results)
@@ -710,7 +710,13 @@ def load_checkpoint_model(checkpoint_path: Path, device: torch.device) -> Tuple[
 
     model = AnchorFreeDetector(num_classes=num_classes, pretrained=False).to(device)
     state = ckpt.get("model_state_dict", ckpt)
-    model.load_state_dict(state, strict=True)
+    try:
+        model.load_state_dict(state, strict=True)
+    except RuntimeError as exc:
+        missing, unexpected = model.load_state_dict(state, strict=False)
+        print(f"Checkpoint partially loaded ({exc}).")
+        print(f"Missing keys: {missing}")
+        print(f"Unexpected keys: {unexpected}")
     model.eval()
 
     return model, list(classes), img_size

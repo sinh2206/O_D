@@ -14,23 +14,23 @@ CLASS_TO_IDX = {name: i for i, name in enumerate(CLASS_NAMES)}
 CLASS_FREQ_PRIOR_TRAIN = [0.5477, 0.1258, 0.0966, 0.0783, 0.1516]
 CLASS_FREQ_PRIOR_VAL = [0.5314, 0.1400, 0.1019, 0.0871, 0.1395]
 
-# Training priorities to boost recall for person/car/dog/cat and suppress chair.
-CLASS_LOSS_WEIGHTS = [1.15, 1.05, 1.00, 1.05, 1.20]
-CLASS_SAMPLER_WEIGHTS = [1.10, 1.05, 1.00, 1.00, 1.10]
+# Training priorities to boost recall on crowded scenes without over-penalizing positives.
+CLASS_LOSS_WEIGHTS = [1.25, 1.05, 1.00, 1.00, 1.30]
+CLASS_SAMPLER_WEIGHTS = [1.20, 1.05, 1.00, 1.00, 1.20]
 
-STRIDES = [16, 32]
+STRIDES = [8, 16, 32]
 FPN_CHANNELS = 128
 
 MEAN = [0.485, 0.456, 0.406]
 STD = [0.229, 0.224, 0.225]
 
-CONF_THRESH = 0.25
+CONF_THRESH = 0.20
 NMS_IOU_THRESH = 0.50
 MAX_OBJECTS_PER_IMAGE = 15
 # Per-class confidence thresholds used after decode/NMS:
 # person, car, dog, cat, chair
-CLASS_CONF_THRESH = [0.28, 0.28, 0.26, 0.26, 0.32]
-CHAIR_SUPPRESS_WITH_PERSON_IOU = 0.80
+CLASS_CONF_THRESH = [0.22, 0.22, 0.20, 0.20, 0.24]
+CHAIR_SUPPRESS_WITH_PERSON_IOU = 0.92
 
 FOCAL_ALPHA = 0.25
 FOCAL_GAMMA = 2.0

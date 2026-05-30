@@ -49,7 +49,7 @@ def compute_class_weights(num_classes: int) -> torch.Tensor:
     # The hard cases show that person/chair scenes are underfit, so the
     # fixed weights keep those classes emphasized instead of downweighting
     # the dominant class too aggressively.
-    fixed_weights = np.asarray([1.15, 1.05, 1.00, 1.05, 1.20], dtype=np.float64)
+    fixed_weights = np.asarray([1.25, 1.05, 1.00, 1.00, 1.30], dtype=np.float64)
     if num_classes <= 0:
         return torch.zeros((0,), dtype=torch.float32)
     if num_classes == fixed_weights.size:
@@ -83,7 +83,7 @@ def build_sample_weights(samples: List[Sample], class_weights: torch.Tensor) -> 
         # Use all labels, not just unique classes, so crowded scenes with many
         # objects get sampled more often.
         base_weight = float(np.mean(cw[labels] * class_sampler_weights[labels]))
-        crowd_bonus = 1.0 + 0.12 * float(np.log1p(labels.size))
+        crowd_bonus = 1.0 + 0.08 * float(min(labels.size, 10))
         ws[i] = max(1.0, base_weight * crowd_bonus)
 
     ws = ws / max(ws.mean(), 1e-12)
@@ -416,7 +416,11 @@ def validate_one_epoch(
 
 def build_optimizer(model: AnchorFreeDetector, lr_backbone: float, lr_head: float, weight_decay: float) -> torch.optim.Optimizer:
     backbone_params = list(model.backbone_fpn.parameters())
-    head_params = list(model.head_s16.parameters()) + list(model.head_s32.parameters())
+    head_params = (
+        list(model.head_s8.parameters())
+        + list(model.head_s16.parameters())
+        + list(model.head_s32.parameters())
+    )
 
     return AdamW(
         [
@@ -454,7 +458,7 @@ def save_checkpoint(
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Train anchor-free detector (ResNet18 + 2-level FPN).")
+    parser = argparse.ArgumentParser(description="Train anchor-free detector (ResNet34 + 3-level FPN).")
     parser.add_argument("--train_data", type=Path, required=True)
     parser.add_argument("--val_data", type=Path, required=True)
     parser.add_argument("--image_dir", type=Path, required=True)
@@ -462,7 +466,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--checkpoint_dir", type=Path, default=Path("./models"))
     parser.add_argument("--img_size", type=int, default=IMG_SIZE)
     parser.add_argument("--batch_size", type=int, default=24)
-    parser.add_argument("--epochs", type=int, default=25)
+    parser.add_argument("--epochs", type=int, default=20)
     parser.add_argument("--lr_backbone", type=float, default=2e-4)
     parser.add_argument("--lr_head", type=float, default=2e-3)
     parser.add_argument("--weight_decay", type=float, default=1e-4)
@@ -470,7 +474,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--resume", type=Path, default=None)
     parser.add_argument("--label_smoothing", type=float, default=LABEL_SMOOTHING)
-    parser.add_argument("--center_radius", type=float, default=1.3)
+    parser.add_argument("--center_radius", type=float, default=1.5)
     parser.add_argument("--no_scale_ranges", action="store_true")
     parser.add_argument("--no_balanced_sampling", action="store_true")
     parser.add_argument("--no_class_weights", action="store_true")
@@ -532,7 +536,13 @@ def main() -> None:
     best_val_loss = float("inf")
     if args.resume is not None and args.resume.exists():
         ckpt = torch.load(str(args.resume), map_location=device)
-        model.load_state_dict(ckpt["model_state_dict"], strict=True)
+        try:
+            model.load_state_dict(ckpt["model_state_dict"], strict=True)
+        except RuntimeError as exc:
+            missing, unexpected = model.load_state_dict(ckpt["model_state_dict"], strict=False)
+            print(f"Resume checkpoint partially loaded ({exc}).")
+            print(f"Missing keys: {missing}")
+            print(f"Unexpected keys: {unexpected}")
         if "optimizer_state_dict" in ckpt:
             optimizer.load_state_dict(ckpt["optimizer_state_dict"])
         if "scheduler_state_dict" in ckpt:
