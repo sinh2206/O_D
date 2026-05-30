@@ -96,6 +96,44 @@ def _round_half_up(value: float) -> int:
     return int(math.floor(float(value) + 0.5))
 
 
+def _normalize_bbox_for_draw(bbox: Sequence[float], image_shape: Tuple[int, int, int]) -> Optional[List[int]]:
+    if not isinstance(bbox, (list, tuple)) or len(bbox) != 4:
+        return None
+    try:
+        x1, y1, x2, y2 = [float(v) for v in bbox]
+    except (TypeError, ValueError):
+        return None
+    if not all(math.isfinite(v) for v in (x1, y1, x2, y2)):
+        return None
+
+    h, w = int(image_shape[0]), int(image_shape[1])
+    if h <= 0 or w <= 0:
+        return None
+
+    x1 = max(0.0, min(float(w), x1))
+    y1 = max(0.0, min(float(h), y1))
+    x2 = max(0.0, min(float(w), x2))
+    y2 = max(0.0, min(float(h), y2))
+
+    ix1 = max(0, min(w - 1, _round_half_up(x1)))
+    iy1 = max(0, min(h - 1, _round_half_up(y1)))
+    ix2 = max(0, min(w - 1, _round_half_up(x2)))
+    iy2 = max(0, min(h - 1, _round_half_up(y2)))
+
+    if ix2 <= ix1:
+        if ix1 < w - 1:
+            ix2 = ix1 + 1
+        else:
+            return None
+    if iy2 <= iy1:
+        if iy1 < h - 1:
+            iy2 = iy1 + 1
+        else:
+            return None
+
+    return [int(ix1), int(iy1), int(ix2), int(iy2)]
+
+
 def _is_fully_inside(inner: Sequence[int], outer: Sequence[int]) -> bool:
     return bool(
         inner[0] >= outer[0]
@@ -131,6 +169,47 @@ def _suppress_same_class_contained_int(boxes: List[dict]) -> List[dict]:
             kept.append(new_box)
 
     return kept
+
+
+def _draw_labeled_box(
+    image_bgr: np.ndarray,
+    bbox: Sequence[float],
+    label: str,
+    color: Tuple[int, int, int],
+    thickness: int = 2,
+) -> None:
+    norm = _normalize_bbox_for_draw(bbox, image_bgr.shape)
+    if norm is None:
+        return
+
+    x1, y1, x2, y2 = norm
+    cv2.rectangle(image_bgr, (x1, y1), (x2, y2), color, thickness, cv2.LINE_AA)
+
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    font_scale = 0.45
+    text_thickness = 1
+    (tw, th), baseline = cv2.getTextSize(label, font, font_scale, text_thickness)
+
+    text_x = x1
+    text_y = y1 - 4
+    if text_y - th - baseline < 0:
+        text_y = min(image_bgr.shape[0] - 4, y2 + th + baseline + 4)
+
+    top = max(0, text_y - th - baseline - 2)
+    bottom = min(image_bgr.shape[0] - 1, text_y + baseline + 2)
+    right = min(image_bgr.shape[1] - 1, text_x + tw + 4)
+
+    cv2.rectangle(image_bgr, (text_x, top), (right, bottom), color, -1)
+    cv2.putText(
+        image_bgr,
+        label,
+        (text_x + 2, bottom - baseline - 1),
+        font,
+        font_scale,
+        (255, 255, 255),
+        text_thickness,
+        cv2.LINE_AA,
+    )
 
 
 def sanitize_predictions_for_export(
@@ -393,19 +472,15 @@ def draw_hardcase(
     )
 
     for gt_idx, gt in enumerate(gt_boxes):
-        x1, y1, x2, y2 = [int(v) for v in gt["bbox"]]
         cls_name = str(gt.get("class", ""))
         color = (80, 180, 255) if gt_is_matched[gt_idx] else (140, 140, 140)
-        cv2.rectangle(out, (x1, y1), (x2, y2), color, 2)
-        cv2.putText(out, f"GT:{cls_name}", (x1, max(14, y1 - 4)), cv2.FONT_HERSHEY_SIMPLEX, 0.42, color, 1, cv2.LINE_AA)
+        _draw_labeled_box(out, gt.get("bbox", [0, 0, 0, 0]), f"GT:{cls_name}", color, thickness=2)
 
     for pred_idx, pred in enumerate(pred_boxes):
-        x1, y1, x2, y2 = [int(v) for v in pred["bbox"]]
         cls_name = str(pred.get("class", ""))
         conf = float(pred.get("confidence", 0.0))
         color = (40, 220, 70) if pred_is_correct[pred_idx] else (30, 30, 255)
-        cv2.rectangle(out, (x1, y1), (x2, y2), color, 2)
-        cv2.putText(out, f"PD:{cls_name}:{conf:.2f}", (x1, min(out.shape[0] - 4, max(14, y2 + 14))), cv2.FONT_HERSHEY_SIMPLEX, 0.42, color, 1, cv2.LINE_AA)
+        _draw_labeled_box(out, pred.get("bbox", [0, 0, 0, 0]), f"PD:{cls_name}:{conf:.2f}", color, thickness=2)
 
     return out
 
@@ -445,15 +520,24 @@ def export_hardcase_images(
     results_dir.mkdir(parents=True, exist_ok=True)
     clean_results_dir(results_dir)
 
+    summary_path = results_dir / "hardcase_summary.json"
+    summary_path.write_text(json.dumps(top_items, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+    # Read back from summary so the exported images always match the file on disk.
+    summary_items = load_hardcase_summary(summary_path)
+
     saved = 0
-    for rank, item in enumerate(top_items, start=1):
-        image = imread_unicode(image_dir / item["image_id"])
+    for rank, item in enumerate(summary_items, start=1):
+        image_id = str(item.get("image_id", ""))
+        if not image_id:
+            continue
+        image = imread_unicode(image_dir / image_id)
         if image is None:
             continue
         vis = draw_hardcase(
             image,
-            gt.get(item["image_id"], []),
-            pred_map.get(item["image_id"], []),
+            gt.get(image_id, []),
+            pred_map.get(image_id, []),
             class_names=class_names,
             iou_thresh=iou_thresh,
         )
@@ -467,13 +551,31 @@ def export_hardcase_images(
             1,
             cv2.LINE_AA,
         )
-        out_name = f"hardcase_{rank:03d}_{item['image_id']}"
+        out_name = f"hardcase_{rank:03d}_{image_id}"
         if imwrite_unicode(results_dir / out_name, vis):
             saved += 1
 
-    summary_path = results_dir / "hardcase_summary.json"
-    summary_path.write_text(json.dumps(top_items, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     return saved, summary_path
+
+
+def load_hardcase_summary(summary_path: Path) -> List[dict]:
+    if not summary_path.exists():
+        return []
+    try:
+        data = json.loads(summary_path.read_text(encoding="utf-8"))
+    except Exception:
+        return []
+    if not isinstance(data, list):
+        return []
+    out: List[dict] = []
+    for item in data:
+        if not isinstance(item, dict):
+            continue
+        image_id = str(item.get("image_id", ""))
+        if not image_id:
+            continue
+        out.append(item)
+    return out
 
 
 def draw_prediction(image_bgr: np.ndarray, boxes: Sequence[dict], class_names: Sequence[str]) -> np.ndarray:
@@ -483,16 +585,14 @@ def draw_prediction(image_bgr: np.ndarray, boxes: Sequence[dict], class_names: S
     for obj in boxes:
         cls_name = str(obj["class"])
         score = float(obj["confidence"])
-        x1, y1, x2, y2 = [int(v) for v in obj["bbox"]]
         idx = cls_to_idx.get(cls_name, 0)
         color = (
             int((53 * (idx + 1)) % 255),
             int((97 * (idx + 1)) % 255),
             int((193 * (idx + 1)) % 255),
         )
-        cv2.rectangle(out, (x1, y1), (x2, y2), color, 2)
         label = f"{cls_name}:{score:.2f}"
-        cv2.putText(out, label, (x1, max(14, y1 - 4)), cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1, cv2.LINE_AA)
+        _draw_labeled_box(out, obj.get("bbox", [0, 0, 0, 0]), label, color, thickness=2)
     return out
 
 
@@ -531,6 +631,10 @@ def apply_class_thresholds(
 
 
 def suppress_chair_inside_person(predictions: List[dict], iou_thresh: float) -> List[dict]:
+    def _box_area(bbox: Sequence[float]) -> float:
+        x1, y1, x2, y2 = [float(v) for v in bbox]
+        return max(0.0, x2 - x1) * max(0.0, y2 - y1)
+
     out: List[dict] = []
     for pred in predictions:
         boxes = pred.get("boxes", [])
@@ -543,8 +647,15 @@ def suppress_chair_inside_person(predictions: List[dict], iou_thresh: float) -> 
                 continue
             chair_box = b.get("bbox", [0, 0, 0, 0])
             remove = False
+            chair_area = _box_area(chair_box)
             for p in persons:
-                if box_iou(chair_box, p.get("bbox", [0, 0, 0, 0])) >= float(iou_thresh):
+                person_box = p.get("bbox", [0, 0, 0, 0])
+                if box_iou(chair_box, person_box) < float(iou_thresh):
+                    continue
+                if not _is_fully_inside(chair_box, person_box):
+                    continue
+                person_area = _box_area(person_box)
+                if chair_area <= 0.60 * max(person_area, 1.0):
                     remove = True
                     break
             if not remove:
@@ -599,7 +710,7 @@ def run_inference(
             conf_thresh=conf_thresh,
             nms_thresh=nms_thresh,
             reg_decode="auto",
-            center_combine="mul",
+            center_combine="sqrt",
             min_box_size=2.0,
         )
         results.extend(batch_results)
@@ -654,7 +765,7 @@ def parse_args() -> argparse.Namespace:
         help="Path to trained model checkpoint (.pth). '--model_path' is kept as a backward-compatible alias.",
     )
     parser.add_argument("--img_size", type=int, default=IMG_SIZE)
-    parser.add_argument("--batch_size", type=int, default=32)
+    parser.add_argument("--batch_size", type=int, default=24)
     parser.add_argument("--conf_thresh", type=float, default=CONF_THRESH)
     parser.add_argument("--nms_thresh", type=float, default=NMS_IOU_THRESH)
     parser.add_argument(

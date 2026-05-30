@@ -46,7 +46,10 @@ class Sample:
 
 
 def compute_class_weights(num_classes: int) -> torch.Tensor:
-    fixed_weights = np.asarray([0.8, 0.8, 1.0, 1.2, 1.5], dtype=np.float64)
+    # The hard cases show that person/chair scenes are underfit, so the
+    # fixed weights keep those classes emphasized instead of downweighting
+    # the dominant class too aggressively.
+    fixed_weights = np.asarray([1.15, 1.05, 1.00, 1.05, 1.20], dtype=np.float64)
     if num_classes <= 0:
         return torch.zeros((0,), dtype=torch.float32)
     if num_classes == fixed_weights.size:
@@ -68,14 +71,20 @@ def build_sample_weights(samples: List[Sample], class_weights: torch.Tensor) -> 
     ws = np.ones((len(samples),), dtype=np.float64)
     for i, s in enumerate(samples):
         if len(s.labels) == 0:
-            ws[i] = 0.9
-            continue
-        uniq = np.unique(np.asarray(s.labels, dtype=np.int64))
-        uniq = uniq[(uniq >= 0) & (uniq < len(cw))]
-        if uniq.size == 0:
+            # Do not downsample empty scenes; they are important for lowering
+            # false positives on background-only images.
             ws[i] = 1.0
             continue
-        ws[i] = float(np.max(cw[uniq] * class_sampler_weights[uniq]))
+        labels = np.asarray(s.labels, dtype=np.int64)
+        labels = labels[(labels >= 0) & (labels < len(cw))]
+        if labels.size == 0:
+            ws[i] = 1.0
+            continue
+        # Use all labels, not just unique classes, so crowded scenes with many
+        # objects get sampled more often.
+        base_weight = float(np.mean(cw[labels] * class_sampler_weights[labels]))
+        crowd_bonus = 1.0 + 0.12 * float(np.log1p(labels.size))
+        ws[i] = max(1.0, base_weight * crowd_bonus)
 
     ws = ws / max(ws.mean(), 1e-12)
     ws = np.clip(ws, 0.25, 4.5)
@@ -452,8 +461,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--val_image_dir", type=Path, required=True)
     parser.add_argument("--checkpoint_dir", type=Path, default=Path("./models"))
     parser.add_argument("--img_size", type=int, default=IMG_SIZE)
-    parser.add_argument("--batch_size", type=int, default=32)
-    parser.add_argument("--epochs", type=int, default=30)
+    parser.add_argument("--batch_size", type=int, default=24)
+    parser.add_argument("--epochs", type=int, default=25)
     parser.add_argument("--lr_backbone", type=float, default=2e-4)
     parser.add_argument("--lr_head", type=float, default=2e-3)
     parser.add_argument("--weight_decay", type=float, default=1e-4)

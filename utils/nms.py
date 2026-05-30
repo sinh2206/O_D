@@ -30,8 +30,8 @@ try:
 except Exception:
     # Safe fallbacks when config.py is not present.
     CLASS_NAMES = ["person", "car", "dog", "cat", "chair"]
-    CONF_THRESH = 0.5
-    NMS_IOU_THRESH = 0.35
+    CONF_THRESH = 0.25
+    NMS_IOU_THRESH = 0.50
     IMG_SIZE = 320
     NUM_CLASSES = 5
     STRIDES = [16, 32]
@@ -152,7 +152,7 @@ def decode_level(
     conf_thresh: float = CONF_THRESH,
     num_classes: int = NUM_CLASSES,
     reg_decode: str = "auto",
-    center_combine: str = "mul",
+    center_combine: str = "sqrt",
     background_index: Optional[int] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
@@ -240,7 +240,7 @@ def decode_multilevel(
     num_classes: int = NUM_CLASSES,
     strides: Optional[Sequence[int]] = None,
     reg_decode: str = "auto",
-    center_combine: str = "mul",
+    center_combine: str = "sqrt",
     background_index: Optional[int] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
@@ -336,7 +336,6 @@ def _suppress_same_class_contained(
     scores: torch.Tensor,
     class_ids: torch.Tensor,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    dup_iou_thresh = 0.25
     if boxes.numel() == 0:
         return boxes, scores, class_ids
 
@@ -351,11 +350,8 @@ def _suppress_same_class_contained(
             if int(class_ids[kept_idx].item()) != cls:
                 continue
             kept_box = boxes[kept_idx]
-            if (
-                _is_fully_inside_xyxy(candidate, kept_box)
-                or _is_fully_inside_xyxy(kept_box, candidate)
-                or float(_box_iou_xyxy(candidate, kept_box.unsqueeze(0))[0].item()) >= dup_iou_thresh
-            ):
+            # Only remove true nested duplicates for the same class.
+            if _is_fully_inside_xyxy(candidate, kept_box) or _is_fully_inside_xyxy(kept_box, candidate):
                 drop = True
                 break
         if not drop:
@@ -481,7 +477,7 @@ def postprocess_single_image(
     conf_thresh: float = CONF_THRESH,
     nms_thresh: float = NMS_IOU_THRESH,
     reg_decode: str = "auto",
-    center_combine: str = "mul",
+    center_combine: str = "sqrt",
     background_index: Optional[int] = None,
     min_box_size: float = 2.0,
 ) -> Dict[str, Any]:
@@ -571,7 +567,7 @@ def postprocess_batch(
     conf_thresh: float = CONF_THRESH,
     nms_thresh: float = NMS_IOU_THRESH,
     reg_decode: str = "auto",
-    center_combine: str = "mul",
+    center_combine: str = "sqrt",
     background_index: Optional[int] = None,
     min_box_size: float = 2.0,
 ) -> List[Dict[str, Any]]:
