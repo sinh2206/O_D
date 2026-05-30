@@ -5,24 +5,13 @@ import json
 import os
 import random
 from pathlib import Path
-from typing import List, Optional, Sequence
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
-from torch.optim import AdamW
 from torch.utils.data import DataLoader, WeightedRandomSampler
 
-from utils.config import (
-    ANCHORS,
-    ANCHOR_MASKS,
-    CLASS_NAMES,
-    CLASS_SAMPLER_WEIGHTS,
-    DEFAULT_TRAIN_ANN,
-    DEFAULT_VAL_ANN,
-    IMG_SIZE,
-    LABEL_SMOOTHING,
-    STRIDES,
-)
+from utils.config import CLASS_NAMES, DEFAULT_TRAIN_ANN, DEFAULT_VAL_ANN, IMG_SIZE, LABEL_SMOOTHING, STRIDES
 from utils.loss import DetectionLoss
 from utils.model import YOLOv3
 from utils.process import DetectionDataset, collate_fn
@@ -68,8 +57,8 @@ def compute_class_weights(class_names: Sequence[str]) -> torch.Tensor:
 def build_sample_weights(records, class_weights: torch.Tensor, class_names: Sequence[str]) -> torch.Tensor:
     cw = class_weights.detach().cpu().numpy().astype(np.float64)
     sampler_weight_map = {
-        str(name): float(CLASS_SAMPLER_WEIGHTS[i]) if i < len(CLASS_SAMPLER_WEIGHTS) else 1.0
-        for i, name in enumerate(CLASS_NAMES)
+        str(name): float(weight)
+        for name, weight in zip(CLASS_NAMES, [1.10, 1.18, 1.10, 1.08, 0.72])
     }
 
     weights = np.ones((len(records),), dtype=np.float64)
@@ -83,11 +72,11 @@ def build_sample_weights(records, class_weights: torch.Tensor, class_names: Sequ
         if uniq.size == 0:
             weights[i] = 1.0
             continue
-        combined: List[float] = []
+        sample_weights = []
         for idx in uniq.tolist():
             cls_name = str(class_names[int(idx)]) if 0 <= int(idx) < len(class_names) else str(idx)
-            combined.append(float(cw[int(idx)] * sampler_weight_map.get(cls_name, 1.0)))
-        weights[i] = float(np.max(np.asarray(combined, dtype=np.float64)))
+            sample_weights.append(float(cw[int(idx)] * sampler_weight_map.get(cls_name, 1.0)))
+        weights[i] = float(np.max(np.asarray(sample_weights, dtype=np.float64)))
 
     weights = weights / max(weights.mean(), 1e-12)
     weights = np.clip(weights, 0.25, 4.5)
@@ -108,7 +97,7 @@ def build_optimizer(model: YOLOv3, lr_backbone: float, lr_head: float, weight_de
     if other_params:
         param_groups.append({"params": other_params, "lr": lr_head})
 
-    return AdamW(param_groups, weight_decay=weight_decay)
+    return torch.optim.AdamW(param_groups, weight_decay=weight_decay)
 
 
 def resolve_num_workers(requested: int, device: torch.device) -> int:
@@ -149,12 +138,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--val_image_dir", type=Path, default=Path("public/val/images"))
     parser.add_argument("--checkpoint_dir", type=Path, default=Path("models"))
     parser.add_argument("--img_size", type=int, default=IMG_SIZE)
-    parser.add_argument("--batch_size", type=int, default=12)
+    parser.add_argument("--batch_size", type=int, default=8)
     parser.add_argument("--epochs", type=int, default=25)
     parser.add_argument("--lr_backbone", type=float, default=2e-4)
     parser.add_argument("--lr_head", type=float, default=2e-3)
     parser.add_argument("--weight_decay", type=float, default=1e-4)
-    parser.add_argument("--num_workers", type=int, default=4)
+    parser.add_argument("--num_workers", type=int, default=6)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--resume", type=Path, default=None)
     parser.add_argument("--label_smoothing", type=float, default=LABEL_SMOOTHING)
@@ -247,8 +236,6 @@ def main() -> None:
         label_smoothing=float(args.label_smoothing),
         center_radius=float(args.center_radius),
         use_scale_ranges=not args.no_scale_ranges,
-        anchors=ANCHORS,
-        anchor_masks=ANCHOR_MASKS,
         img_size=args.img_size,
     ).to(device)
     optimizer = build_optimizer(model, lr_backbone=args.lr_backbone, lr_head=args.lr_head, weight_decay=args.weight_decay)
@@ -257,31 +244,32 @@ def main() -> None:
 
     start_epoch = 1
     best_val_loss = float("inf")
-    if args.resume is not None:
-        if not args.resume.exists():
-            raise FileNotFoundError(f"Resume checkpoint not found: {args.resume}")
+    if args.resume is not None and args.resume.exists():
         ckpt = load_checkpoint(args.resume, model, optimizer)
-        if "scheduler_state_dict" in ckpt:
-            scheduler.load_state_dict(ckpt["scheduler_state_dict"])
-        ckpt_classes = ckpt.get("classes")
-        if ckpt_classes is not None and list(ckpt_classes) != list(classes):
-            raise ValueError(f"Checkpoint classes {ckpt_classes} do not match dataset classes {classes}")
         start_epoch = int(ckpt.get("epoch", 0)) + 1
         best_val_loss = float(ckpt.get("best_val_loss", float("inf")))
+        if "scheduler_state_dict" in ckpt:
+            try:
+                scheduler.load_state_dict(ckpt["scheduler_state_dict"])
+            except Exception:
+                pass
+        print(f"Resumed from {args.resume} at epoch {start_epoch}")
 
     args.checkpoint_dir.mkdir(parents=True, exist_ok=True)
     best_path = args.checkpoint_dir / "best.pth"
     last_path = args.checkpoint_dir / "last.pth"
 
-    print(f"Device: {device_summary(device)}, AMP: {amp_enabled}")
+    print(f"Device: {device_summary(device)} | AMP: {amp_enabled}")
     print(f"Train samples: {len(train_ds)}, Val samples: {len(val_ds)}, Classes: {classes}")
     print(f"Balanced sampling: {not args.no_balanced_sampling}")
     print(f"Class weights enabled: {not args.no_class_weights}")
     if class_weights is not None:
-        print(f"Class weights: {[round(float(x), 4) for x in class_weights.tolist()]}")
-    print(f"Num workers: {num_workers}")
+        print(f"Class weights: {[round(x, 4) for x in class_weights.tolist()]}")
 
-    no_improve_epochs = 0
+    patience = max(0, int(args.early_stopping_patience))
+    min_delta = float(args.early_stopping_min_delta)
+    patience_left = patience
+
     for epoch in range(start_epoch, args.epochs + 1):
         train_metrics = train_one_epoch(
             model=model,
@@ -308,45 +296,8 @@ def main() -> None:
             f"val_loss={val_metrics['loss']:.4f}"
         )
 
-        checkpoint_extra = {
-            "scheduler_state_dict": scheduler.state_dict(),
-            "classes": classes,
-            "img_size": int(args.img_size),
-            "architecture": "yolov3",
-            "strides": STRIDES,
-            "anchors": ANCHORS,
-            "anchor_masks": ANCHOR_MASKS,
-        }
         save_checkpoint(
             path=last_path,
-            epoch=epoch,
-            model=model,
-            optimizer=optimizer,
-            best_val_loss=best_val_loss,
-            extra=checkpoint_extra,
-        )
-
-        if val_metrics["loss"] + float(args.early_stopping_min_delta) < best_val_loss:
-            best_val_loss = float(val_metrics["loss"])
-            no_improve_epochs = 0
-            save_checkpoint(
-                path=best_path,
-                epoch=epoch,
-                model=model,
-                optimizer=optimizer,
-                best_val_loss=best_val_loss,
-                extra=checkpoint_extra,
-            )
-            print(f"Saved best checkpoint: {best_path} (val_loss={best_val_loss:.4f})")
-        else:
-            no_improve_epochs += 1
-            if args.early_stopping_patience > 0 and no_improve_epochs >= args.early_stopping_patience:
-                print(f"Early stopping at epoch {epoch} after {no_improve_epochs} epochs without improvement.")
-                break
-
-    if not best_path.exists():
-        save_checkpoint(
-            path=best_path,
             epoch=epoch,
             model=model,
             optimizer=optimizer,
@@ -354,15 +305,40 @@ def main() -> None:
             extra={
                 "scheduler_state_dict": scheduler.state_dict(),
                 "classes": classes,
-                "img_size": int(args.img_size),
-                "architecture": "yolov3",
+                "img_size": args.img_size,
                 "strides": STRIDES,
-                "anchors": ANCHORS,
-                "anchor_masks": ANCHOR_MASKS,
+                "architecture": "yolov3",
             },
         )
 
-    print(f"Training done. Best model: {best_path}")
+        improved = val_metrics["loss"] < (best_val_loss - min_delta)
+        if improved:
+            best_val_loss = float(val_metrics["loss"])
+            patience_left = patience
+            save_checkpoint(
+                path=best_path,
+                epoch=epoch,
+                model=model,
+                optimizer=optimizer,
+                best_val_loss=best_val_loss,
+                extra={
+                    "scheduler_state_dict": scheduler.state_dict(),
+                    "classes": classes,
+                    "img_size": args.img_size,
+                    "strides": STRIDES,
+                    "architecture": "yolov3",
+                },
+            )
+            print(f"Saved best checkpoint: {best_path} (val_loss={best_val_loss:.4f})")
+        elif patience > 0:
+            patience_left -= 1
+            if patience_left <= 0:
+                print(f"Early stopping triggered at epoch {epoch}.")
+                break
+
+    print(f"Training complete. Best val loss: {best_val_loss:.4f}")
+    print(f"Best checkpoint: {best_path}")
+    print(f"Last checkpoint: {last_path}")
 
 
 if __name__ == "__main__":

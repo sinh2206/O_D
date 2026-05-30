@@ -146,6 +146,10 @@ class DetectionDataset(Dataset):
         if not self._records:
             raise ValueError(f"No valid samples found in {annotation_path} for image_dir={image_dir}")
 
+    @property
+    def records(self) -> List[DetectionSample]:
+        return self._records
+
     def __len__(self) -> int:
         return len(self._records)
 
