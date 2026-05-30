@@ -301,10 +301,9 @@ def clean_results_dir(results_dir: Path) -> None:
     for p in results_dir.iterdir():
         if not p.is_file():
             continue
-        if p.suffix.lower() in VALID_EXTS:
-            p.unlink()
-            continue
         if p.name == "hardcase_summary.json":
+            continue
+        if p.name.startswith("hardcase_") and p.suffix.lower() in VALID_EXTS:
             p.unlink()
 
 
@@ -485,7 +484,7 @@ def draw_hardcase(
     return out
 
 
-def export_hardcase_images(
+def export_hardcase_summary(
     predictions: List[dict],
     image_dir: Path,
     annotation_path: Path,
@@ -518,44 +517,11 @@ def export_hardcase_images(
     top_items = scored[: max(0, int(top_k))]
 
     results_dir.mkdir(parents=True, exist_ok=True)
-    clean_results_dir(results_dir)
 
     summary_path = results_dir / "hardcase_summary.json"
     summary_path.write_text(json.dumps(top_items, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
-    # Read back from summary so the exported images always match the file on disk.
-    summary_items = load_hardcase_summary(summary_path)
-
-    saved = 0
-    for rank, item in enumerate(summary_items, start=1):
-        image_id = str(item.get("image_id", ""))
-        if not image_id:
-            continue
-        image = imread_unicode(image_dir / image_id)
-        if image is None:
-            continue
-        vis = draw_hardcase(
-            image,
-            gt.get(image_id, []),
-            pred_map.get(image_id, []),
-            class_names=class_names,
-            iou_thresh=iou_thresh,
-        )
-        cv2.putText(
-            vis,
-            f"rank={rank} err={item['error_score']:.3f} ratio={item['error_ratio']:.3f} fn={item['fn']} fp={item['fp']}",
-            (8, max(20, vis.shape[0] - 10)),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.48,
-            (255, 255, 255),
-            1,
-            cv2.LINE_AA,
-        )
-        out_name = f"hardcase_{rank:03d}_{image_id}"
-        if imwrite_unicode(results_dir / out_name, vis):
-            saved += 1
-
-    return saved, summary_path
+    return len(top_items), summary_path
 
 
 def load_hardcase_summary(summary_path: Path) -> List[dict]:
@@ -751,7 +717,7 @@ def load_checkpoint_model(checkpoint_path: Path, device: torch.device) -> Tuple[
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Predict val set, export integer bbox JSON, and save hardcase images.")
+    parser = argparse.ArgumentParser(description="Predict val set, export integer bbox JSON, and save hardcase summary.")
     parser.add_argument("--image_dir", type=Path, default=DEFAULT_VAL_IMAGE_DIR)
     parser.add_argument("--val_annotation", type=Path, default=DEFAULT_VAL_ANNOTATION)
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT_JSON)
@@ -818,8 +784,6 @@ def main() -> None:
     if not image_paths:
         raise ValueError(f"No images found in: {args.image_dir}")
 
-    clean_results_dir(args.results_dir)
-
     predictions = run_inference(
         model=model,
         image_paths=image_paths,
@@ -839,11 +803,12 @@ def main() -> None:
         class_names=class_names,
         max_objects=MAX_OBJECTS_PER_IMAGE,
     )
+    clean_results_dir(args.results_dir)
     args.output.parent.mkdir(parents=True, exist_ok=True)
     with args.output.open("w", encoding="utf-8") as f:
         json.dump(predictions, f, ensure_ascii=False, indent=2)
 
-    saved, summary_path = export_hardcase_images(
+    hardcase_count, summary_path = export_hardcase_summary(
         predictions=predictions,
         image_dir=args.image_dir,
         annotation_path=args.val_annotation,
@@ -856,7 +821,7 @@ def main() -> None:
     print(f"Device: {device}")
     print(f"Predicted images: {len(predictions)}")
     print(f"Saved JSON: {args.output}")
-    print(f"Saved hardcase images: {saved} -> {args.results_dir}")
+    print(f"Hardcase items: {hardcase_count}")
     print(f"Hardcase summary: {summary_path}")
 
 
