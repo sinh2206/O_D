@@ -12,11 +12,13 @@ import torch
 
 from utils.config import (
     CHAIR_SUPPRESS_WITH_PERSON_IOU,
+    CHAIR_SUPPRESS_MAX_AREA_RATIO,
     CLASS_CONF_THRESH,
     CLASS_NAMES,
     CONF_THRESH,
     IMG_SIZE,
     MAX_OBJECTS_PER_IMAGE,
+    MIN_BOX_SIZE,
     MEAN,
     NMS_IOU_THRESH,
     NUM_CLASSES,
@@ -144,7 +146,21 @@ def _is_fully_inside(inner: Sequence[int], outer: Sequence[int]) -> bool:
 
 
 def _suppress_same_class_contained_int(boxes: List[dict]) -> List[dict]:
-    ordered = sorted(boxes, key=lambda b: float(b.get("confidence", 0.0)), reverse=True)
+    def _area(b: dict) -> float:
+        bbox = b.get("bbox", [0, 0, 0, 0])
+        if not isinstance(bbox, list) or len(bbox) != 4:
+            return 0.0
+        try:
+            x1, y1, x2, y2 = [float(v) for v in bbox]
+        except (TypeError, ValueError):
+            return 0.0
+        return max(0.0, x2 - x1) * max(0.0, y2 - y1)
+
+    ordered = sorted(
+        boxes,
+        key=lambda b: (_area(b), float(b.get("confidence", 0.0))),
+        reverse=True,
+    )
     kept: List[dict] = []
 
     for box in ordered:
@@ -621,7 +637,9 @@ def suppress_chair_inside_person(predictions: List[dict], iou_thresh: float) -> 
                 if not _is_fully_inside(chair_box, person_box):
                     continue
                 person_area = _box_area(person_box)
-                if chair_area <= 0.45 * max(person_area, 1.0):
+                if chair_area <= float(CHAIR_SUPPRESS_MAX_AREA_RATIO) * max(person_area, 1.0):
+                    if float(p.get("confidence", 0.0)) < float(b.get("confidence", 0.0)):
+                        continue
                     remove = True
                     break
             if not remove:
@@ -676,8 +694,8 @@ def run_inference(
             conf_thresh=conf_thresh,
             nms_thresh=nms_thresh,
             reg_decode="auto",
-            center_combine="soft",
-            min_box_size=2.0,
+            center_combine="cls",
+            min_box_size=MIN_BOX_SIZE,
         )
         results.extend(batch_results)
 
@@ -737,7 +755,7 @@ def parse_args() -> argparse.Namespace:
         help="Path to trained model checkpoint (.pth). '--model_path' is kept as a backward-compatible alias.",
     )
     parser.add_argument("--img_size", type=int, default=IMG_SIZE)
-    parser.add_argument("--batch_size", type=int, default=12)
+    parser.add_argument("--batch_size", type=int, default=24)
     parser.add_argument("--conf_thresh", type=float, default=CONF_THRESH)
     parser.add_argument("--nms_thresh", type=float, default=NMS_IOU_THRESH)
     parser.add_argument(
