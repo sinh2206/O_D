@@ -29,6 +29,7 @@ VALID_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 DEFAULT_VAL_IMAGE_DIR = Path("public/val/images")
 DEFAULT_VAL_ANNOTATION = Path("public/annotations/val.json")
 DEFAULT_RESULTS_DIR = Path("results")
+DEFAULT_OUTPUT_JSON = Path("val_predictions.json")
 
 
 def imread_unicode(path: Path) -> Optional[np.ndarray]:
@@ -575,7 +576,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Predict val set, export integer bbox JSON, and save hardcase images.")
     parser.add_argument("--image_dir", type=Path, default=DEFAULT_VAL_IMAGE_DIR)
     parser.add_argument("--val_annotation", type=Path, default=DEFAULT_VAL_ANNOTATION)
-    parser.add_argument("--output", type=Path, default=DEFAULT_RESULTS_DIR / "val_predictions.json")
+    parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT_JSON)
     parser.add_argument("--results_dir", type=Path, default=DEFAULT_RESULTS_DIR)
     parser.add_argument(
         "--checkpoint",
@@ -586,7 +587,7 @@ def parse_args() -> argparse.Namespace:
         help="Path to trained model checkpoint (.pth). '--model_path' is kept as a backward-compatible alias.",
     )
     parser.add_argument("--img_size", type=int, default=IMG_SIZE)
-    parser.add_argument("--batch_size", type=int, default=8)
+    parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--conf_thresh", type=float, default=CONF_THRESH)
     parser.add_argument("--nms_thresh", type=float, default=NMS_IOU_THRESH)
     parser.add_argument(
@@ -613,10 +614,10 @@ def main() -> None:
 
     if args.image_dir.resolve() != DEFAULT_VAL_IMAGE_DIR.resolve():
         raise ValueError(f"--image_dir must be '{DEFAULT_VAL_IMAGE_DIR}'. Got: {args.image_dir}")
+    if args.val_annotation.resolve() != DEFAULT_VAL_ANNOTATION.resolve():
+        raise ValueError(f"--val_annotation must be '{DEFAULT_VAL_ANNOTATION}'. Got: {args.val_annotation}")
     if args.results_dir.resolve() != DEFAULT_RESULTS_DIR.resolve():
         raise ValueError(f"--results_dir must be '{DEFAULT_RESULTS_DIR}'. Got: {args.results_dir}")
-    if args.output.resolve().parent != DEFAULT_RESULTS_DIR.resolve():
-        raise ValueError(f"--output must be inside '{DEFAULT_RESULTS_DIR}'. Got: {args.output}")
 
     if args.device == "auto":
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
