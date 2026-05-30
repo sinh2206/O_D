@@ -46,20 +46,17 @@ class Sample:
 
 
 def compute_class_weights(num_classes: int) -> torch.Tensor:
-    if len(CLASS_FREQ_PRIOR_TRAIN) == num_classes and len(CLASS_FREQ_PRIOR_VAL) == num_classes:
-        p = 0.5 * (np.asarray(CLASS_FREQ_PRIOR_TRAIN, dtype=np.float64) + np.asarray(CLASS_FREQ_PRIOR_VAL, dtype=np.float64))
-        p = np.clip(p, 1e-6, None)
-        p = p / p.sum()
-        w = 1.0 / np.sqrt(p)
+    fixed_weights = np.asarray([0.8, 0.8, 1.0, 1.2, 1.5], dtype=np.float64)
+    if num_classes <= 0:
+        return torch.zeros((0,), dtype=torch.float32)
+    if num_classes == fixed_weights.size:
+        weights = fixed_weights
+    elif num_classes < fixed_weights.size:
+        weights = fixed_weights[:num_classes]
     else:
-        w = np.ones((num_classes,), dtype=np.float64)
-
-    if len(CLASS_LOSS_WEIGHTS) == num_classes:
-        w = w * np.asarray(CLASS_LOSS_WEIGHTS, dtype=np.float64)
-
-    w = w / max(w.mean(), 1e-12)
-    w = np.clip(w, 0.55, 2.5)
-    return torch.as_tensor(w, dtype=torch.float32)
+        weights = np.ones((num_classes,), dtype=np.float64)
+        weights[: fixed_weights.size] = fixed_weights
+    return torch.as_tensor(weights, dtype=torch.float32)
 
 
 def build_sample_weights(samples: List[Sample], class_weights: torch.Tensor) -> torch.Tensor:
@@ -456,7 +453,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--checkpoint_dir", type=Path, default=Path("./models"))
     parser.add_argument("--img_size", type=int, default=IMG_SIZE)
     parser.add_argument("--batch_size", type=int, default=32)
-    parser.add_argument("--epochs", type=int, default=20)
+    parser.add_argument("--epochs", type=int, default=30)
     parser.add_argument("--lr_backbone", type=float, default=2e-4)
     parser.add_argument("--lr_head", type=float, default=2e-3)
     parser.add_argument("--weight_decay", type=float, default=1e-4)

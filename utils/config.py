@@ -29,7 +29,7 @@ NMS_IOU_THRESH = 0.35
 MAX_OBJECTS_PER_IMAGE = 15
 # Per-class confidence thresholds used after decode/NMS:
 # person, car, dog, cat, chair
-CLASS_CONF_THRESH = [0.38, 0.40, 0.40, 0.40, 0.72]
+CLASS_CONF_THRESH = [0.43, 0.43, 0.40, 0.40, 0.60]
 CHAIR_SUPPRESS_WITH_PERSON_IOU = 0.55
 
 FOCAL_ALPHA = 0.25

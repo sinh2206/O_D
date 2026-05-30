@@ -326,25 +326,86 @@ def score_image_error(
     }
 
 
+def match_predictions_to_ground_truth(
+    gt_boxes: Sequence[dict],
+    pred_boxes: Sequence[dict],
+    class_names: Sequence[str],
+    iou_thresh: float = 0.5,
+) -> Tuple[List[bool], List[Optional[int]], List[bool]]:
+    gt_by_class: Dict[str, List[Tuple[int, dict]]] = {}
+    for idx, gt in enumerate(gt_boxes):
+        cls_name = str(gt.get("class", ""))
+        if cls_name not in class_names:
+            continue
+        gt_by_class.setdefault(cls_name, []).append((idx, gt))
+
+    pred_sorted = sorted(
+        [(idx, pred) for idx, pred in enumerate(pred_boxes)],
+        key=lambda item: float(item[1].get("confidence", 0.0)),
+        reverse=True,
+    )
+
+    pred_is_correct = [False] * len(pred_boxes)
+    pred_matched_gt: List[Optional[int]] = [None] * len(pred_boxes)
+    gt_is_matched = [False] * len(gt_boxes)
+
+    matched_gt_indices: Dict[str, set[int]] = {cls: set() for cls in class_names}
+
+    for pred_idx, pred in pred_sorted:
+        cls_name = str(pred.get("class", ""))
+        if cls_name not in gt_by_class:
+            continue
+
+        pb = pred.get("bbox", [0, 0, 0, 0])
+        best_iou = 0.0
+        best_gt_idx: Optional[int] = None
+
+        for gt_idx, gt in gt_by_class[cls_name]:
+            if gt_idx in matched_gt_indices[cls_name]:
+                continue
+            iou = box_iou(pb, gt["bbox"])
+            if iou > best_iou:
+                best_iou = iou
+                best_gt_idx = gt_idx
+
+        if best_gt_idx is not None and best_iou >= float(iou_thresh):
+            matched_gt_indices[cls_name].add(best_gt_idx)
+            pred_is_correct[pred_idx] = True
+            pred_matched_gt[pred_idx] = best_gt_idx
+            gt_is_matched[best_gt_idx] = True
+
+    return pred_is_correct, pred_matched_gt, gt_is_matched
+
+
 def draw_hardcase(
     image_bgr: np.ndarray,
     gt_boxes: Sequence[dict],
     pred_boxes: Sequence[dict],
+    class_names: Sequence[str],
+    iou_thresh: float = 0.5,
 ) -> np.ndarray:
     out = image_bgr.copy()
+    pred_is_correct, _, gt_is_matched = match_predictions_to_ground_truth(
+        gt_boxes=gt_boxes,
+        pred_boxes=pred_boxes,
+        class_names=class_names,
+        iou_thresh=iou_thresh,
+    )
 
-    for gt in gt_boxes:
+    for gt_idx, gt in enumerate(gt_boxes):
         x1, y1, x2, y2 = [int(v) for v in gt["bbox"]]
         cls_name = str(gt.get("class", ""))
-        cv2.rectangle(out, (x1, y1), (x2, y2), (40, 220, 70), 2)
-        cv2.putText(out, f"GT:{cls_name}", (x1, max(14, y1 - 4)), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (40, 220, 70), 1, cv2.LINE_AA)
+        color = (80, 180, 255) if gt_is_matched[gt_idx] else (140, 140, 140)
+        cv2.rectangle(out, (x1, y1), (x2, y2), color, 2)
+        cv2.putText(out, f"GT:{cls_name}", (x1, max(14, y1 - 4)), cv2.FONT_HERSHEY_SIMPLEX, 0.42, color, 1, cv2.LINE_AA)
 
-    for pred in pred_boxes:
+    for pred_idx, pred in enumerate(pred_boxes):
         x1, y1, x2, y2 = [int(v) for v in pred["bbox"]]
         cls_name = str(pred.get("class", ""))
         conf = float(pred.get("confidence", 0.0))
-        cv2.rectangle(out, (x1, y1), (x2, y2), (30, 30, 255), 2)
-        cv2.putText(out, f"PD:{cls_name}:{conf:.2f}", (x1, min(out.shape[0] - 4, max(14, y2 + 14))), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (30, 30, 255), 1, cv2.LINE_AA)
+        color = (40, 220, 70) if pred_is_correct[pred_idx] else (30, 30, 255)
+        cv2.rectangle(out, (x1, y1), (x2, y2), color, 2)
+        cv2.putText(out, f"PD:{cls_name}:{conf:.2f}", (x1, min(out.shape[0] - 4, max(14, y2 + 14))), cv2.FONT_HERSHEY_SIMPLEX, 0.42, color, 1, cv2.LINE_AA)
 
     return out
 
@@ -389,7 +450,13 @@ def export_hardcase_images(
         image = imread_unicode(image_dir / item["image_id"])
         if image is None:
             continue
-        vis = draw_hardcase(image, gt.get(item["image_id"], []), pred_map.get(item["image_id"], []))
+        vis = draw_hardcase(
+            image,
+            gt.get(item["image_id"], []),
+            pred_map.get(item["image_id"], []),
+            class_names=class_names,
+            iou_thresh=iou_thresh,
+        )
         cv2.putText(
             vis,
             f"rank={rank} err={item['error_score']:.3f} ratio={item['error_ratio']:.3f} fn={item['fn']} fp={item['fp']}",
@@ -597,7 +664,7 @@ def parse_args() -> argparse.Namespace:
         help="Per-class thresholds in CLASS_NAMES order, e.g. '0.38,0.40,0.40,0.40,0.72'",
     )
     parser.add_argument("--chair_suppress_iou", type=float, default=CHAIR_SUPPRESS_WITH_PERSON_IOU)
-    parser.add_argument("--hardcase_topk", type=int, default=100)
+    parser.add_argument("--hardcase_topk", type=int, default=50)
     parser.add_argument("--hardcase_iou", type=float, default=0.5)
     parser.add_argument("--device", type=str, default="auto", choices=["auto", "cuda", "cpu"])
     return parser.parse_args()

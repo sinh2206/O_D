@@ -20,6 +20,7 @@ Target assignment:
 
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -318,7 +319,7 @@ def _default_scale_ranges(strides: Sequence[int]) -> List[Tuple[float, float]]:
             lower = float(4.0 * strides[i - 1])
 
         if i == len(strides) - 1:
-            upper = 1e8
+            upper = float("inf")
         else:
             upper = float(4.0 * s)
 
@@ -405,7 +406,10 @@ def _assign_level_targets(
     if scale_range is not None:
         max_dist = ltrb.max(dim=-1).values
         lo, hi = float(scale_range[0]), float(scale_range[1])
-        in_range = (max_dist >= lo) & (max_dist <= hi)
+        if math.isfinite(hi):
+            in_range = (max_dist >= lo) & (max_dist < hi)
+        else:
+            in_range = max_dist >= lo
         candidate = candidate & in_range
 
     # Resolve overlaps by smallest GT area.

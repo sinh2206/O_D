@@ -106,13 +106,13 @@ def _classification_scores(
     - cls_id:    (H,W) in [0..num_classes-1]
 
     Cases:
-    - logits channels == num_classes: softmax over C channels.
+    - logits channels == num_classes: sigmoid over C channels.
     - logits channels == num_classes+1: treat one channel as background.
     """
     c, _, _ = cls_logits.shape
 
     if c == num_classes:
-        prob = torch.softmax(cls_logits, dim=0)
+        prob = torch.sigmoid(cls_logits)
         cls_score, cls_id = prob.max(dim=0)
         return cls_score, cls_id
 
@@ -336,6 +336,7 @@ def _suppress_same_class_contained(
     scores: torch.Tensor,
     class_ids: torch.Tensor,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    dup_iou_thresh = 0.25
     if boxes.numel() == 0:
         return boxes, scores, class_ids
 
@@ -350,7 +351,11 @@ def _suppress_same_class_contained(
             if int(class_ids[kept_idx].item()) != cls:
                 continue
             kept_box = boxes[kept_idx]
-            if _is_fully_inside_xyxy(candidate, kept_box) or _is_fully_inside_xyxy(kept_box, candidate):
+            if (
+                _is_fully_inside_xyxy(candidate, kept_box)
+                or _is_fully_inside_xyxy(kept_box, candidate)
+                or float(_box_iou_xyxy(candidate, kept_box.unsqueeze(0))[0].item()) >= dup_iou_thresh
+            ):
                 drop = True
                 break
         if not drop:

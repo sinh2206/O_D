@@ -10,7 +10,7 @@ Design (per FPN level):
 - Regression branch: Conv1x1 -> (B, 4, H, W), decoded as (t, l, b, r)
 
 Confidence (no objectness branch):
-- class_prob = softmax(cls_logits, dim=1)
+- class_prob = sigmoid(cls_logits)
 - confidence = max(class_prob)
 
 Box decode at location (i, j):
@@ -123,7 +123,7 @@ def decode_level(
     if reg_preds.shape[0] != 4:
         raise ValueError("reg_preds first dim must be 4 for (t,l,b,r).")
 
-    cls_prob = torch.softmax(cls_logits, dim=0)
+    cls_prob = torch.sigmoid(cls_logits)
     best_score, best_cls = cls_prob.max(dim=0)  # (H, W)
 
     mask = best_score >= conf_thresh
