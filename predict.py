@@ -22,8 +22,9 @@ from utils.config import (
     NUM_CLASSES,
     STD,
 )
-from utils.model import AnchorFreeDetector
-from utils.nms import LetterboxMeta, postprocess_batch
+from utils.forecast import predict_images
+from utils.model import YOLOv3
+from utils.nms import LetterboxMeta
 
 VALID_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 DEFAULT_VAL_IMAGE_DIR = Path("public/val/images")
@@ -487,7 +488,7 @@ def suppress_chair_inside_person(predictions: List[dict], iou_thresh: float) -> 
 
 @torch.no_grad()
 def run_inference(
-    model: AnchorFreeDetector,
+    model: YOLOv3,
     image_paths: List[Path],
     device: torch.device,
     batch_size: int,
@@ -496,47 +497,16 @@ def run_inference(
     nms_thresh: float,
     class_names: Sequence[str],
 ) -> List[dict]:
-    results: List[dict] = []
-    amp_enabled = device.type == "cuda"
-
-    for start in range(0, len(image_paths), batch_size):
-        batch_paths = image_paths[start : start + batch_size]
-        tensors: List[torch.Tensor] = []
-        metas: List[LetterboxMeta] = []
-        image_ids: List[str] = []
-
-        for p in batch_paths:
-            image = imread_unicode(p)
-            if image is None:
-                continue
-            tensor, meta = letterbox_preprocess(image, img_size=img_size)
-            tensors.append(tensor)
-            metas.append(meta)
-            image_ids.append(p.name)
-
-        if not tensors:
-            continue
-
-        images = torch.stack(tensors, dim=0).to(device, non_blocking=True).to(memory_format=torch.channels_last)
-        with torch.autocast(device_type=device.type, enabled=amp_enabled):
-            outputs = model(images)
-
-        batch_results = postprocess_batch(
-            outputs=outputs,
-            image_ids=image_ids,
-            metas=metas,
-            class_names=class_names,
-            num_classes=len(class_names),
-            img_size=img_size,
-            conf_thresh=conf_thresh,
-            nms_thresh=nms_thresh,
-            reg_decode="auto",
-            center_combine="mul",
-            min_box_size=2.0,
-        )
-        results.extend(batch_results)
-
-    return results
+    return predict_images(
+        model=model,
+        image_paths=image_paths,
+        device=device,
+        batch_size=batch_size,
+        img_size=img_size,
+        conf_thresh=conf_thresh,
+        nms_thresh=nms_thresh,
+        class_names=class_names,
+    )
 
 
 def save_preview_images(predictions: List[dict], image_dir: Path, preview_dir: Path, limit: int, class_names: Sequence[str]) -> int:
@@ -557,13 +527,13 @@ def save_preview_images(predictions: List[dict], image_dir: Path, preview_dir: P
     return saved
 
 
-def load_checkpoint_model(checkpoint_path: Path, device: torch.device) -> Tuple[AnchorFreeDetector, List[str], int]:
+def load_checkpoint_model(checkpoint_path: Path, device: torch.device) -> Tuple[YOLOv3, List[str], int]:
     ckpt = torch.load(str(checkpoint_path), map_location=device)
     classes = ckpt.get("classes", CLASS_NAMES)
     img_size = int(ckpt.get("img_size", IMG_SIZE))
     num_classes = len(classes)
 
-    model = AnchorFreeDetector(num_classes=num_classes, pretrained=False).to(device)
+    model = YOLOv3(num_classes=num_classes, pretrained=False).to(device)
     state = ckpt.get("model_state_dict", ckpt)
     model.load_state_dict(state, strict=True)
     model.eval()
