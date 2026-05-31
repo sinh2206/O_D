@@ -17,6 +17,8 @@ from utils.config import (
     CONF_THRESH,
     IMG_SIZE,
     MAX_OBJECTS_PER_IMAGE,
+    MIN_BOX_SIZE,
+    MIN_EXPORT_CONF,
     MEAN,
     NMS_IOU_THRESH,
     NUM_CLASSES,
@@ -243,6 +245,8 @@ def sanitize_predictions_for_export(
             if not math.isfinite(conf):
                 continue
             conf = max(0.0, min(1.0, conf))
+            if conf < float(MIN_EXPORT_CONF):
+                continue
 
             bbox = box.get("bbox", [])
             if not isinstance(bbox, list) or len(bbox) != 4:
@@ -589,7 +593,7 @@ def apply_class_thresholds(
         for box in pred.get("boxes", []):
             c = str(box.get("class", ""))
             s = float(box.get("confidence", 0.0))
-            thr = th_map.get(c, 0.5)
+            thr = max(th_map.get(c, 0.5), float(MIN_EXPORT_CONF))
             if s >= thr:
                 keep.append(box)
         out.append({"image_id": pred.get("image_id"), "boxes": keep})
@@ -676,8 +680,8 @@ def run_inference(
             conf_thresh=conf_thresh,
             nms_thresh=nms_thresh,
             reg_decode="auto",
-            center_combine="soft",
-            min_box_size=2.0,
+            center_combine="cls",
+            min_box_size=MIN_BOX_SIZE,
         )
         results.extend(batch_results)
 
