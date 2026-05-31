@@ -26,10 +26,12 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 import torch
 
 try:
-    from .config import CLASS_NAMES, CONF_THRESH, IMG_SIZE, MAX_OBJECTS_PER_IMAGE, MIN_BOX_SIZE, NMS_IOU_THRESH, NUM_CLASSES, STRIDES
+    from .config import CLASS_NAMES, CLASS_SCORE_SCALES, CONF_THRESH, IMG_SIZE, INFER_CENTER_COMBINE, MAX_OBJECTS_PER_IMAGE, MIN_BOX_SIZE, NMS_IOU_THRESH, NUM_CLASSES, STRIDES
 except Exception:
     # Safe fallbacks when config.py is not present.
     CLASS_NAMES = ["person", "car", "dog", "cat", "chair"]
+    CLASS_SCORE_SCALES = [1.0 for _ in CLASS_NAMES]
+    INFER_CENTER_COMBINE = "cls"
     CONF_THRESH = 0.50
     NMS_IOU_THRESH = 0.50
     IMG_SIZE = 320
@@ -114,6 +116,9 @@ def _classification_scores(
 
     if c == num_classes:
         prob = torch.sigmoid(cls_logits)
+        if len(CLASS_SCORE_SCALES) == int(num_classes):
+            scale = torch.as_tensor(CLASS_SCORE_SCALES, dtype=prob.dtype, device=prob.device).view(-1, 1, 1)
+            prob = torch.clamp(prob * scale, min=0.0, max=1.0)
         cls_score, cls_id = prob.max(dim=0)
         return cls_score, cls_id
 
@@ -127,6 +132,9 @@ def _classification_scores(
 
         fg_indices = [i for i in range(c) if i != background_index]
         fg_prob = prob[fg_indices, :, :]
+        if len(CLASS_SCORE_SCALES) == int(num_classes):
+            scale = torch.as_tensor(CLASS_SCORE_SCALES, dtype=fg_prob.dtype, device=fg_prob.device).view(-1, 1, 1)
+            fg_prob = torch.clamp(fg_prob * scale, min=0.0, max=1.0)
 
         fg_max, fg_id_local = fg_prob.max(dim=0)
         fg_score = 1.0 - prob[background_index, :, :]
@@ -153,7 +161,7 @@ def decode_level(
     conf_thresh: float = CONF_THRESH,
     num_classes: int = NUM_CLASSES,
     reg_decode: str = "auto",
-    center_combine: str = "cls",
+    center_combine: str = INFER_CENTER_COMBINE,
     background_index: Optional[int] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
@@ -247,7 +255,7 @@ def decode_multilevel(
     num_classes: int = NUM_CLASSES,
     strides: Optional[Sequence[int]] = None,
     reg_decode: str = "auto",
-    center_combine: str = "cls",
+    center_combine: str = INFER_CENTER_COMBINE,
     background_index: Optional[int] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
@@ -338,6 +346,10 @@ def _is_fully_inside_xyxy(inner: torch.Tensor, outer: torch.Tensor) -> bool:
     )
 
 
+def _box_area_xyxy(box: torch.Tensor) -> float:
+    return float(max(0.0, float(box[2]) - float(box[0])) * max(0.0, float(box[3]) - float(box[1])))
+
+
 def _suppress_same_class_contained(
     boxes: torch.Tensor,
     scores: torch.Tensor,
@@ -352,15 +364,36 @@ def _suppress_same_class_contained(
     for idx in order.tolist():
         cls = int(class_ids[idx].item())
         candidate = boxes[idx]
+        candidate_score = float(scores[idx].item())
+        candidate_area = _box_area_xyxy(candidate)
         drop = False
-        for kept_idx in keep:
+        replace_slot = -1
+
+        for slot, kept_idx in enumerate(keep):
             if int(class_ids[kept_idx].item()) != cls:
                 continue
             kept_box = boxes[kept_idx]
-            # Only remove true nested duplicates for the same class.
-            if _is_fully_inside_xyxy(candidate, kept_box) or _is_fully_inside_xyxy(kept_box, candidate):
-                drop = True
+            kept_score = float(scores[kept_idx].item())
+            kept_area = _box_area_xyxy(kept_box)
+
+            cand_inside_kept = _is_fully_inside_xyxy(candidate, kept_box)
+            kept_inside_cand = _is_fully_inside_xyxy(kept_box, candidate)
+            if not (cand_inside_kept or kept_inside_cand):
+                continue
+
+            # If one box fully contains the other and scores are close, prefer
+            # the larger box to avoid losing full-object detections.
+            if kept_inside_cand and candidate_area > kept_area and candidate_score + 0.03 >= kept_score:
+                replace_slot = slot
                 break
+
+            drop = True
+            break
+
+        if replace_slot >= 0:
+            keep[replace_slot] = idx
+            continue
+
         if not drop:
             keep.append(idx)
 
@@ -484,7 +517,7 @@ def postprocess_single_image(
     conf_thresh: float = CONF_THRESH,
     nms_thresh: float = NMS_IOU_THRESH,
     reg_decode: str = "auto",
-    center_combine: str = "cls",
+    center_combine: str = INFER_CENTER_COMBINE,
     background_index: Optional[int] = None,
     min_box_size: float = MIN_BOX_SIZE,
 ) -> Dict[str, Any]:
@@ -574,7 +607,7 @@ def postprocess_batch(
     conf_thresh: float = CONF_THRESH,
     nms_thresh: float = NMS_IOU_THRESH,
     reg_decode: str = "auto",
-    center_combine: str = "cls",
+    center_combine: str = INFER_CENTER_COMBINE,
     background_index: Optional[int] = None,
     min_box_size: float = MIN_BOX_SIZE,
 ) -> List[Dict[str, Any]]:

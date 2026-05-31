@@ -20,6 +20,7 @@ from utils.config import (
     LOW_LIGHT_GAMMA,
     LOW_LIGHT_MEAN_THRESH,
     IMG_SIZE,
+    INFER_CENTER_COMBINE,
     MAX_OBJECTS_PER_IMAGE,
     MIN_BOX_SIZE,
     MIN_EXPORT_CONF,
@@ -161,13 +162,34 @@ def _suppress_same_class_contained_int(boxes: List[dict]) -> List[dict]:
         bbox_i = [int(v) for v in bbox]
 
         drop = False
-        for kept_box in kept:
+        replace_idx = -1
+        area = max(0, bbox_i[2] - bbox_i[0]) * max(0, bbox_i[3] - bbox_i[1])
+        score = float(box.get("confidence", 0.0))
+
+        for k_idx, kept_box in enumerate(kept):
             if str(kept_box.get("class", "")) != cls:
                 continue
             kept_bbox = [int(v) for v in kept_box["bbox"]]
-            if _is_fully_inside(bbox_i, kept_bbox) or _is_fully_inside(kept_bbox, bbox_i):
-                drop = True
+            kept_area = max(0, kept_bbox[2] - kept_bbox[0]) * max(0, kept_bbox[3] - kept_bbox[1])
+            kept_score = float(kept_box.get("confidence", 0.0))
+
+            cand_inside_kept = _is_fully_inside(bbox_i, kept_bbox)
+            kept_inside_cand = _is_fully_inside(kept_bbox, bbox_i)
+            if not (cand_inside_kept or kept_inside_cand):
+                continue
+
+            if kept_inside_cand and area > kept_area and score + 0.03 >= kept_score:
+                replace_idx = k_idx
                 break
+
+            drop = True
+            break
+
+        if replace_idx >= 0:
+            new_box = dict(box)
+            new_box["bbox"] = bbox_i
+            kept[replace_idx] = new_box
+            continue
 
         if not drop:
             new_box = dict(box)
@@ -648,6 +670,7 @@ def run_inference(
     conf_thresh: float,
     nms_thresh: float,
     class_names: Sequence[str],
+    center_combine: str = INFER_CENTER_COMBINE,
 ) -> List[dict]:
     results: List[dict] = []
     amp_enabled = device.type == "cuda"
@@ -684,7 +707,7 @@ def run_inference(
             conf_thresh=conf_thresh,
             nms_thresh=nms_thresh,
             reg_decode="auto",
-            center_combine="cls",
+            center_combine=str(center_combine),
             min_box_size=MIN_BOX_SIZE,
         )
         results.extend(batch_results)
@@ -749,6 +772,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--conf_thresh", type=float, default=CONF_THRESH)
     parser.add_argument("--nms_thresh", type=float, default=NMS_IOU_THRESH)
     parser.add_argument(
+        "--center_combine",
+        type=str,
+        default=str(INFER_CENTER_COMBINE),
+        choices=["cls", "soft", "sqrt", "mul"],
+        help="How to combine class score and centerness at inference.",
+    )
+    parser.add_argument(
         "--class_conf",
         type=str,
         default=",".join(str(x) for x in CLASS_CONF_THRESH),
@@ -807,6 +837,7 @@ def main() -> None:
         conf_thresh=float(args.conf_thresh),
         nms_thresh=float(args.nms_thresh),
         class_names=class_names,
+        center_combine=str(args.center_combine),
     )
     predictions = apply_class_thresholds(predictions, class_names=class_names, class_conf_thresh=class_conf)
     predictions = suppress_chair_inside_person(predictions, iou_thresh=float(args.chair_suppress_iou))
@@ -833,6 +864,13 @@ def main() -> None:
     )
 
     print(f"Device: {device}")
+    ckpt_meta = torch.load(str(args.checkpoint), map_location="cpu")
+    print(
+        "Checkpoint meta: "
+        f"epoch={ckpt_meta.get('epoch', 'NA')}, "
+        f"best_val_loss={ckpt_meta.get('best_val_loss', 'NA')}, "
+        f"img_size={ckpt_meta.get('img_size', 'NA')}"
+    )
     print(f"Predicted images: {len(predictions)}")
     print(f"Saved JSON: {args.output}")
     print(f"Hardcase items: {hardcase_count}")

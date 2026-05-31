@@ -74,7 +74,9 @@ def compute_class_weights(num_classes: int) -> torch.Tensor:
         class_boost = np.ones((num_classes,), dtype=np.float64)
     weights = weights * class_boost
     weights = weights / max(weights.mean(), 1e-12)
-    weights = np.clip(weights, 0.70, 1.80)
+    # Keep dominant class penalized enough to reduce person-overprediction
+    # while still allowing minority classes to be upweighted.
+    weights = np.clip(weights, 0.45, 2.20)
     return torch.as_tensor(weights, dtype=torch.float32)
 
 
@@ -272,18 +274,27 @@ def get_train_transforms(img_size: int) -> A.Compose:
 
     affine = A.Affine(**affine_kwargs)
 
+    downscale_params = inspect.signature(A.Downscale.__init__).parameters
+    if "scale_range" in downscale_params:
+        downscale_aug = A.Downscale(scale_range=(0.60, 0.85), p=1.0)
+    else:
+        downscale_aug = A.Downscale(scale_min=0.60, scale_max=0.85, p=1.0)
+
     return A.Compose(
         [
             A.LongestMaxSize(max_size=img_size, interpolation=cv2.INTER_LINEAR),
             make_pad_if_needed(img_size),
             A.HorizontalFlip(p=0.5),
+            A.VerticalFlip(p=0.08),
+            A.RandomRotate90(p=0.22),
             A.CLAHE(clip_limit=2.2, tile_grid_size=(8, 8), p=0.2),
             A.OneOf(
                 [
                     A.GaussianBlur(blur_limit=(3, 7), p=1.0),
                     A.MotionBlur(blur_limit=5, p=1.0),
+                    downscale_aug,
                 ],
-                p=0.2,
+                p=0.30,
             ),
             A.RandomGamma(gamma_limit=(88, 122), p=0.25),
             A.ColorJitter(brightness=0.12, contrast=0.12, saturation=0.1, hue=0.05, p=0.45),

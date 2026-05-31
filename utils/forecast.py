@@ -62,7 +62,7 @@ class AnchorFreeForecastHead(nn.Module):
     def _init_params(self) -> None:
         # Initialize low class confidence at start.
         nn.init.normal_(self.cls_pred.weight, mean=0.0, std=0.01)
-        nn.init.constant_(self.cls_pred.bias, -1.5)
+        nn.init.constant_(self.cls_pred.bias, -1.2)
 
         nn.init.normal_(self.reg_pred.weight, mean=0.0, std=0.01)
         nn.init.constant_(self.reg_pred.bias, 1.0)

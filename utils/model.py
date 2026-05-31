@@ -145,13 +145,13 @@ class AnchorFreeHead(nn.Module):
     def _init_params(self) -> None:
         # Low prior for positives at init.
         nn.init.normal_(self.cls_out.weight, mean=0.0, std=0.01)
-        nn.init.constant_(self.cls_out.bias, -1.5)
+        nn.init.constant_(self.cls_out.bias, -1.2)
 
         nn.init.normal_(self.reg_out.weight, mean=0.0, std=0.01)
         nn.init.constant_(self.reg_out.bias, 1.0)
 
         nn.init.normal_(self.center_out.weight, mean=0.0, std=0.01)
-        nn.init.constant_(self.center_out.bias, -1.5)
+        nn.init.constant_(self.center_out.bias, -1.0)
 
     def forward(self, feat: torch.Tensor) -> Dict[str, torch.Tensor]:
         cls_feat = self.cls_tower(feat)
