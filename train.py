@@ -20,6 +20,8 @@ from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
 
 from utils.config import (
     CENTER_RADIUS,
+    CLASS_FREQ_PRIOR_TRAIN,
+    CLASS_FREQ_PRIOR_VAL,
     CLASS_LOSS_WEIGHTS,
     CLASS_NAMES,
     CLASS_SAMPLER_WEIGHTS,
@@ -37,6 +39,7 @@ from utils.config import (
 )
 from utils.loss import DetectionLoss
 from utils.model import AnchorFreeDetector
+from utils.runtime import create_grad_scaler, resolve_num_workers, should_pin_memory
 
 VALID_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 
@@ -51,17 +54,50 @@ class Sample:
     labels: List[int]
 
 
-def compute_class_weights(num_classes: int) -> torch.Tensor:
+def compute_class_weights(
+    num_classes: int,
+    train_samples: Optional[List[Sample]] = None,
+    val_samples: Optional[List[Sample]] = None,
+) -> torch.Tensor:
     if num_classes <= 0:
         return torch.zeros((0,), dtype=torch.float32)
-    fixed = np.asarray(CLASS_LOSS_WEIGHTS, dtype=np.float64)
-    if fixed.size == num_classes:
-        weights = fixed
-    elif fixed.size > num_classes:
-        weights = fixed[:num_classes]
-    else:
+
+    def _freq_from_samples(samples: List[Sample]) -> np.ndarray:
+        counts = np.zeros((num_classes,), dtype=np.float64)
+        for s in samples:
+            if not s.labels:
+                continue
+            labels = np.asarray(s.labels, dtype=np.int64)
+            labels = labels[(labels >= 0) & (labels < num_classes)]
+            if labels.size == 0:
+                continue
+            binc = np.bincount(labels, minlength=num_classes).astype(np.float64)
+            counts += binc
+        if counts.sum() <= 0:
+            return np.zeros((num_classes,), dtype=np.float64)
+        return counts / counts.sum()
+
+    freq_train = _freq_from_samples(train_samples) if train_samples else np.asarray(CLASS_FREQ_PRIOR_TRAIN, dtype=np.float64)
+    freq_val = _freq_from_samples(val_samples) if val_samples else np.asarray(CLASS_FREQ_PRIOR_VAL, dtype=np.float64)
+
+    if freq_train.size != num_classes or freq_val.size != num_classes or freq_train.sum() <= 0 or freq_val.sum() <= 0:
         weights = np.ones((num_classes,), dtype=np.float64)
-        weights[: fixed.size] = fixed
+        return torch.as_tensor(weights, dtype=torch.float32)
+
+    freq = 0.5 * (freq_train + freq_val)
+    freq = np.clip(freq, 1e-6, None)
+
+    # Base inverse-frequency weight, softened by sqrt to avoid exploding the
+    # minority classes. A mild class-specific boost is applied afterwards.
+    weights = np.power(freq.mean() / freq, 0.5)
+    class_boost = np.asarray(CLASS_LOSS_WEIGHTS, dtype=np.float64)
+    if class_boost.size != num_classes:
+        class_boost = np.ones((num_classes,), dtype=np.float64)
+    weights = weights * class_boost
+    weights = weights / max(weights.mean(), 1e-12)
+    # Keep dominant class penalized enough to reduce person-overprediction
+    # while still allowing minority classes to be upweighted.
+    weights = np.clip(weights, 0.45, 2.20)
     return torch.as_tensor(weights, dtype=torch.float32)
 
 
@@ -261,17 +297,23 @@ def get_train_transforms(img_size: int) -> A.Compose:
 
     downscale_params = inspect.signature(A.Downscale.__init__).parameters
     if "scale_range" in downscale_params:
-        downscale_aug = A.Downscale(scale_range=(0.60, 0.85), p=1.0)
+        downscale_aug = A.Downscale(scale_range=(0.72, 0.90), p=1.0)
     else:
-        downscale_aug = A.Downscale(scale_min=0.60, scale_max=0.85, p=1.0)
+        downscale_aug = A.Downscale(scale_min=0.72, scale_max=0.90, p=1.0)
+
+    try:
+        crop_aug = A.RandomSizedBBoxSafeCrop(height=img_size, width=img_size, erosion_rate=0.0, p=0.24)
+    except TypeError:
+        crop_aug = A.NoOp(p=1.0)
 
     return A.Compose(
         [
+            crop_aug,
             A.LongestMaxSize(max_size=img_size, interpolation=cv2.INTER_LINEAR),
             make_pad_if_needed(img_size),
             A.HorizontalFlip(p=0.5),
-            A.VerticalFlip(p=0.08),
-            A.RandomRotate90(p=0.22),
+            A.VerticalFlip(p=0.05),
+            A.RandomRotate90(p=0.12),
             A.CLAHE(clip_limit=2.2, tile_grid_size=(8, 8), p=0.2),
             A.OneOf(
                 [
@@ -279,8 +321,9 @@ def get_train_transforms(img_size: int) -> A.Compose:
                     A.MotionBlur(blur_limit=5, p=1.0),
                     downscale_aug,
                 ],
-                p=0.30,
+                p=0.18,
             ),
+            A.Sharpen(alpha=(0.15, 0.35), lightness=(0.85, 1.15), p=0.16),
             A.RandomGamma(gamma_limit=(88, 122), p=0.25),
             A.ColorJitter(brightness=0.12, contrast=0.12, saturation=0.1, hue=0.05, p=0.45),
             affine,
@@ -379,6 +422,7 @@ def make_dataloader(
     shuffle: bool,
     num_workers: int,
     sampler: Optional[WeightedRandomSampler] = None,
+    pin_memory: bool = False,
 ) -> DataLoader:
     return DataLoader(
         dataset,
@@ -386,7 +430,7 @@ def make_dataloader(
         shuffle=(shuffle and sampler is None),
         sampler=sampler,
         num_workers=num_workers,
-        pin_memory=True,
+        pin_memory=pin_memory,
         persistent_workers=(num_workers > 0),
         drop_last=False,
         collate_fn=collate_fn,
@@ -518,7 +562,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--checkpoint_dir", type=Path, default=Path("./models"))
     parser.add_argument("--img_size", type=int, default=IMG_SIZE)
     parser.add_argument("--batch_size", type=int, default=8)
-    parser.add_argument("--epochs", type=int, default=20)
+    parser.add_argument("--epochs", type=int, default=30)
     parser.add_argument("--lr_backbone", type=float, default=2e-4)
     parser.add_argument("--lr_head", type=float, default=2e-3)
     parser.add_argument("--weight_decay", type=float, default=1e-4)
@@ -544,6 +588,8 @@ def main() -> None:
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     amp_enabled = (device.type == "cuda") and (not args.no_amp)
+    resolved_workers, max_safe_workers = resolve_num_workers(int(args.num_workers))
+    pin_memory = should_pin_memory(device)
 
     train_samples, classes = parse_samples(args.train_data, args.image_dir, class_names=None)
     val_samples, _ = parse_samples(args.val_data, args.val_image_dir, class_names=classes)
@@ -552,7 +598,11 @@ def main() -> None:
     train_ds = DetectionDataset(train_samples, transforms=get_train_transforms(args.img_size))
     val_ds = DetectionDataset(val_samples, transforms=get_val_transforms(args.img_size))
 
-    class_weights = None if args.no_class_weights else compute_class_weights(num_classes=num_classes)
+    class_weights = None if args.no_class_weights else compute_class_weights(
+        num_classes=num_classes,
+        train_samples=train_samples,
+        val_samples=val_samples,
+    )
     train_sampler = None
     if not args.no_balanced_sampling and class_weights is not None:
         sample_weights = build_sample_weights(train_samples, class_weights)
@@ -566,10 +616,17 @@ def main() -> None:
         train_ds,
         batch_size=args.batch_size,
         shuffle=True,
-        num_workers=args.num_workers,
+        num_workers=resolved_workers,
         sampler=train_sampler,
+        pin_memory=pin_memory,
     )
-    val_loader = make_dataloader(val_ds, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers)
+    val_loader = make_dataloader(
+        val_ds,
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=resolved_workers,
+        pin_memory=pin_memory,
+    )
 
     model = AnchorFreeDetector(num_classes=num_classes, pretrained=True).to(device).to(memory_format=torch.channels_last)
     criterion = DetectionLoss(
@@ -582,7 +639,7 @@ def main() -> None:
     ).to(device)
     optimizer = build_optimizer(model, lr_backbone=args.lr_backbone, lr_head=args.lr_head, weight_decay=args.weight_decay)
     scheduler = CosineAnnealingLR(optimizer, T_max=max(args.epochs, 1))
-    scaler = torch.cuda.amp.GradScaler(enabled=amp_enabled)
+    scaler = create_grad_scaler(device=device, enabled=amp_enabled)
 
     start_epoch = 1
     best_val_loss = float("inf")
@@ -610,6 +667,8 @@ def main() -> None:
     print(f"Train samples: {len(train_ds)}, Val samples: {len(val_ds)}, Classes: {classes}")
     print(f"Balanced sampling: {not args.no_balanced_sampling}")
     print(f"Class weights enabled: {not args.no_class_weights}")
+    print(f"Num workers: requested={args.num_workers}, resolved={resolved_workers}, max_safe={max_safe_workers}")
+    print(f"Pin memory: {pin_memory}")
     if class_weights is not None:
         print(f"Class weights: {[round(x, 4) for x in class_weights.tolist()]}")
 

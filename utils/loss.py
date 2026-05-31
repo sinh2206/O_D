@@ -37,6 +37,8 @@ try:
         NEGATIVE_FOCAL_WEIGHT,
         NUM_CLASSES,
         STRIDES,
+        TINY_ASSIGN_EXPAND_STRIDE,
+        TINY_OBJECT_MAX_SIDE_FACTOR,
     )
 except Exception:
     # Safe fallbacks so this module still works if config.py is not available.
@@ -50,6 +52,8 @@ except Exception:
     LAMBDA_CLS = 1.0
     LAMBDA_REG = 1.0
     LAMBDA_CTR = 0.5
+    TINY_OBJECT_MAX_SIDE_FACTOR = 2.0
+    TINY_ASSIGN_EXPAND_STRIDE = 0.75
 
 EPS = 1e-8
 DEFAULT_CENTER_RADIUS = float(CENTER_RADIUS)
@@ -348,6 +352,8 @@ def _assign_level_targets(
     use_softmax_bg: bool,
     scale_range: Optional[Tuple[float, float]],
     center_radius: float,
+    tiny_object_max_side_factor: float,
+    tiny_assign_expand_stride: float,
 ) -> Dict[str, torch.Tensor]:
     """
     Assign targets for one image and one FPN level.
@@ -398,7 +404,8 @@ def _assign_level_targets(
     ltrb = torch.stack([l, t, r, b], dim=-1)  # (P, N, 4) order l,t,r,b
     tlbr = torch.stack([t, l, b, r], dim=-1)  # (P, N, 4) order t,l,b,r
 
-    inside_box = (ltrb.min(dim=-1).values > 0.0)
+    # Keep boundary points as valid for extremely small/quantized boxes.
+    inside_box = (ltrb.min(dim=-1).values >= 0.0)
 
     # Center sampling region.
     gx = 0.5 * (x1 + x2)
@@ -423,6 +430,41 @@ def _assign_level_targets(
         else:
             in_range = max_dist >= lo
         candidate = candidate & in_range
+
+    # Tiny-object fallback: if a tiny GT gets no positive location at this
+    # level, force the nearest point around its center as positive.
+    gt_w = (x2 - x1).squeeze(0).clamp(min=0.0)
+    gt_h = (y2 - y1).squeeze(0).clamp(min=0.0)
+    gt_max_side = torch.maximum(gt_w, gt_h)
+    tiny_limit = float(tiny_object_max_side_factor) * float(stride)
+    tiny_mask = gt_max_side <= tiny_limit
+
+    if tiny_mask.any():
+        point_x = points_xy[:, 0]
+        point_y = points_xy[:, 1]
+        expand = float(tiny_assign_expand_stride) * float(stride)
+        gx_1d = gx.squeeze(0)
+        gy_1d = gy.squeeze(0)
+
+        for gt_idx in torch.where(tiny_mask)[0].tolist():
+            if bool(candidate[:, gt_idx].any()):
+                continue
+
+            ex1 = float(x1[0, gt_idx] - expand)
+            ey1 = float(y1[0, gt_idx] - expand)
+            ex2 = float(x2[0, gt_idx] + expand)
+            ey2 = float(y2[0, gt_idx] + expand)
+
+            in_expanded = (point_x >= ex1) & (point_x <= ex2) & (point_y >= ey1) & (point_y <= ey2)
+            pool = torch.where(in_expanded)[0]
+            if pool.numel() == 0:
+                pool = torch.arange(points_xy.shape[0], device=device)
+
+            dx = point_x[pool] - gx_1d[gt_idx]
+            dy = point_y[pool] - gy_1d[gt_idx]
+            best_local = torch.argmin(dx * dx + dy * dy)
+            best_point = int(pool[best_local].item())
+            candidate[best_point, gt_idx] = True
 
     # Resolve overlaps by smallest GT area.
     gt_area = _box_area(gt_boxes).view(1, -1).expand(p, -1)
@@ -473,6 +515,8 @@ def build_targets(
     strides: Optional[Sequence[int]] = None,
     center_radius: float = DEFAULT_CENTER_RADIUS,
     use_scale_ranges: bool = True,
+    tiny_object_max_side_factor: float = TINY_OBJECT_MAX_SIDE_FACTOR,
+    tiny_assign_expand_stride: float = TINY_ASSIGN_EXPAND_STRIDE,
 ) -> Dict[str, Any]:
     """
     Build multi-level targets from model outputs and raw GT targets.
@@ -541,6 +585,8 @@ def build_targets(
                 use_softmax_bg=use_softmax_bg,
                 scale_range=srange,
                 center_radius=float(center_radius),
+                tiny_object_max_side_factor=float(tiny_object_max_side_factor),
+                tiny_assign_expand_stride=float(tiny_assign_expand_stride),
             )
 
             if use_softmax_bg:
@@ -586,6 +632,8 @@ def compute_loss(
     label_smoothing: float = LABEL_SMOOTHING,
     center_radius: float = DEFAULT_CENTER_RADIUS,
     use_scale_ranges: bool = True,
+    tiny_object_max_side_factor: float = TINY_OBJECT_MAX_SIDE_FACTOR,
+    tiny_assign_expand_stride: float = TINY_ASSIGN_EXPAND_STRIDE,
 ) -> Dict[str, torch.Tensor]:
     """
     Compute multi-level anchor-free loss.
@@ -609,6 +657,8 @@ def compute_loss(
         strides=strides,
         center_radius=center_radius,
         use_scale_ranges=use_scale_ranges,
+        tiny_object_max_side_factor=tiny_object_max_side_factor,
+        tiny_assign_expand_stride=tiny_assign_expand_stride,
     )
 
     use_softmax_bg = bool(target_pack["use_softmax_bg"])
@@ -725,6 +775,8 @@ class DetectionLoss(nn.Module):
         label_smoothing: float = LABEL_SMOOTHING,
         center_radius: float = DEFAULT_CENTER_RADIUS,
         use_scale_ranges: bool = True,
+        tiny_object_max_side_factor: float = TINY_OBJECT_MAX_SIDE_FACTOR,
+        tiny_assign_expand_stride: float = TINY_ASSIGN_EXPAND_STRIDE,
     ):
         super().__init__()
         self.num_classes = int(num_classes)
@@ -742,6 +794,8 @@ class DetectionLoss(nn.Module):
         self.label_smoothing = float(label_smoothing)
         self.center_radius = float(center_radius)
         self.use_scale_ranges = bool(use_scale_ranges)
+        self.tiny_object_max_side_factor = float(tiny_object_max_side_factor)
+        self.tiny_assign_expand_stride = float(tiny_assign_expand_stride)
 
     def forward(self, outputs: Dict[str, Any], targets: Any) -> Dict[str, torch.Tensor]:
         return compute_loss(
@@ -759,4 +813,6 @@ class DetectionLoss(nn.Module):
             label_smoothing=self.label_smoothing,
             center_radius=self.center_radius,
             use_scale_ranges=self.use_scale_ranges,
+            tiny_object_max_side_factor=self.tiny_object_max_side_factor,
+            tiny_assign_expand_stride=self.tiny_assign_expand_stride,
         )
