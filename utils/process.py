@@ -273,8 +273,8 @@ def build_train_transform(img_size: int) -> A.Compose:
         bbox_params=A.BboxParams(
             format="pascal_voc",
             label_fields=["class_labels"],
-            min_visibility=0.1,
-            min_area=2.0,
+            min_visibility=0.3,
+            min_area=16.0,
             clip=True,
         ),
     )
