@@ -30,7 +30,7 @@ try:
 except Exception:
     # Safe fallbacks when config.py is not present.
     CLASS_NAMES = ["person", "car", "dog", "cat", "chair"]
-    CONF_THRESH = 0.50
+    CONF_THRESH = 0.25
     NMS_IOU_THRESH = 0.50
     IMG_SIZE = 320
     NUM_CLASSES = 5

@@ -34,6 +34,7 @@ from utils.config import (
 )
 from utils.loss import DetectionLoss
 from utils.model import AnchorFreeDetector
+from utils.runtime import load_partial_state_dict
 
 VALID_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 
@@ -47,10 +48,7 @@ class Sample:
 
 
 def compute_class_weights(num_classes: int) -> torch.Tensor:
-    # The hard cases show that person/chair scenes are underfit, so the
-    # fixed weights keep those classes emphasized instead of downweighting
-    # the dominant class too aggressively.
-    fixed_weights = np.asarray([1.10, 1.05, 1.00, 1.00, 1.60], dtype=np.float64)
+    fixed_weights = np.asarray(CLASS_LOSS_WEIGHTS, dtype=np.float64)
     if num_classes <= 0:
         return torch.zeros((0,), dtype=torch.float32)
     if num_classes == fixed_weights.size:
@@ -198,9 +196,9 @@ def make_pad_if_needed(img_size: int):
 def get_train_transforms(img_size: int) -> A.Compose:
     affine_params = inspect.signature(A.Affine.__init__).parameters
     affine_kwargs = dict(
-        scale=(0.75, 1.35),
-        translate_percent=(-0.06, 0.06),
-        rotate=(-5, 5),
+        scale=(0.85, 1.55),
+        translate_percent=(-0.12, 0.12),
+        rotate=(-8, 8),
         shear=(-1.5, 1.5),
         p=0.25,
     )
@@ -235,7 +233,7 @@ def get_train_transforms(img_size: int) -> A.Compose:
                     A.GaussianBlur(blur_limit=(3, 7), p=1.0),
                     A.MotionBlur(blur_limit=5, p=1.0),
                 ],
-                p=0.2,
+                p=0.25,
             ),
             A.RandomGamma(gamma_limit=(88, 122), p=0.25),
             A.ColorJitter(brightness=0.12, contrast=0.12, saturation=0.1, hue=0.05, p=0.45),
@@ -246,8 +244,8 @@ def get_train_transforms(img_size: int) -> A.Compose:
         bbox_params=A.BboxParams(
             format="pascal_voc",
             label_fields=["class_labels"],
-            min_area=1.0,
-            min_visibility=0.05,
+            min_area=0.5,
+            min_visibility=0.02,
             clip=True,
         ),
     )
@@ -264,7 +262,7 @@ def get_val_transforms(img_size: int) -> A.Compose:
         bbox_params=A.BboxParams(
             format="pascal_voc",
             label_fields=["class_labels"],
-            min_area=1.0,
+            min_area=0.5,
             min_visibility=0.0,
             clip=True,
         ),
@@ -460,6 +458,7 @@ def save_checkpoint(
             "classes": classes,
             "img_size": img_size,
             "strides": STRIDES,
+            "use_softmax_bg": bool(getattr(model, "use_background_class", False)),
         },
         str(path),
     )
@@ -473,7 +472,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--val_image_dir", type=Path, required=True)
     parser.add_argument("--checkpoint_dir", type=Path, default=Path("./models"))
     parser.add_argument("--img_size", type=int, default=IMG_SIZE)
-    parser.add_argument("--batch_size", type=int, default=24)
+    parser.add_argument("--batch_size", type=int, default=16)
     parser.add_argument("--epochs", type=int, default=20)
     parser.add_argument("--lr_backbone", type=float, default=2e-4)
     parser.add_argument("--lr_head", type=float, default=2e-3)
@@ -544,17 +543,25 @@ def main() -> None:
     best_val_loss = float("inf")
     if args.resume is not None and args.resume.exists():
         ckpt = torch.load(str(args.resume), map_location=device)
-        try:
-            model.load_state_dict(ckpt["model_state_dict"], strict=True)
-        except RuntimeError as exc:
-            missing, unexpected = model.load_state_dict(ckpt["model_state_dict"], strict=False)
-            print(f"Resume checkpoint partially loaded ({exc}).")
-            print(f"Missing keys: {missing}")
-            print(f"Unexpected keys: {unexpected}")
+        missing, unexpected, skipped = load_partial_state_dict(model, ckpt["model_state_dict"])
+        if missing or unexpected or skipped:
+            print("Resume checkpoint partially loaded.")
+            if missing:
+                print(f"Missing keys: {missing}")
+            if unexpected:
+                print(f"Unexpected keys: {unexpected}")
+            if skipped:
+                print(f"Skipped mismatched keys: {skipped}")
         if "optimizer_state_dict" in ckpt:
-            optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+            try:
+                optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+            except Exception as exc:
+                print(f"Skipping optimizer state from resume checkpoint: {exc}")
         if "scheduler_state_dict" in ckpt:
-            scheduler.load_state_dict(ckpt["scheduler_state_dict"])
+            try:
+                scheduler.load_state_dict(ckpt["scheduler_state_dict"])
+            except Exception as exc:
+                print(f"Skipping scheduler state from resume checkpoint: {exc}")
         start_epoch = int(ckpt.get("epoch", 0)) + 1
         best_val_loss = float(ckpt.get("best_val_loss", float("inf")))
 

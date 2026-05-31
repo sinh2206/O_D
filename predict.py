@@ -27,6 +27,7 @@ from utils.config import (
 )
 from utils.model import AnchorFreeDetector
 from utils.nms import LetterboxMeta, postprocess_batch
+from utils.runtime import load_partial_state_dict
 
 VALID_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 DEFAULT_VAL_IMAGE_DIR = Path("public/val/images")
@@ -594,7 +595,7 @@ def apply_class_thresholds(
         for box in pred.get("boxes", []):
             c = str(box.get("class", ""))
             s = float(box.get("confidence", 0.0))
-            thr = max(th_map.get(c, 0.5), float(MIN_EXPORT_CONF))
+            thr = max(th_map.get(c, float(MIN_EXPORT_CONF)), float(MIN_EXPORT_CONF))
             if s >= thr:
                 keep.append(box)
         out.append({"image_id": pred.get("image_id"), "boxes": keep})
@@ -715,13 +716,15 @@ def load_checkpoint_model(checkpoint_path: Path, device: torch.device) -> Tuple[
 
     model = AnchorFreeDetector(num_classes=num_classes, pretrained=False).to(device)
     state = ckpt.get("model_state_dict", ckpt)
-    try:
-        model.load_state_dict(state, strict=True)
-    except RuntimeError as exc:
-        missing, unexpected = model.load_state_dict(state, strict=False)
-        print(f"Checkpoint partially loaded ({exc}).")
-        print(f"Missing keys: {missing}")
-        print(f"Unexpected keys: {unexpected}")
+    missing, unexpected, skipped = load_partial_state_dict(model, state)
+    if missing or unexpected or skipped:
+        print("Checkpoint partially loaded.")
+        if missing:
+            print(f"Missing keys: {missing}")
+        if unexpected:
+            print(f"Unexpected keys: {unexpected}")
+        if skipped:
+            print(f"Skipped mismatched keys: {skipped}")
     model.eval()
 
     return model, list(classes), img_size
@@ -742,7 +745,7 @@ def parse_args() -> argparse.Namespace:
         help="Path to trained model checkpoint (.pth). '--model_path' is kept as a backward-compatible alias.",
     )
     parser.add_argument("--img_size", type=int, default=IMG_SIZE)
-    parser.add_argument("--batch_size", type=int, default=24)
+    parser.add_argument("--batch_size", type=int, default=16)
     parser.add_argument("--conf_thresh", type=float, default=CONF_THRESH)
     parser.add_argument("--nms_thresh", type=float, default=NMS_IOU_THRESH)
     parser.add_argument(

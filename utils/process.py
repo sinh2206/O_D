@@ -94,7 +94,7 @@ def scale_boxes_xyxy(boxes: np.ndarray, sx: float, sy: float) -> np.ndarray:
     return out
 
 
-def clip_filter_boxes(boxes: np.ndarray, labels: List[str], w: int, h: int, min_area: float = 1.0) -> Tuple[np.ndarray, List[str]]:
+def clip_filter_boxes(boxes: np.ndarray, labels: List[str], w: int, h: int, min_area: float = 0.5) -> Tuple[np.ndarray, List[str]]:
     if boxes.size == 0:
         return boxes.reshape(0, 4), []
 
@@ -148,7 +148,7 @@ def load_resized_record(record: Record, image_dir: Path, target_size: int) -> Tu
 
     boxes = np.asarray(record.boxes, dtype=np.float32)
     boxes = scale_boxes_xyxy(boxes, sx=target_size / max(w0, 1), sy=target_size / max(h0, 1))
-    boxes, labels = clip_filter_boxes(boxes, list(record.labels), w=target_size, h=target_size, min_area=1.0)
+    boxes, labels = clip_filter_boxes(boxes, list(record.labels), w=target_size, h=target_size, min_area=0.5)
     return img_r, boxes, labels
 
 
@@ -192,7 +192,7 @@ def build_mosaic(records: List[Record], image_dir: Path, img_size: int, primary_
 
     if all_boxes:
         boxes_cat = np.concatenate(all_boxes, axis=0).astype(np.float32)
-        boxes_cat, labels_out = clip_filter_boxes(boxes_cat, all_labels, w=2 * s, h=2 * s, min_area=1.0)
+        boxes_cat, labels_out = clip_filter_boxes(boxes_cat, all_labels, w=2 * s, h=2 * s, min_area=0.5)
     else:
         boxes_cat = np.zeros((0, 4), dtype=np.float32)
         labels_out = []
@@ -235,27 +235,27 @@ def maybe_mixup(
         new_boxes = np.concatenate([boxes, mix_boxes], axis=0)
         new_labels = list(labels) + list(mix_labels)
 
-    new_boxes, new_labels = clip_filter_boxes(new_boxes, new_labels, w=2 * img_size, h=2 * img_size, min_area=1.0)
+    new_boxes, new_labels = clip_filter_boxes(new_boxes, new_labels, w=2 * img_size, h=2 * img_size, min_area=0.5)
     return blended, new_boxes, new_labels
 
 
 def build_train_transform(img_size: int) -> A.Compose:
     try:
         affine = A.Affine(
-            scale=(0.5, 1.5),
-            translate_percent=(-0.2, 0.2),
-            rotate=(-10, 10),
-            shear=(-2, 2),
+            scale=(0.85, 1.55),
+            translate_percent=(-0.12, 0.12),
+            rotate=(-8, 8),
+            shear=(-1.5, 1.5),
             border_mode=cv2.BORDER_CONSTANT,
             fill=114,
             p=1.0,
         )
     except TypeError:
         affine = A.Affine(
-            scale=(0.5, 1.5),
-            translate_percent=(-0.2, 0.2),
-            rotate=(-10, 10),
-            shear=(-2, 2),
+            scale=(0.85, 1.55),
+            translate_percent=(-0.12, 0.12),
+            rotate=(-8, 8),
+            shear=(-1.5, 1.5),
             mode=cv2.BORDER_CONSTANT,
             cval=114,
             p=1.0,
@@ -280,8 +280,8 @@ def build_train_transform(img_size: int) -> A.Compose:
         bbox_params=A.BboxParams(
             format="pascal_voc",
             label_fields=["class_labels"],
-            min_visibility=0.05,
-            min_area=1.0,
+            min_visibility=0.02,
+            min_area=0.5,
             clip=True,
         ),
     )
@@ -381,7 +381,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--annotation", type=Path, default=Path("public/annotations/val.json"))
     p.add_argument("--image_dir", type=Path, default=Path("public/val/images"))
     p.add_argument("--output_dir", type=Path, default=Path("results"))
-    p.add_argument("--img_size", type=int, default=320)
+    p.add_argument("--img_size", type=int, default=512)
     p.add_argument("--num_samples", type=int, default=50)
     p.add_argument("--include", type=str, default="img_326a06a3c024.jpg")
     p.add_argument("--mixup_prob", type=float, default=0.5)

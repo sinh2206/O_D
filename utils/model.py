@@ -29,7 +29,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torchvision import models
 
-from .config import FPN_CHANNELS, NUM_CLASSES
+from .config import FPN_CHANNELS, NUM_CLASSES, USE_SOFTMAX_BG
 
 
 class ConvBNLeaky(nn.Module):
@@ -116,13 +116,19 @@ class AnchorFreeHead(nn.Module):
     """
     Anchor-free head for one feature level.
 
-    Outputs per level:
-    - cls_logits:   (B, C, H, W)
+Outputs per level:
+- cls_logits:   (B, C or C+1, H, W)
     - reg_preds:    (B, 4, H, W), non-negative via ReLU
     - center_logits:(B, 1, H, W)
     """
 
-    def __init__(self, in_ch: int, num_classes: int, num_convs: int = 2):
+    def __init__(
+        self,
+        in_ch: int,
+        num_classes: int,
+        num_convs: int = 2,
+        use_background_class: bool = True,
+    ):
         super().__init__()
 
         cls_layers: List[nn.Module] = []
@@ -136,7 +142,9 @@ class AnchorFreeHead(nn.Module):
         self.cls_tower = nn.Sequential(*cls_layers)
         self.reg_tower = nn.Sequential(*reg_layers)
 
-        self.cls_out = nn.Conv2d(in_ch, num_classes, kernel_size=1)
+        self.use_background_class = bool(use_background_class)
+        cls_channels = int(num_classes) + (1 if self.use_background_class else 0)
+        self.cls_out = nn.Conv2d(in_ch, cls_channels, kernel_size=1)
         self.reg_out = nn.Conv2d(in_ch, 4, kernel_size=1)
         self.center_out = nn.Conv2d(in_ch, 1, kernel_size=1)
 
@@ -198,9 +206,25 @@ class AnchorFreeDetector(nn.Module):
         self.legacy_single_output = legacy_single_output
 
         self.backbone_fpn = ResNet34FPN3L(fpn_channels=feat_channels, pretrained=pretrained)
-        self.head_s8 = AnchorFreeHead(in_ch=feat_channels, num_classes=num_classes, num_convs=2)
-        self.head_s16 = AnchorFreeHead(in_ch=feat_channels, num_classes=num_classes, num_convs=2)
-        self.head_s32 = AnchorFreeHead(in_ch=feat_channels, num_classes=num_classes, num_convs=2)
+        self.use_background_class = bool(USE_SOFTMAX_BG)
+        self.head_s8 = AnchorFreeHead(
+            in_ch=feat_channels,
+            num_classes=num_classes,
+            num_convs=2,
+            use_background_class=self.use_background_class,
+        )
+        self.head_s16 = AnchorFreeHead(
+            in_ch=feat_channels,
+            num_classes=num_classes,
+            num_convs=2,
+            use_background_class=self.use_background_class,
+        )
+        self.head_s32 = AnchorFreeHead(
+            in_ch=feat_channels,
+            num_classes=num_classes,
+            num_convs=2,
+            use_background_class=self.use_background_class,
+        )
 
     def extract_features(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         return self.backbone_fpn(x)

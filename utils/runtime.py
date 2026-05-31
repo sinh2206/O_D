@@ -70,6 +70,35 @@ def create_grad_scaler(device: torch.device, enabled: bool) -> Any:
     return torch.cuda.amp.GradScaler(enabled=amp_enabled)
 
 
+def load_partial_state_dict(
+    model: torch.nn.Module,
+    state_dict: dict[str, torch.Tensor],
+) -> Tuple[list[str], list[str], list[str]]:
+    """
+    Load only the tensors whose names and shapes match the current model.
+
+    Returns:
+        missing_keys, unexpected_keys, skipped_mismatched_keys
+    """
+    model_state = model.state_dict()
+    filtered: dict[str, torch.Tensor] = {}
+    skipped: list[str] = []
+    unexpected: list[str] = []
+
+    for key, tensor in state_dict.items():
+        if key not in model_state:
+            unexpected.append(key)
+            continue
+        if model_state[key].shape != tensor.shape:
+            skipped.append(key)
+            continue
+        filtered[key] = tensor
+
+    missing, unexpected_loaded = model.load_state_dict(filtered, strict=False)
+    unexpected.extend(list(unexpected_loaded))
+    return list(missing), unexpected, skipped
+
+
 def save_checkpoint(
     path: Path,
     epoch: int,
@@ -104,15 +133,18 @@ def load_checkpoint(
 ) -> Tuple[int, float]:
     ckpt = torch.load(str(path), map_location=map_location)
     state_dict = ckpt.get("model_state_dict", ckpt)
-    try:
-        model.load_state_dict(state_dict, strict=True)
-    except RuntimeError:
-        model.load_state_dict(state_dict, strict=False)
+    load_partial_state_dict(model, state_dict)
 
     if optimizer is not None and "optimizer_state_dict" in ckpt:
-        optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+        try:
+            optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+        except Exception:
+            pass
     if scheduler is not None and "scheduler_state_dict" in ckpt:
-        scheduler.load_state_dict(ckpt["scheduler_state_dict"])
+        try:
+            scheduler.load_state_dict(ckpt["scheduler_state_dict"])
+        except Exception:
+            pass
 
     epoch = int(ckpt.get("epoch", 0))
     best_val_loss = float(ckpt.get("best_val_loss", float("inf")))
