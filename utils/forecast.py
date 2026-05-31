@@ -26,7 +26,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .config import CONF_THRESH, FPN_CHANNELS, IMG_SIZE, NMS_IOU_THRESH, NUM_CLASSES, USE_SOFTMAX_BG
+from .config import CONF_THRESH, FPN_CHANNELS, IMG_SIZE, NMS_IOU_THRESH, NUM_CLASSES
 
 
 class ConvBNLeaky(nn.Module):
@@ -54,9 +54,7 @@ class AnchorFreeForecastHead(nn.Module):
             ConvBNLeaky(in_ch, in_ch, k=3, s=1, p=1),
         )
 
-        self.use_background_class = bool(USE_SOFTMAX_BG)
-        cls_channels = int(num_classes) + (1 if self.use_background_class else 0)
-        self.cls_pred = nn.Conv2d(in_ch, cls_channels, kernel_size=1, bias=True)
+        self.cls_pred = nn.Conv2d(in_ch, num_classes, kernel_size=1, bias=True)
         self.reg_pred = nn.Conv2d(in_ch, 4, kernel_size=1, bias=True)
 
         self._init_params()
@@ -106,37 +104,10 @@ def _build_grid(h: int, w: int, stride: float, device: torch.device) -> Tuple[to
     return gx, gy
 
 
-def _classification_scores(
-    cls_logits: torch.Tensor,
-    num_classes: int,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """
-    Return per-location score and class id for either:
-    - sigmoid C-channel head
-    - softmax (C+1)-channel head with explicit background channel
-    """
-    c, _, _ = cls_logits.shape
-    if c == num_classes:
-        prob = torch.sigmoid(cls_logits)
-        cls_score, cls_id = prob.max(dim=0)
-        return cls_score, cls_id
-
-    if c == num_classes + 1:
-        prob = torch.softmax(cls_logits, dim=0)
-        bg = prob[num_classes]
-        fg_prob = prob[:num_classes]
-        cls_score, cls_id = fg_prob.max(dim=0)
-        cls_score = cls_score * (1.0 - bg)
-        return cls_score, cls_id
-
-    raise ValueError(f"Unexpected cls channels={c}. Expected {num_classes} or {num_classes + 1}.")
-
-
 def decode_level(
     cls_logits: torch.Tensor,
     reg_preds: torch.Tensor,
     stride: float,
-    num_classes: int = NUM_CLASSES,
     conf_thresh: float = CONF_THRESH,
     img_size: Optional[int] = IMG_SIZE,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -154,7 +125,8 @@ def decode_level(
     if reg_preds.shape[0] != 4:
         raise ValueError("reg_preds first dim must be 4 for (t,l,b,r).")
 
-    best_score, best_cls = _classification_scores(cls_logits, num_classes=num_classes)
+    cls_prob = torch.sigmoid(cls_logits)
+    best_score, best_cls = cls_prob.max(dim=0)  # (H, W)
 
     mask = best_score >= conf_thresh
     if not mask.any():

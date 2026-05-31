@@ -3,7 +3,7 @@
 """
 Anchor-Free feature extractor and detection head.
 
-Architecture summary (input 320x320):
+Architecture summary (input IMG_SIZE x IMG_SIZE):
 - Backbone: ResNet-34 pretrained (no avgpool/fc)
   stem -> layer1 -> layer2(C2, stride 8, 128ch) -> layer3(C3, stride 16, 256ch) -> layer4(C4, stride 32, 512ch)
 - Neck: 3-level FPN
@@ -13,9 +13,9 @@ Architecture summary (input 320x320):
   top-down: upsample(P4) + P3, then upsample(P3) + P2
   smooth: conv3x3 + BN + LeakyReLU(0.1) on all levels
 - Outputs:
-  P2_out: (B, 128, H/8,  W/8),  stride 8   (for 320 -> 40x40)
-  P3_out: (B, 128, H/16, W/16), stride 16  (for 320 -> 20x20)
-  P4_out: (B, 128, H/32, W/32), stride 32  (for 320 -> 10x10)
+  P2_out: (B, 128, H/8,  W/8),  stride 8
+  P3_out: (B, 128, H/16, W/16), stride 16
+  P4_out: (B, 128, H/32, W/32), stride 32
 
 Compatibility with preprocess.py:
 - Model expects normalized RGB tensors of shape (B, 3, H, W).
@@ -29,7 +29,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torchvision import models
 
-from .config import FPN_CHANNELS, NUM_CLASSES, USE_SOFTMAX_BG
+from .config import FPN_CHANNELS, NUM_CLASSES
 
 
 class ConvBNLeaky(nn.Module):
@@ -116,19 +116,13 @@ class AnchorFreeHead(nn.Module):
     """
     Anchor-free head for one feature level.
 
-Outputs per level:
-- cls_logits:   (B, C or C+1, H, W)
+    Outputs per level:
+    - cls_logits:   (B, C, H, W)
     - reg_preds:    (B, 4, H, W), non-negative via ReLU
     - center_logits:(B, 1, H, W)
     """
 
-    def __init__(
-        self,
-        in_ch: int,
-        num_classes: int,
-        num_convs: int = 2,
-        use_background_class: bool = True,
-    ):
+    def __init__(self, in_ch: int, num_classes: int, num_convs: int = 2):
         super().__init__()
 
         cls_layers: List[nn.Module] = []
@@ -142,9 +136,7 @@ Outputs per level:
         self.cls_tower = nn.Sequential(*cls_layers)
         self.reg_tower = nn.Sequential(*reg_layers)
 
-        self.use_background_class = bool(use_background_class)
-        cls_channels = int(num_classes) + (1 if self.use_background_class else 0)
-        self.cls_out = nn.Conv2d(in_ch, cls_channels, kernel_size=1)
+        self.cls_out = nn.Conv2d(in_ch, num_classes, kernel_size=1)
         self.reg_out = nn.Conv2d(in_ch, 4, kernel_size=1)
         self.center_out = nn.Conv2d(in_ch, 1, kernel_size=1)
 
@@ -206,25 +198,9 @@ class AnchorFreeDetector(nn.Module):
         self.legacy_single_output = legacy_single_output
 
         self.backbone_fpn = ResNet34FPN3L(fpn_channels=feat_channels, pretrained=pretrained)
-        self.use_background_class = bool(USE_SOFTMAX_BG)
-        self.head_s8 = AnchorFreeHead(
-            in_ch=feat_channels,
-            num_classes=num_classes,
-            num_convs=2,
-            use_background_class=self.use_background_class,
-        )
-        self.head_s16 = AnchorFreeHead(
-            in_ch=feat_channels,
-            num_classes=num_classes,
-            num_convs=2,
-            use_background_class=self.use_background_class,
-        )
-        self.head_s32 = AnchorFreeHead(
-            in_ch=feat_channels,
-            num_classes=num_classes,
-            num_convs=2,
-            use_background_class=self.use_background_class,
-        )
+        self.head_s8 = AnchorFreeHead(in_ch=feat_channels, num_classes=num_classes, num_convs=2)
+        self.head_s16 = AnchorFreeHead(in_ch=feat_channels, num_classes=num_classes, num_convs=2)
+        self.head_s32 = AnchorFreeHead(in_ch=feat_channels, num_classes=num_classes, num_convs=2)
 
     def extract_features(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         return self.backbone_fpn(x)

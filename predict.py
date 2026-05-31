@@ -16,6 +16,9 @@ from utils.config import (
     CLASS_CONF_THRESH,
     CLASS_NAMES,
     CONF_THRESH,
+    LOW_LIGHT_CLAHE_CLIP,
+    LOW_LIGHT_GAMMA,
+    LOW_LIGHT_MEAN_THRESH,
     IMG_SIZE,
     MAX_OBJECTS_PER_IMAGE,
     MIN_BOX_SIZE,
@@ -27,7 +30,6 @@ from utils.config import (
 )
 from utils.model import AnchorFreeDetector
 from utils.nms import LetterboxMeta, postprocess_batch
-from utils.runtime import load_partial_state_dict
 
 VALID_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 DEFAULT_VAL_IMAGE_DIR = Path("public/val/images")
@@ -58,14 +60,14 @@ def imwrite_unicode(path: Path, image_bgr: np.ndarray) -> bool:
 
 def enhance_low_light_bgr(image_bgr: np.ndarray) -> np.ndarray:
     gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
-    if float(gray.mean()) >= 82.0:
+    if float(gray.mean()) >= float(LOW_LIGHT_MEAN_THRESH):
         return image_bgr
     lab = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2LAB)
     l, a, b = cv2.split(lab)
-    clahe = cv2.createCLAHE(clipLimit=2.2, tileGridSize=(8, 8))
+    clahe = cv2.createCLAHE(clipLimit=float(LOW_LIGHT_CLAHE_CLIP), tileGridSize=(8, 8))
     l = clahe.apply(l)
     out = cv2.cvtColor(cv2.merge([l, a, b]), cv2.COLOR_LAB2BGR)
-    lut = np.array([((i / 255.0) ** 0.82) * 255.0 for i in range(256)], dtype=np.float32)
+    lut = np.array([((i / 255.0) ** float(LOW_LIGHT_GAMMA)) * 255.0 for i in range(256)], dtype=np.float32)
     lut = np.clip(lut, 0, 255).astype(np.uint8)
     return cv2.LUT(out, lut)
 
@@ -595,7 +597,7 @@ def apply_class_thresholds(
         for box in pred.get("boxes", []):
             c = str(box.get("class", ""))
             s = float(box.get("confidence", 0.0))
-            thr = max(th_map.get(c, float(MIN_EXPORT_CONF)), float(MIN_EXPORT_CONF))
+            thr = max(th_map.get(c, 0.5), float(MIN_EXPORT_CONF))
             if s >= thr:
                 keep.append(box)
         out.append({"image_id": pred.get("image_id"), "boxes": keep})
@@ -716,15 +718,13 @@ def load_checkpoint_model(checkpoint_path: Path, device: torch.device) -> Tuple[
 
     model = AnchorFreeDetector(num_classes=num_classes, pretrained=False).to(device)
     state = ckpt.get("model_state_dict", ckpt)
-    missing, unexpected, skipped = load_partial_state_dict(model, state)
-    if missing or unexpected or skipped:
-        print("Checkpoint partially loaded.")
-        if missing:
-            print(f"Missing keys: {missing}")
-        if unexpected:
-            print(f"Unexpected keys: {unexpected}")
-        if skipped:
-            print(f"Skipped mismatched keys: {skipped}")
+    try:
+        model.load_state_dict(state, strict=True)
+    except RuntimeError as exc:
+        missing, unexpected = model.load_state_dict(state, strict=False)
+        print(f"Checkpoint partially loaded ({exc}).")
+        print(f"Missing keys: {missing}")
+        print(f"Unexpected keys: {unexpected}")
     model.eval()
 
     return model, list(classes), img_size
@@ -745,7 +745,7 @@ def parse_args() -> argparse.Namespace:
         help="Path to trained model checkpoint (.pth). '--model_path' is kept as a backward-compatible alias.",
     )
     parser.add_argument("--img_size", type=int, default=IMG_SIZE)
-    parser.add_argument("--batch_size", type=int, default=16)
+    parser.add_argument("--batch_size", type=int, default=8)
     parser.add_argument("--conf_thresh", type=float, default=CONF_THRESH)
     parser.add_argument("--nms_thresh", type=float, default=NMS_IOU_THRESH)
     parser.add_argument(

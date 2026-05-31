@@ -27,14 +27,18 @@ from utils.config import (
     CLASS_SAMPLER_WEIGHTS,
     IMG_SIZE,
     LABEL_SMOOTHING,
+    LOW_LIGHT_CLAHE_CLIP,
+    LOW_LIGHT_GAMMA,
+    LOW_LIGHT_MEAN_THRESH,
     MEAN,
     NUM_CLASSES,
+    SMALL_OBJECT_AREA_RATIO,
+    SMALL_OBJECT_BONUS,
     STD,
     STRIDES,
 )
 from utils.loss import DetectionLoss
 from utils.model import AnchorFreeDetector
-from utils.runtime import load_partial_state_dict
 
 VALID_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 
@@ -43,21 +47,34 @@ VALID_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 class Sample:
     image_id: str
     image_path: Path
+    width: int
+    height: int
     boxes: List[List[float]]
     labels: List[int]
 
 
 def compute_class_weights(num_classes: int) -> torch.Tensor:
-    fixed_weights = np.asarray(CLASS_LOSS_WEIGHTS, dtype=np.float64)
     if num_classes <= 0:
         return torch.zeros((0,), dtype=torch.float32)
-    if num_classes == fixed_weights.size:
-        weights = fixed_weights
-    elif num_classes < fixed_weights.size:
-        weights = fixed_weights[:num_classes]
-    else:
+
+    freq_train = np.asarray(CLASS_FREQ_PRIOR_TRAIN, dtype=np.float64)
+    freq_val = np.asarray(CLASS_FREQ_PRIOR_VAL, dtype=np.float64)
+    if freq_train.size != num_classes or freq_val.size != num_classes:
         weights = np.ones((num_classes,), dtype=np.float64)
-        weights[: fixed_weights.size] = fixed_weights
+        return torch.as_tensor(weights, dtype=torch.float32)
+
+    freq = 0.5 * (freq_train + freq_val)
+    freq = np.clip(freq, 1e-6, None)
+
+    # Base inverse-frequency weight, softened by sqrt to avoid exploding the
+    # minority classes. A mild class-specific boost is applied afterwards.
+    weights = np.power(freq.mean() / freq, 0.5)
+    class_boost = np.asarray(CLASS_LOSS_WEIGHTS, dtype=np.float64)
+    if class_boost.size != num_classes:
+        class_boost = np.ones((num_classes,), dtype=np.float64)
+    weights = weights * class_boost
+    weights = weights / max(weights.mean(), 1e-12)
+    weights = np.clip(weights, 0.70, 1.80)
     return torch.as_tensor(weights, dtype=torch.float32)
 
 
@@ -83,7 +100,24 @@ def build_sample_weights(samples: List[Sample], class_weights: torch.Tensor) -> 
         # objects get sampled more often.
         base_weight = float(np.mean(cw[labels] * class_sampler_weights[labels]))
         crowd_bonus = 1.0 + 0.12 * float(min(labels.size, 10))
-        ws[i] = max(1.0, base_weight * crowd_bonus)
+        small_bonus = 1.0
+        if s.width > 0 and s.height > 0 and len(s.boxes) > 0:
+            img_area = float(max(s.width * s.height, 1))
+            box_areas = np.asarray(
+                [
+                    max(0.0, float(box[2]) - float(box[0])) * max(0.0, float(box[3]) - float(box[1]))
+                    for box in s.boxes
+                ],
+                dtype=np.float64,
+            )
+            if box_areas.size > 0:
+                area_ratios = box_areas / img_area
+                smallness = np.mean(
+                    np.clip((float(SMALL_OBJECT_AREA_RATIO) - area_ratios) / float(SMALL_OBJECT_AREA_RATIO), 0.0, 1.0)
+                )
+                small_bonus = 1.0 + float(SMALL_OBJECT_BONUS) * float(smallness)
+
+        ws[i] = max(1.0, base_weight * crowd_bonus * small_bonus)
 
     ws = ws / max(ws.mean(), 1e-12)
     ws = np.clip(ws, 0.25, 4.5)
@@ -108,17 +142,17 @@ def imread_unicode(path: Path) -> Optional[np.ndarray]:
 
 def enhance_low_light_bgr(image_bgr: np.ndarray) -> np.ndarray:
     gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
-    if float(gray.mean()) >= 82.0:
+    if float(gray.mean()) >= float(LOW_LIGHT_MEAN_THRESH):
         return image_bgr
 
     lab = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2LAB)
     l, a, b = cv2.split(lab)
-    clahe = cv2.createCLAHE(clipLimit=2.2, tileGridSize=(8, 8))
+    clahe = cv2.createCLAHE(clipLimit=float(LOW_LIGHT_CLAHE_CLIP), tileGridSize=(8, 8))
     l = clahe.apply(l)
     merged = cv2.merge([l, a, b])
     out = cv2.cvtColor(merged, cv2.COLOR_LAB2BGR)
 
-    lut = np.array([((i / 255.0) ** 0.82) * 255.0 for i in range(256)], dtype=np.float32)
+    lut = np.array([((i / 255.0) ** float(LOW_LIGHT_GAMMA)) * 255.0 for i in range(256)], dtype=np.float32)
     lut = np.clip(lut, 0, 255).astype(np.uint8)
     out = cv2.LUT(out, lut)
     return out
@@ -155,6 +189,13 @@ def parse_samples(annotation_path: Path, image_dir: Path, class_names: Optional[
             else:
                 continue
 
+        width = int(im.get("width", 0) or 0)
+        height = int(im.get("height", 0) or 0)
+        if width <= 0 or height <= 0:
+            image = imread_unicode(image_path)
+            if image is not None:
+                height, width = image.shape[:2]
+
         boxes: List[List[float]] = []
         labels: List[int] = []
         for ann in ann_by_image.get(image_id, []):
@@ -167,7 +208,16 @@ def parse_samples(annotation_path: Path, image_dir: Path, class_names: Optional[
             boxes.append([x1, y1, x2, y2])
             labels.append(class_to_idx[cls_name])
 
-        samples.append(Sample(image_id=image_id, image_path=image_path, boxes=boxes, labels=labels))
+        samples.append(
+            Sample(
+                image_id=image_id,
+                image_path=image_path,
+                width=int(width),
+                height=int(height),
+                boxes=boxes,
+                labels=labels,
+            )
+        )
 
     if not samples:
         raise ValueError(f"No valid samples from {annotation_path} with image_dir={image_dir}")
@@ -196,11 +246,11 @@ def make_pad_if_needed(img_size: int):
 def get_train_transforms(img_size: int) -> A.Compose:
     affine_params = inspect.signature(A.Affine.__init__).parameters
     affine_kwargs = dict(
-        scale=(0.85, 1.55),
-        translate_percent=(-0.12, 0.12),
-        rotate=(-8, 8),
-        shear=(-1.5, 1.5),
-        p=0.25,
+        scale=(0.85, 1.25),
+        translate_percent=(-0.04, 0.04),
+        rotate=(-4, 4),
+        shear=(-1.0, 1.0),
+        p=0.20,
     )
     if "border_mode" in affine_params:
         affine_kwargs["border_mode"] = cv2.BORDER_CONSTANT
@@ -233,7 +283,7 @@ def get_train_transforms(img_size: int) -> A.Compose:
                     A.GaussianBlur(blur_limit=(3, 7), p=1.0),
                     A.MotionBlur(blur_limit=5, p=1.0),
                 ],
-                p=0.25,
+                p=0.2,
             ),
             A.RandomGamma(gamma_limit=(88, 122), p=0.25),
             A.ColorJitter(brightness=0.12, contrast=0.12, saturation=0.1, hue=0.05, p=0.45),
@@ -244,8 +294,8 @@ def get_train_transforms(img_size: int) -> A.Compose:
         bbox_params=A.BboxParams(
             format="pascal_voc",
             label_fields=["class_labels"],
-            min_area=0.5,
-            min_visibility=0.02,
+            min_area=0.0,
+            min_visibility=0.0,
             clip=True,
         ),
     )
@@ -262,7 +312,7 @@ def get_val_transforms(img_size: int) -> A.Compose:
         bbox_params=A.BboxParams(
             format="pascal_voc",
             label_fields=["class_labels"],
-            min_area=0.5,
+            min_area=0.0,
             min_visibility=0.0,
             clip=True,
         ),
@@ -458,7 +508,6 @@ def save_checkpoint(
             "classes": classes,
             "img_size": img_size,
             "strides": STRIDES,
-            "use_softmax_bg": bool(getattr(model, "use_background_class", False)),
         },
         str(path),
     )
@@ -472,7 +521,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--val_image_dir", type=Path, required=True)
     parser.add_argument("--checkpoint_dir", type=Path, default=Path("./models"))
     parser.add_argument("--img_size", type=int, default=IMG_SIZE)
-    parser.add_argument("--batch_size", type=int, default=16)
+    parser.add_argument("--batch_size", type=int, default=8)
     parser.add_argument("--epochs", type=int, default=20)
     parser.add_argument("--lr_backbone", type=float, default=2e-4)
     parser.add_argument("--lr_head", type=float, default=2e-3)
@@ -543,25 +592,17 @@ def main() -> None:
     best_val_loss = float("inf")
     if args.resume is not None and args.resume.exists():
         ckpt = torch.load(str(args.resume), map_location=device)
-        missing, unexpected, skipped = load_partial_state_dict(model, ckpt["model_state_dict"])
-        if missing or unexpected or skipped:
-            print("Resume checkpoint partially loaded.")
-            if missing:
-                print(f"Missing keys: {missing}")
-            if unexpected:
-                print(f"Unexpected keys: {unexpected}")
-            if skipped:
-                print(f"Skipped mismatched keys: {skipped}")
+        try:
+            model.load_state_dict(ckpt["model_state_dict"], strict=True)
+        except RuntimeError as exc:
+            missing, unexpected = model.load_state_dict(ckpt["model_state_dict"], strict=False)
+            print(f"Resume checkpoint partially loaded ({exc}).")
+            print(f"Missing keys: {missing}")
+            print(f"Unexpected keys: {unexpected}")
         if "optimizer_state_dict" in ckpt:
-            try:
-                optimizer.load_state_dict(ckpt["optimizer_state_dict"])
-            except Exception as exc:
-                print(f"Skipping optimizer state from resume checkpoint: {exc}")
+            optimizer.load_state_dict(ckpt["optimizer_state_dict"])
         if "scheduler_state_dict" in ckpt:
-            try:
-                scheduler.load_state_dict(ckpt["scheduler_state_dict"])
-            except Exception as exc:
-                print(f"Skipping scheduler state from resume checkpoint: {exc}")
+            scheduler.load_state_dict(ckpt["scheduler_state_dict"])
         start_epoch = int(ckpt.get("epoch", 0)) + 1
         best_val_loss = float(ckpt.get("best_val_loss", float("inf")))
 

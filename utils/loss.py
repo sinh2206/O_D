@@ -192,7 +192,6 @@ def focal_softmax_loss(
     bg_index: int,
     alpha: float = FOCAL_ALPHA,
     gamma: float = FOCAL_GAMMA,
-    class_weights: Optional[torch.Tensor] = None,
     reduction: str = "mean",
 ) -> torch.Tensor:
     """
@@ -216,16 +215,6 @@ def focal_softmax_loss(
     alpha_t[idx == int(bg_index)] = float(1.0 - alpha)
 
     loss = -alpha_t * (1.0 - p).pow(gamma) * lp
-
-    if class_weights is not None:
-        cw = class_weights.to(device=logits.device, dtype=logits.dtype).view(-1)
-        if cw.numel() > 0:
-            weights = torch.ones_like(loss)
-            fg_mask = idx != int(bg_index)
-            if fg_mask.any():
-                fg_idx = idx[fg_mask].clamp(min=0, max=max(int(cw.numel()) - 1, 0))
-                weights[fg_mask] = cw[fg_idx]
-            loss = loss * weights
 
     if reduction == "sum":
         return loss.sum()
@@ -650,7 +639,6 @@ def compute_loss(
                 bg_index=bg_index,
                 alpha=focal_alpha,
                 gamma=focal_gamma,
-                class_weights=class_weights,
                 reduction="sum",
             )
         else:
