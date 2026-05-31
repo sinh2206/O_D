@@ -14,10 +14,10 @@ CLASS_TO_IDX = {name: i for i, name in enumerate(CLASS_NAMES)}
 CLASS_FREQ_PRIOR_TRAIN = [0.5477, 0.1258, 0.0966, 0.0783, 0.1516]
 CLASS_FREQ_PRIOR_VAL = [0.5314, 0.1400, 0.1019, 0.0871, 0.1395]
 
-# Class emphasis factors used by train.py to derive final weights from the
-# observed class frequencies.
-CLASS_LOSS_WEIGHTS = [0.60, 1.25, 1.35, 1.45, 1.20]
-CLASS_SAMPLER_WEIGHTS = [0.70, 1.20, 1.30, 1.30, 1.15]
+# Fixed class weights in CLASS_NAMES order:
+# person, car, dog, cat, chair
+CLASS_LOSS_WEIGHTS = [1.0, 1.0, 1.1, 1.1, 1.2]
+CLASS_SAMPLER_WEIGHTS = [1.0, 1.0, 1.1, 1.1, 1.2]
 
 STRIDES = [8, 16, 32]
 FPN_CHANNELS = 128
@@ -32,7 +32,7 @@ MAX_OBJECTS_PER_IMAGE = 15
 # person, car, dog, cat, chair
 CLASS_CONF_THRESH = [0.35, 0.35, 0.35, 0.35, 0.35]
 MIN_EXPORT_CONF = 0.3
-CLASS_SCORE_SCALES = [0.80, 1.10, 1.20, 1.20, 1.05]
+CLASS_SCORE_SCALES = [1.0, 1.0, 1.1, 1.1, 1.2]
 CHAIR_SUPPRESS_WITH_PERSON_IOU = 0.92
 CHAIR_SUPPRESS_MAX_AREA_RATIO = 0.25
 MIN_BOX_SIZE = 1.0

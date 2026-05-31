@@ -20,8 +20,6 @@ from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
 
 from utils.config import (
     CENTER_RADIUS,
-    CLASS_FREQ_PRIOR_TRAIN,
-    CLASS_FREQ_PRIOR_VAL,
     CLASS_LOSS_WEIGHTS,
     CLASS_NAMES,
     CLASS_SAMPLER_WEIGHTS,
@@ -56,27 +54,14 @@ class Sample:
 def compute_class_weights(num_classes: int) -> torch.Tensor:
     if num_classes <= 0:
         return torch.zeros((0,), dtype=torch.float32)
-
-    freq_train = np.asarray(CLASS_FREQ_PRIOR_TRAIN, dtype=np.float64)
-    freq_val = np.asarray(CLASS_FREQ_PRIOR_VAL, dtype=np.float64)
-    if freq_train.size != num_classes or freq_val.size != num_classes:
+    fixed = np.asarray(CLASS_LOSS_WEIGHTS, dtype=np.float64)
+    if fixed.size == num_classes:
+        weights = fixed
+    elif fixed.size > num_classes:
+        weights = fixed[:num_classes]
+    else:
         weights = np.ones((num_classes,), dtype=np.float64)
-        return torch.as_tensor(weights, dtype=torch.float32)
-
-    freq = 0.5 * (freq_train + freq_val)
-    freq = np.clip(freq, 1e-6, None)
-
-    # Base inverse-frequency weight, softened by sqrt to avoid exploding the
-    # minority classes. A mild class-specific boost is applied afterwards.
-    weights = np.power(freq.mean() / freq, 0.5)
-    class_boost = np.asarray(CLASS_LOSS_WEIGHTS, dtype=np.float64)
-    if class_boost.size != num_classes:
-        class_boost = np.ones((num_classes,), dtype=np.float64)
-    weights = weights * class_boost
-    weights = weights / max(weights.mean(), 1e-12)
-    # Keep dominant class penalized enough to reduce person-overprediction
-    # while still allowing minority classes to be upweighted.
-    weights = np.clip(weights, 0.45, 2.20)
+        weights[: fixed.size] = fixed
     return torch.as_tensor(weights, dtype=torch.float32)
 
 
