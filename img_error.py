@@ -157,36 +157,11 @@ def draw_prediction_only(
         iou_thresh=iou_thresh,
     )
 
-    def _best_iou_same_class(pred_box: dict) -> float:
-        cls_name = str(pred_box.get("class", ""))
-        pb = pred_box.get("bbox", [0, 0, 0, 0])
-        best = 0.0
-        for gt in gt_boxes:
-            if str(gt.get("class", "")) != cls_name:
-                continue
-            gb = gt.get("bbox", [0, 0, 0, 0])
-            x1 = max(float(pb[0]), float(gb[0]))
-            y1 = max(float(pb[1]), float(gb[1]))
-            x2 = min(float(pb[2]), float(gb[2]))
-            y2 = min(float(pb[3]), float(gb[3]))
-            inter = max(0.0, x2 - x1) * max(0.0, y2 - y1)
-            ap = max(0.0, float(pb[2]) - float(pb[0])) * max(0.0, float(pb[3]) - float(pb[1]))
-            ag = max(0.0, float(gb[2]) - float(gb[0])) * max(0.0, float(gb[3]) - float(gb[1]))
-            iou = inter / (ap + ag - inter + 1e-9)
-            if iou > best:
-                best = iou
-        return float(best)
-
     for idx, pred in enumerate(pred_boxes):
         cls_name = str(pred.get("class", ""))
         conf = float(pred.get("confidence", 0.0))
         color = (40, 220, 70) if pred_is_correct[idx] else (30, 30, 255)
-        label = f"PD:{cls_name}:{conf:.2f}"
-        if not pred_is_correct[idx]:
-            best_iou = _best_iou_same_class(pred)
-            if best_iou > 0:
-                label = f"{label} iou={best_iou:.2f}"
-        _draw_labeled_box(out, pred.get("bbox", [0, 0, 0, 0]), label, color, thickness=2)
+        _draw_labeled_box(out, pred.get("bbox", [0, 0, 0, 0]), f"PD:{cls_name}:{conf:.2f}", color, thickness=2)
 
     return out
 

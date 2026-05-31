@@ -352,143 +352,6 @@ def box_iou(a: Sequence[float], b: Sequence[float]) -> float:
     return inter / (area_a + area_b - inter + 1e-9)
 
 
-def _inverse_hflip_boxes(boxes: Sequence[dict], width: int) -> List[dict]:
-    out: List[dict] = []
-    for box in boxes:
-        bbox = box.get("bbox", [])
-        if not isinstance(bbox, list) or len(bbox) != 4:
-            continue
-        x1, y1, x2, y2 = [float(v) for v in bbox]
-        nx1 = float(width) - x2
-        nx2 = float(width) - x1
-        new_box = dict(box)
-        new_box["bbox"] = [nx1, y1, nx2, y2]
-        out.append(new_box)
-    return out
-
-
-def _inverse_rot180_boxes(boxes: Sequence[dict], width: int, height: int) -> List[dict]:
-    out: List[dict] = []
-    for box in boxes:
-        bbox = box.get("bbox", [])
-        if not isinstance(bbox, list) or len(bbox) != 4:
-            continue
-        x1, y1, x2, y2 = [float(v) for v in bbox]
-        nx1 = float(width) - x2
-        ny1 = float(height) - y2
-        nx2 = float(width) - x1
-        ny2 = float(height) - y1
-        new_box = dict(box)
-        new_box["bbox"] = [nx1, ny1, nx2, ny2]
-        out.append(new_box)
-    return out
-
-
-def _merge_tta_boxes(
-    all_boxes: Sequence[dict],
-    iou_thresh: float = 0.45,
-    min_votes: int = 2,
-) -> List[dict]:
-    if not all_boxes:
-        return []
-
-    ordered = sorted(all_boxes, key=lambda b: float(b.get("confidence", 0.0)), reverse=True)
-    used = [False] * len(ordered)
-    merged: List[dict] = []
-
-    for i, base in enumerate(ordered):
-        if used[i]:
-            continue
-        cls_name = str(base.get("class", ""))
-        base_bbox = base.get("bbox", [0.0, 0.0, 0.0, 0.0])
-        cluster = [i]
-        used[i] = True
-
-        for j in range(i + 1, len(ordered)):
-            if used[j]:
-                continue
-            cand = ordered[j]
-            if str(cand.get("class", "")) != cls_name:
-                continue
-            if box_iou(base_bbox, cand.get("bbox", [0.0, 0.0, 0.0, 0.0])) >= float(iou_thresh):
-                used[j] = True
-                cluster.append(j)
-
-        votes = len(cluster)
-        confs = [float(ordered[k].get("confidence", 0.0)) for k in cluster]
-        max_conf = max(confs)
-
-        if votes < int(min_votes) and max_conf < 0.60:
-            continue
-
-        denom = max(sum(confs), 1e-9)
-        x1 = sum(float(ordered[k]["bbox"][0]) * confs[idx] for idx, k in enumerate(cluster)) / denom
-        y1 = sum(float(ordered[k]["bbox"][1]) * confs[idx] for idx, k in enumerate(cluster)) / denom
-        x2 = sum(float(ordered[k]["bbox"][2]) * confs[idx] for idx, k in enumerate(cluster)) / denom
-        y2 = sum(float(ordered[k]["bbox"][3]) * confs[idx] for idx, k in enumerate(cluster)) / denom
-
-        merged.append(
-            {
-                "class": cls_name,
-                "confidence": float(max_conf),
-                "bbox": [x1, y1, x2, y2],
-            }
-        )
-
-    return merged
-
-
-@torch.no_grad()
-def _run_tta_fallback_single(
-    model: AnchorFreeDetector,
-    image_bgr: np.ndarray,
-    image_id: str,
-    device: torch.device,
-    img_size: int,
-    conf_thresh: float,
-    nms_thresh: float,
-    class_names: Sequence[str],
-    center_combine: str,
-    tta_min_votes: int,
-) -> List[dict]:
-    h, w = image_bgr.shape[:2]
-    fallback_conf = max(0.20, min(float(conf_thresh) * 0.75, 0.28))
-
-    variants = [
-        ("orig", image_bgr, lambda boxes: list(boxes)),
-        ("hflip", cv2.flip(image_bgr, 1), lambda boxes: _inverse_hflip_boxes(boxes, width=w)),
-        ("rot180", cv2.rotate(image_bgr, cv2.ROTATE_180), lambda boxes: _inverse_rot180_boxes(boxes, width=w, height=h)),
-    ]
-
-    all_boxes: List[dict] = []
-    amp_enabled = device.type == "cuda"
-
-    for _, variant_img, inv_fn in variants:
-        tensor, meta = letterbox_preprocess(variant_img, img_size=img_size)
-        images = torch.stack([tensor], dim=0).to(device, non_blocking=True).to(memory_format=torch.channels_last)
-        with torch.autocast(device_type=device.type, enabled=amp_enabled):
-            outputs = model(images)
-        pred = postprocess_batch(
-            outputs=outputs,
-            image_ids=[image_id],
-            metas=[meta],
-            class_names=class_names,
-            num_classes=len(class_names),
-            img_size=img_size,
-            conf_thresh=fallback_conf,
-            nms_thresh=nms_thresh,
-            reg_decode="auto",
-            center_combine=str(center_combine),
-            min_box_size=MIN_BOX_SIZE,
-        )[0]["boxes"]
-        all_boxes.extend(inv_fn(pred))
-
-    merged = _merge_tta_boxes(all_boxes, iou_thresh=0.45, min_votes=max(1, int(tta_min_votes)))
-    merged = _suppress_same_class_contained_int(merged)
-    merged = sorted(merged, key=lambda b: float(b.get("confidence", 0.0)), reverse=True)
-    return merged[: int(MAX_OBJECTS_PER_IMAGE)]
-
-
 def load_ground_truth(annotation_path: Path, class_names: Sequence[str]) -> Dict[str, List[dict]]:
     data = json.loads(annotation_path.read_text(encoding="utf-8"))
     valid_classes = set(class_names)
@@ -729,6 +592,21 @@ def draw_prediction(image_bgr: np.ndarray, boxes: Sequence[dict], class_names: S
     return out
 
 
+def box_iou(a: Sequence[float], b: Sequence[float]) -> float:
+    ax1, ay1, ax2, ay2 = [float(v) for v in a]
+    bx1, by1, bx2, by2 = [float(v) for v in b]
+    xx1 = max(ax1, bx1)
+    yy1 = max(ay1, by1)
+    xx2 = min(ax2, bx2)
+    yy2 = min(ay2, by2)
+    w = max(0.0, xx2 - xx1)
+    h = max(0.0, yy2 - yy1)
+    inter = w * h
+    area_a = max(0.0, ax2 - ax1) * max(0.0, ay2 - ay1)
+    area_b = max(0.0, bx2 - bx1) * max(0.0, by2 - by1)
+    return inter / (area_a + area_b - inter + 1e-9)
+
+
 def apply_class_thresholds(
     predictions: List[dict],
     class_names: Sequence[str],
@@ -793,8 +671,6 @@ def run_inference(
     nms_thresh: float,
     class_names: Sequence[str],
     center_combine: str = INFER_CENTER_COMBINE,
-    enable_tta_fallback: bool = False,
-    tta_min_votes: int = 2,
 ) -> List[dict]:
     results: List[dict] = []
     amp_enabled = device.type == "cuda"
@@ -804,7 +680,6 @@ def run_inference(
         tensors: List[torch.Tensor] = []
         metas: List[LetterboxMeta] = []
         image_ids: List[str] = []
-        originals: Dict[str, np.ndarray] = {}
 
         for p in batch_paths:
             image = imread_unicode(p)
@@ -814,7 +689,6 @@ def run_inference(
             tensors.append(tensor)
             metas.append(meta)
             image_ids.append(p.name)
-            originals[p.name] = image
 
         if not tensors:
             continue
@@ -836,30 +710,6 @@ def run_inference(
             center_combine=str(center_combine),
             min_box_size=MIN_BOX_SIZE,
         )
-
-        if enable_tta_fallback:
-            for item in batch_results:
-                if len(item.get("boxes", [])) > 0:
-                    continue
-                image_id = str(item.get("image_id", ""))
-                image_bgr = originals.get(image_id)
-                if image_bgr is None:
-                    continue
-                tta_boxes = _run_tta_fallback_single(
-                    model=model,
-                    image_bgr=image_bgr,
-                    image_id=image_id,
-                    device=device,
-                    img_size=img_size,
-                    conf_thresh=conf_thresh,
-                    nms_thresh=nms_thresh,
-                    class_names=class_names,
-                    center_combine=center_combine,
-                    tta_min_votes=tta_min_votes,
-                )
-                if tta_boxes:
-                    item["boxes"] = tta_boxes
-
         results.extend(batch_results)
 
     return results
@@ -937,8 +787,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--chair_suppress_iou", type=float, default=CHAIR_SUPPRESS_WITH_PERSON_IOU)
     parser.add_argument("--hardcase_topk", type=int, default=50)
     parser.add_argument("--hardcase_iou", type=float, default=0.5)
-    parser.add_argument("--tta_fallback", action="store_true", help="Enable TTA fallback on images with zero detections.")
-    parser.add_argument("--tta_min_votes", type=int, default=2, help="Minimum TTA consensus votes to keep a fallback box.")
     parser.add_argument("--device", type=str, default="auto", choices=["auto", "cuda", "cpu"])
     return parser.parse_args()
 
@@ -990,8 +838,6 @@ def main() -> None:
         nms_thresh=float(args.nms_thresh),
         class_names=class_names,
         center_combine=str(args.center_combine),
-        enable_tta_fallback=bool(args.tta_fallback),
-        tta_min_votes=max(1, int(args.tta_min_votes)),
     )
     predictions = apply_class_thresholds(predictions, class_names=class_names, class_conf_thresh=class_conf)
     predictions = suppress_chair_inside_person(predictions, iou_thresh=float(args.chair_suppress_iou))
@@ -1027,7 +873,6 @@ def main() -> None:
     )
     print(f"Predicted images: {len(predictions)}")
     print(f"Saved JSON: {args.output}")
-    print(f"TTA fallback: {bool(args.tta_fallback)} (min_votes={max(1, int(args.tta_min_votes))})")
     print(f"Hardcase items: {hardcase_count}")
     print(f"Hardcase summary: {summary_path}")
 
