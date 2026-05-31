@@ -19,6 +19,7 @@ from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
 
 from utils.config import (
+    CENTER_RADIUS,
     CLASS_FREQ_PRIOR_TRAIN,
     CLASS_FREQ_PRIOR_VAL,
     CLASS_LOSS_WEIGHTS,
@@ -49,7 +50,7 @@ def compute_class_weights(num_classes: int) -> torch.Tensor:
     # The hard cases show that person/chair scenes are underfit, so the
     # fixed weights keep those classes emphasized instead of downweighting
     # the dominant class too aggressively.
-    fixed_weights = np.asarray([1.25, 1.05, 1.00, 1.00, 1.30], dtype=np.float64)
+    fixed_weights = np.asarray([0.8, 1.25, 1.00, 1.00, 1.4], dtype=np.float64)
     if num_classes <= 0:
         return torch.zeros((0,), dtype=torch.float32)
     if num_classes == fixed_weights.size:
@@ -83,7 +84,7 @@ def build_sample_weights(samples: List[Sample], class_weights: torch.Tensor) -> 
         # Use all labels, not just unique classes, so crowded scenes with many
         # objects get sampled more often.
         base_weight = float(np.mean(cw[labels] * class_sampler_weights[labels]))
-        crowd_bonus = 1.0 + 0.08 * float(min(labels.size, 10))
+        crowd_bonus = 1.0 + 0.12 * float(min(labels.size, 10))
         ws[i] = max(1.0, base_weight * crowd_bonus)
 
     ws = ws / max(ws.mean(), 1e-12)
@@ -238,8 +239,8 @@ def get_train_transforms(img_size: int) -> A.Compose:
         bbox_params=A.BboxParams(
             format="pascal_voc",
             label_fields=["class_labels"],
-            min_area=4.0,
-            min_visibility=0.2,
+            min_area=2.0,
+            min_visibility=0.1,
             clip=True,
         ),
     )
@@ -474,7 +475,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--resume", type=Path, default=None)
     parser.add_argument("--label_smoothing", type=float, default=LABEL_SMOOTHING)
-    parser.add_argument("--center_radius", type=float, default=1.5)
+    parser.add_argument("--center_radius", type=float, default=CENTER_RADIUS)
     parser.add_argument("--no_scale_ranges", action="store_true")
     parser.add_argument("--no_balanced_sampling", action="store_true")
     parser.add_argument("--no_class_weights", action="store_true")

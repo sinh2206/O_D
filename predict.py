@@ -12,6 +12,7 @@ import torch
 
 from utils.config import (
     CHAIR_SUPPRESS_WITH_PERSON_IOU,
+    CHAIR_SUPPRESS_MAX_AREA_RATIO,
     CLASS_CONF_THRESH,
     CLASS_NAMES,
     CONF_THRESH,
@@ -625,7 +626,7 @@ def suppress_chair_inside_person(predictions: List[dict], iou_thresh: float) -> 
                 if not _is_fully_inside(chair_box, person_box):
                     continue
                 person_area = _box_area(person_box)
-                if chair_area <= 0.45 * max(person_area, 1.0):
+                if chair_area <= float(CHAIR_SUPPRESS_MAX_AREA_RATIO) * max(person_area, 1.0):
                     remove = True
                     break
             if not remove:

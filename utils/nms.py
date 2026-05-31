@@ -26,16 +26,17 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 import torch
 
 try:
-    from .config import CLASS_NAMES, CONF_THRESH, IMG_SIZE, MAX_OBJECTS_PER_IMAGE, NMS_IOU_THRESH, NUM_CLASSES, STRIDES
+    from .config import CLASS_NAMES, CONF_THRESH, IMG_SIZE, MAX_OBJECTS_PER_IMAGE, MIN_BOX_SIZE, NMS_IOU_THRESH, NUM_CLASSES, STRIDES
 except Exception:
     # Safe fallbacks when config.py is not present.
     CLASS_NAMES = ["person", "car", "dog", "cat", "chair"]
-    CONF_THRESH = 0.20
+    CONF_THRESH = 0.50
     NMS_IOU_THRESH = 0.50
     IMG_SIZE = 320
     NUM_CLASSES = 5
     STRIDES = [8, 16, 32]
     MAX_OBJECTS_PER_IMAGE = 15
+    MIN_BOX_SIZE = 1.0
 
 
 @dataclass
@@ -152,7 +153,7 @@ def decode_level(
     conf_thresh: float = CONF_THRESH,
     num_classes: int = NUM_CLASSES,
     reg_decode: str = "auto",
-    center_combine: str = "soft",
+    center_combine: str = "cls",
     background_index: Optional[int] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
@@ -246,7 +247,7 @@ def decode_multilevel(
     num_classes: int = NUM_CLASSES,
     strides: Optional[Sequence[int]] = None,
     reg_decode: str = "auto",
-    center_combine: str = "soft",
+    center_combine: str = "cls",
     background_index: Optional[int] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
@@ -462,7 +463,7 @@ def remap_boxes_to_original(boxes: torch.Tensor, meta: LetterboxMeta) -> torch.T
     return out
 
 
-def filter_small_boxes(boxes: torch.Tensor, min_size: float = 2.0) -> torch.Tensor:
+def filter_small_boxes(boxes: torch.Tensor, min_size: float = MIN_BOX_SIZE) -> torch.Tensor:
     """Return boolean mask keeping boxes with width/height >= min_size."""
     if boxes.numel() == 0:
         return torch.zeros((0,), dtype=torch.bool, device=boxes.device)
@@ -483,9 +484,9 @@ def postprocess_single_image(
     conf_thresh: float = CONF_THRESH,
     nms_thresh: float = NMS_IOU_THRESH,
     reg_decode: str = "auto",
-    center_combine: str = "soft",
+    center_combine: str = "cls",
     background_index: Optional[int] = None,
-    min_box_size: float = 2.0,
+    min_box_size: float = MIN_BOX_SIZE,
 ) -> Dict[str, Any]:
     """
     Full decode + NMS + remap pipeline for one image.
@@ -573,9 +574,9 @@ def postprocess_batch(
     conf_thresh: float = CONF_THRESH,
     nms_thresh: float = NMS_IOU_THRESH,
     reg_decode: str = "auto",
-    center_combine: str = "soft",
+    center_combine: str = "cls",
     background_index: Optional[int] = None,
-    min_box_size: float = 2.0,
+    min_box_size: float = MIN_BOX_SIZE,
 ) -> List[Dict[str, Any]]:
     """Batch wrapper for JSON-ready predictions."""
     bsz = outputs["cls_logits"][0].shape[0]

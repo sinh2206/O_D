@@ -11,11 +11,11 @@ from predict import (
     DEFAULT_RESULTS_DIR,
     DEFAULT_VAL_ANNOTATION,
     DEFAULT_VAL_IMAGE_DIR,
-    draw_hardcase,
     imread_unicode,
     imwrite_unicode,
     load_ground_truth,
     load_hardcase_summary,
+    match_predictions_to_ground_truth,
 )
 from utils.config import CLASS_NAMES
 
@@ -69,6 +69,103 @@ def draw_header(image, text: str) -> None:
     )
 
 
+def _round_half_up(value: float) -> int:
+    return int(value + 0.5) if value >= 0 else int(value - 0.5)
+
+
+def _normalize_bbox_for_draw(bbox, image_shape):
+    if not isinstance(bbox, (list, tuple)) or len(bbox) != 4:
+        return None
+    try:
+        x1, y1, x2, y2 = [float(v) for v in bbox]
+    except (TypeError, ValueError):
+        return None
+    h, w = int(image_shape[0]), int(image_shape[1])
+    if h <= 0 or w <= 0:
+        return None
+
+    x1 = max(0.0, min(float(w), x1))
+    y1 = max(0.0, min(float(h), y1))
+    x2 = max(0.0, min(float(w), x2))
+    y2 = max(0.0, min(float(h), y2))
+
+    ix1 = max(0, min(w - 1, _round_half_up(x1)))
+    iy1 = max(0, min(h - 1, _round_half_up(y1)))
+    ix2 = max(0, min(w - 1, _round_half_up(x2)))
+    iy2 = max(0, min(h - 1, _round_half_up(y2)))
+
+    if ix2 <= ix1:
+        if ix1 < w - 1:
+            ix2 = ix1 + 1
+        else:
+            return None
+    if iy2 <= iy1:
+        if iy1 < h - 1:
+            iy2 = iy1 + 1
+        else:
+            return None
+
+    return [int(ix1), int(iy1), int(ix2), int(iy2)]
+
+
+def _draw_labeled_box(image_bgr, bbox, label: str, color, thickness: int = 2) -> None:
+    norm = _normalize_bbox_for_draw(bbox, image_bgr.shape)
+    if norm is None:
+        return
+
+    x1, y1, x2, y2 = norm
+    cv2.rectangle(image_bgr, (x1, y1), (x2, y2), color, thickness, cv2.LINE_AA)
+
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    font_scale = 0.45
+    text_thickness = 1
+    (tw, th), baseline = cv2.getTextSize(label, font, font_scale, text_thickness)
+    text_x = x1
+    text_y = y1 - 4
+    if text_y - th - baseline < 0:
+        text_y = min(image_bgr.shape[0] - 4, y2 + th + baseline + 4)
+
+    top = max(0, text_y - th - baseline - 2)
+    bottom = min(image_bgr.shape[0] - 1, text_y + baseline + 2)
+    right = min(image_bgr.shape[1] - 1, text_x + tw + 4)
+
+    cv2.rectangle(image_bgr, (text_x, top), (right, bottom), color, -1)
+    cv2.putText(
+        image_bgr,
+        label,
+        (text_x + 2, bottom - baseline - 1),
+        font,
+        font_scale,
+        (255, 255, 255),
+        text_thickness,
+        cv2.LINE_AA,
+    )
+
+
+def draw_prediction_only(
+    image_bgr,
+    gt_boxes: Sequence[dict],
+    pred_boxes: Sequence[dict],
+    class_names: Sequence[str],
+    iou_thresh: float = 0.5,
+):
+    out = image_bgr.copy()
+    pred_is_correct, _, _ = match_predictions_to_ground_truth(
+        gt_boxes=gt_boxes,
+        pred_boxes=pred_boxes,
+        class_names=class_names,
+        iou_thresh=iou_thresh,
+    )
+
+    for idx, pred in enumerate(pred_boxes):
+        cls_name = str(pred.get("class", ""))
+        conf = float(pred.get("confidence", 0.0))
+        color = (40, 220, 70) if pred_is_correct[idx] else (30, 30, 255)
+        _draw_labeled_box(out, pred.get("bbox", [0, 0, 0, 0]), f"PD:{cls_name}:{conf:.2f}", color, thickness=2)
+
+    return out
+
+
 def render_hardcases(
     summary_path: Path,
     predictions_path: Path,
@@ -100,7 +197,7 @@ def render_hardcases(
         if image is None:
             continue
 
-        vis = draw_hardcase(
+        vis = draw_prediction_only(
             image_bgr=image,
             gt_boxes=gt_map.get(image_id, []),
             pred_boxes=pred_map.get(image_id, []),

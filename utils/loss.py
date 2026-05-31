@@ -27,12 +27,14 @@ import torch.nn.functional as F
 
 try:
     from .config import (
+        CENTER_RADIUS,
         FOCAL_ALPHA,
         FOCAL_GAMMA,
         LABEL_SMOOTHING,
         LAMBDA_CLS,
         LAMBDA_CTR,
         LAMBDA_REG,
+        NEGATIVE_FOCAL_WEIGHT,
         NUM_CLASSES,
         STRIDES,
     )
@@ -40,15 +42,17 @@ except Exception:
     # Safe fallbacks so this module still works if config.py is not available.
     NUM_CLASSES = 5
     STRIDES = [8, 16, 32]
+    CENTER_RADIUS = 2.0
     FOCAL_GAMMA = 2.0
     FOCAL_ALPHA = 0.25
-    LABEL_SMOOTHING = 0.03
+    LABEL_SMOOTHING = 0.01
+    NEGATIVE_FOCAL_WEIGHT = 0.5
     LAMBDA_CLS = 1.0
     LAMBDA_REG = 1.0
     LAMBDA_CTR = 0.5
 
 EPS = 1e-8
-DEFAULT_CENTER_RADIUS = 1.5
+DEFAULT_CENTER_RADIUS = float(CENTER_RADIUS)
 
 
 def _meshgrid_xy(height: int, width: int, device: torch.device) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -152,6 +156,7 @@ def focal_sigmoid_loss(
     targets: torch.Tensor,
     alpha: float = FOCAL_ALPHA,
     gamma: float = FOCAL_GAMMA,
+    negative_weight: float = NEGATIVE_FOCAL_WEIGHT,
     class_weights: Optional[torch.Tensor] = None,
     label_smoothing: float = 0.0,
     reduction: str = "mean",
@@ -164,6 +169,9 @@ def focal_sigmoid_loss(
     p_t = prob * targets + (1.0 - prob) * (1.0 - targets)
     alpha_t = alpha * targets + (1.0 - alpha) * (1.0 - targets)
     loss = alpha_t * (1.0 - p_t).pow(gamma) * ce
+    if negative_weight != 1.0:
+        neg_mask = targets <= 0.5
+        loss = torch.where(neg_mask, loss * float(negative_weight), loss)
     if class_weights is not None:
         w = class_weights.to(device=logits.device, dtype=logits.dtype).view(1, -1)
         # Weight positives more strongly, but do not amplify the vast number of
@@ -312,19 +320,20 @@ def _default_scale_ranges(strides: Sequence[int]) -> List[Tuple[float, float]]:
     """
     FCOS-like object size ranges (max(l,t,r,b) in pixels) per level.
 
-    For strides [8, 16, 32] -> [(0, 32), (32, 64), (64, inf)]
+    The ranges are intentionally slightly overlapping to keep small and
+    partially occluded objects from disappearing at level boundaries.
     """
     ranges: List[Tuple[float, float]] = []
     for i, s in enumerate(strides):
         if i == 0:
             lower = 0.0
         else:
-            lower = float(4.0 * strides[i - 1])
+            lower = float(3.0 * strides[i - 1])
 
         if i == len(strides) - 1:
             upper = float("inf")
         else:
-            upper = float(4.0 * s)
+            upper = float(6.0 * s)
 
         ranges.append((lower, upper))
     return ranges
@@ -572,6 +581,7 @@ def compute_loss(
     lambda_ctr: float = LAMBDA_CTR,
     focal_alpha: float = FOCAL_ALPHA,
     focal_gamma: float = FOCAL_GAMMA,
+    negative_focal_weight: float = NEGATIVE_FOCAL_WEIGHT,
     class_weights: Optional[torch.Tensor] = None,
     label_smoothing: float = LABEL_SMOOTHING,
     center_radius: float = DEFAULT_CENTER_RADIUS,
@@ -638,6 +648,7 @@ def compute_loss(
                 targets=cls_tgt,
                 alpha=focal_alpha,
                 gamma=focal_gamma,
+                negative_weight=negative_focal_weight,
                 class_weights=class_weights,
                 label_smoothing=label_smoothing,
                 reduction="sum",
@@ -709,6 +720,7 @@ class DetectionLoss(nn.Module):
         lambda_ctr: float = LAMBDA_CTR,
         focal_alpha: float = FOCAL_ALPHA,
         focal_gamma: float = FOCAL_GAMMA,
+        negative_focal_weight: float = NEGATIVE_FOCAL_WEIGHT,
         class_weights: Optional[torch.Tensor] = None,
         label_smoothing: float = LABEL_SMOOTHING,
         center_radius: float = DEFAULT_CENTER_RADIUS,
@@ -722,6 +734,7 @@ class DetectionLoss(nn.Module):
         self.lambda_ctr = float(lambda_ctr)
         self.focal_alpha = float(focal_alpha)
         self.focal_gamma = float(focal_gamma)
+        self.negative_focal_weight = float(negative_focal_weight)
         if class_weights is None:
             self.register_buffer("class_weights", torch.empty(0), persistent=False)
         else:
@@ -741,6 +754,7 @@ class DetectionLoss(nn.Module):
             lambda_ctr=self.lambda_ctr,
             focal_alpha=self.focal_alpha,
             focal_gamma=self.focal_gamma,
+            negative_focal_weight=self.negative_focal_weight,
             class_weights=self.class_weights if self.class_weights.numel() > 0 else None,
             label_smoothing=self.label_smoothing,
             center_radius=self.center_radius,
