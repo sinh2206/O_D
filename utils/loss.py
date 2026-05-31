@@ -328,12 +328,12 @@ def _default_scale_ranges(strides: Sequence[int]) -> List[Tuple[float, float]]:
         if i == 0:
             lower = 0.0
         else:
-            lower = float(3.0 * strides[i - 1])
+            lower = float(2.5 * strides[i - 1])
 
         if i == len(strides) - 1:
             upper = float("inf")
         else:
-            upper = float(6.0 * s)
+            upper = float(8.0 * s)
 
         ranges.append((lower, upper))
     return ranges

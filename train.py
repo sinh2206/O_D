@@ -50,7 +50,7 @@ def compute_class_weights(num_classes: int) -> torch.Tensor:
     # The hard cases show that person/chair scenes are underfit, so the
     # fixed weights keep those classes emphasized instead of downweighting
     # the dominant class too aggressively.
-    fixed_weights = np.asarray([0.8, 1.25, 1.00, 1.00, 1.4], dtype=np.float64)
+    fixed_weights = np.asarray([1.10, 1.05, 1.00, 1.00, 1.60], dtype=np.float64)
     if num_classes <= 0:
         return torch.zeros((0,), dtype=torch.float32)
     if num_classes == fixed_weights.size:
@@ -198,7 +198,7 @@ def make_pad_if_needed(img_size: int):
 def get_train_transforms(img_size: int) -> A.Compose:
     affine_params = inspect.signature(A.Affine.__init__).parameters
     affine_kwargs = dict(
-        scale=(0.92, 1.08),
+        scale=(0.75, 1.35),
         translate_percent=(-0.06, 0.06),
         rotate=(-5, 5),
         shear=(-1.5, 1.5),
@@ -230,6 +230,13 @@ def get_train_transforms(img_size: int) -> A.Compose:
             make_pad_if_needed(img_size),
             A.HorizontalFlip(p=0.5),
             A.CLAHE(clip_limit=2.2, tile_grid_size=(8, 8), p=0.2),
+            A.OneOf(
+                [
+                    A.GaussianBlur(blur_limit=(3, 7), p=1.0),
+                    A.MotionBlur(blur_limit=5, p=1.0),
+                ],
+                p=0.2,
+            ),
             A.RandomGamma(gamma_limit=(88, 122), p=0.25),
             A.ColorJitter(brightness=0.12, contrast=0.12, saturation=0.1, hue=0.05, p=0.45),
             affine,
@@ -239,8 +246,8 @@ def get_train_transforms(img_size: int) -> A.Compose:
         bbox_params=A.BboxParams(
             format="pascal_voc",
             label_fields=["class_labels"],
-            min_area=2.0,
-            min_visibility=0.1,
+            min_area=1.0,
+            min_visibility=0.05,
             clip=True,
         ),
     )
@@ -466,7 +473,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--val_image_dir", type=Path, required=True)
     parser.add_argument("--checkpoint_dir", type=Path, default=Path("./models"))
     parser.add_argument("--img_size", type=int, default=IMG_SIZE)
-    parser.add_argument("--batch_size", type=int, default=32)
+    parser.add_argument("--batch_size", type=int, default=24)
     parser.add_argument("--epochs", type=int, default=20)
     parser.add_argument("--lr_backbone", type=float, default=2e-4)
     parser.add_argument("--lr_head", type=float, default=2e-3)
