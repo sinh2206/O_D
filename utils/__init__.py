@@ -21,6 +21,7 @@ from .config import (
     STRIDES,
 )
 from .runtime import EarlyStopping, get_scheduler, set_global_seed
+from .runtime import configure_precision_runtime
 
 __all__ = [
     "CLASS_NAMES",
@@ -30,6 +31,7 @@ __all__ = [
     "EARLY_STOP_DELTA",
     "EARLY_STOP_PATIENCE",
     "EarlyStopping",
+    "configure_precision_runtime",
     "FPN_CHANNELS",
     "get_scheduler",
     "IMG_SIZE",

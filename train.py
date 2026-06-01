@@ -5,6 +5,7 @@ import inspect
 import json
 import math
 import random
+from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -30,6 +31,17 @@ from utils.config import (
     DEFAULT_SEED,
     EARLY_STOP_DELTA,
     EARLY_STOP_PATIENCE,
+    FAST_CACHE_IMAGES,
+    FAST_CACHE_MAX_IMAGES,
+    FAST_DETERMINISTIC,
+    FAST_ENABLE_TF32,
+    FAST_IMG_SIZE,
+    FAST_MAP_EVAL_INTERVAL,
+    FAST_MAP_MAX_BATCHES,
+    FAST_MIXUP_PROB,
+    FAST_MOSAIC_PROB,
+    FAST_PREFETCH_FACTOR,
+    FAST_VAL_INTERVAL,
     IMG_SIZE,
     LABEL_SMOOTHING,
     LOW_LIGHT_CLAHE_CLIP,
@@ -49,11 +61,12 @@ from utils.config import (
     SMALL_OBJECT_BONUS,
     STD,
     STRIDES,
+    TRAIN_SPEED_MODE,
 )
 from utils.loss import DetectionLoss
 from utils.model import AnchorFreeDetector
 from utils.nms import postprocess_batch
-from utils.runtime import EarlyStopping, create_grad_scaler, get_scheduler, resolve_num_workers, set_global_seed, should_pin_memory
+from utils.runtime import EarlyStopping, configure_precision_runtime, create_grad_scaler, get_scheduler, resolve_num_workers, set_global_seed, should_pin_memory
 
 VALID_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 
@@ -141,8 +154,8 @@ def build_sample_weights(samples: List[Sample], class_weights: torch.Tensor) -> 
     return torch.as_tensor(ws, dtype=torch.double)
 
 
-def seed_everything(seed: int) -> None:
-    set_global_seed(seed=int(seed), deterministic=True)
+def seed_everything(seed: int, deterministic: bool = True) -> None:
+    set_global_seed(seed=int(seed), deterministic=bool(deterministic))
 
 
 def seed_worker(worker_id: int) -> None:
@@ -263,7 +276,7 @@ def make_pad_if_needed(img_size: int):
     return A.PadIfNeeded(**kwargs)
 
 
-def get_train_transforms(img_size: int) -> A.Compose:
+def get_train_transforms(img_size: int, fast_mode: bool = False) -> A.Compose:
     affine_params = inspect.signature(A.Affine.__init__).parameters
     affine_kwargs = dict(
         scale=(0.85, 1.25),
@@ -298,24 +311,42 @@ def get_train_transforms(img_size: int) -> A.Compose:
     else:
         downscale_aug = A.Downscale(scale_min=0.60, scale_max=0.85, p=1.0)
 
+    hflip_p = 0.5
+    vflip_p = 0.08
+    rot90_p = 0.22
+    blur_block_p = 0.30
+    clahe_p = 0.20
+    gamma_p = 0.25
+    color_jitter_p = 0.45
+    affine_p = 0.20
+    if fast_mode:
+        vflip_p = 0.0
+        rot90_p = 0.0
+        blur_block_p = 0.15
+        clahe_p = 0.10
+        gamma_p = 0.12
+        color_jitter_p = 0.28
+        affine_p = 0.12
+    affine.p = float(affine_p)
+
     return A.Compose(
         [
             A.LongestMaxSize(max_size=img_size, interpolation=cv2.INTER_LINEAR),
             make_pad_if_needed(img_size),
-            A.HorizontalFlip(p=0.5),
-            A.VerticalFlip(p=0.08),
-            A.RandomRotate90(p=0.22),
-            A.CLAHE(clip_limit=2.2, tile_grid_size=(8, 8), p=0.2),
+            A.HorizontalFlip(p=float(hflip_p)),
+            A.VerticalFlip(p=float(vflip_p)),
+            A.RandomRotate90(p=float(rot90_p)),
+            A.CLAHE(clip_limit=2.2, tile_grid_size=(8, 8), p=float(clahe_p)),
             A.OneOf(
                 [
                     A.GaussianBlur(blur_limit=(3, 7), p=1.0),
                     A.MotionBlur(blur_limit=5, p=1.0),
                     downscale_aug,
                 ],
-                p=0.30,
+                p=float(blur_block_p),
             ),
-            A.RandomGamma(gamma_limit=(88, 122), p=0.25),
-            A.ColorJitter(brightness=0.12, contrast=0.12, saturation=0.1, hue=0.05, p=0.45),
+            A.RandomGamma(gamma_limit=(88, 122), p=float(gamma_p)),
+            A.ColorJitter(brightness=0.12, contrast=0.12, saturation=0.1, hue=0.05, p=float(color_jitter_p)),
             affine,
             A.Normalize(mean=MEAN, std=STD),
             ToTensorV2(),
@@ -357,6 +388,8 @@ class DetectionDataset(Dataset):
         train_mode: bool = False,
         mosaic_prob: float = 0.0,
         mixup_prob: float = 0.0,
+        cache_images: bool = False,
+        cache_max_images: int = 0,
     ):
         self.samples = samples
         self.transforms = transforms
@@ -364,16 +397,33 @@ class DetectionDataset(Dataset):
         self.train_mode = bool(train_mode)
         self.mosaic_prob = max(0.0, min(1.0, float(mosaic_prob)))
         self.mixup_prob = max(0.0, min(1.0, float(mixup_prob)))
+        self.cache_images = bool(cache_images)
+        self.cache_max_images = max(0, int(cache_max_images))
+        self._image_cache: "OrderedDict[str, np.ndarray]" = OrderedDict()
 
     def __len__(self) -> int:
         return len(self.samples)
 
     def _load_sample_rgb(self, sample: Sample) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-        image = imread_unicode(sample.image_path)
-        if image is None:
-            raise FileNotFoundError(f"Cannot read image: {sample.image_path}")
-        image = enhance_low_light_bgr(image)
-        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        cache_key = str(sample.image_id)
+        image: Optional[np.ndarray] = None
+        if self.cache_images and cache_key in self._image_cache:
+            image = self._image_cache.pop(cache_key)
+            self._image_cache[cache_key] = image
+            image = image.copy()
+        else:
+            image = imread_unicode(sample.image_path)
+            if image is None:
+                raise FileNotFoundError(f"Cannot read image: {sample.image_path}")
+            image = enhance_low_light_bgr(image)
+            image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+
+            if self.cache_images and self.cache_max_images > 0:
+                if len(self._image_cache) >= self.cache_max_images:
+                    self._image_cache.popitem(last=False)
+                self._image_cache[cache_key] = image
+                image = image.copy()
+
         boxes = np.asarray(sample.boxes, dtype=np.float32) if sample.boxes else np.zeros((0, 4), dtype=np.float32)
         labels = np.asarray(sample.labels, dtype=np.int64) if sample.labels else np.zeros((0,), dtype=np.int64)
         return image, boxes, labels
@@ -540,9 +590,13 @@ def make_dataloader(
     sampler: Optional[WeightedRandomSampler] = None,
     pin_memory: bool = False,
     seed: int = 42,
+    prefetch_factor: int = 2,
 ) -> DataLoader:
     generator = torch.Generator()
     generator.manual_seed(int(seed))
+    kwargs: Dict[str, Any] = {}
+    if int(num_workers) > 0:
+        kwargs["prefetch_factor"] = max(1, int(prefetch_factor))
     return DataLoader(
         dataset,
         batch_size=batch_size,
@@ -555,6 +609,7 @@ def make_dataloader(
         collate_fn=collate_fn,
         worker_init_fn=seed_worker,
         generator=generator,
+        **kwargs,
     )
 
 
@@ -682,6 +737,7 @@ def evaluate_map50(
     conf_thresh: float,
     nms_thresh: float,
     amp_enabled: bool,
+    max_batches: int = 0,
 ) -> Dict[str, Any]:
     model.eval()
     cls_to_idx = {c: i for i, c in enumerate(class_names)}
@@ -689,7 +745,9 @@ def evaluate_map50(
     per_class_match: Dict[int, List[int]] = {i: [] for i in range(len(class_names))}
     per_class_gt: Dict[int, int] = {i: 0 for i in range(len(class_names))}
 
-    for images, targets in loader:
+    for batch_idx, (images, targets) in enumerate(loader):
+        if int(max_batches) > 0 and batch_idx >= int(max_batches):
+            break
         image_ids = [str(t.get("image_id", f"img_{i}")) for i, t in enumerate(targets)]
         images = images.to(device, non_blocking=True).to(memory_format=torch.channels_last)
         with torch.autocast(device_type=device.type, enabled=amp_enabled):
@@ -821,7 +879,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lr_head", type=float, default=2e-3)
     parser.add_argument("--weight_decay", type=float, default=1e-4)
     parser.add_argument("--num_workers", type=int, default=2)
+    parser.add_argument("--speed_mode", type=str, default=TRAIN_SPEED_MODE, choices=["quality", "balanced", "fast"])
     parser.add_argument("--seed", type=int, default=DEFAULT_SEED)
+    parser.add_argument("--deterministic", action="store_true", help="Enable deterministic kernels for reproducibility (slower).")
+    parser.add_argument("--enable_tf32", action="store_true", help="Enable TF32 kernels on Ampere+ GPUs for faster training.")
     parser.add_argument("--resume", type=Path, default=None)
     parser.add_argument("--scheduler", type=str, default=DEFAULT_SCHEDULER, choices=["plateau", "cosine"])
     parser.add_argument("--plateau_factor", type=float, default=PLATEAU_FACTOR)
@@ -832,8 +893,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--mosaic_prob", type=float, default=MOSAIC_PROB)
     parser.add_argument("--mixup_prob", type=float, default=MIXUP_PROB)
     parser.add_argument("--map_eval_interval", type=int, default=MAP_EVAL_INTERVAL)
+    parser.add_argument("--map_max_batches", type=int, default=0, help="Limit mAP evaluation to first N val batches (0 = full val set).")
+    parser.add_argument("--val_interval", type=int, default=1, help="Run val_loss every N epochs.")
     parser.add_argument("--map_conf_thresh", type=float, default=MAP_CONF_THRESH)
     parser.add_argument("--map_nms_thresh", type=float, default=MAP_NMS_THRESH)
+    parser.add_argument("--prefetch_factor", type=int, default=FAST_PREFETCH_FACTOR)
+    parser.add_argument("--cache_images", action="store_true", help="Cache decoded RGB images in RAM to reduce I/O.")
+    parser.add_argument("--cache_max_images", type=int, default=FAST_CACHE_MAX_IMAGES)
     parser.add_argument("--label_smoothing", type=float, default=LABEL_SMOOTHING)
     parser.add_argument("--center_radius", type=float, default=CENTER_RADIUS)
     parser.add_argument("--no_scale_ranges", action="store_true")
@@ -843,13 +909,51 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def apply_speed_mode(args: argparse.Namespace) -> argparse.Namespace:
+    mode = str(args.speed_mode).strip().lower()
+
+    if mode == "fast":
+        if int(args.img_size) >= int(IMG_SIZE):
+            args.img_size = int(FAST_IMG_SIZE)
+        args.mosaic_prob = min(float(args.mosaic_prob), float(FAST_MOSAIC_PROB))
+        args.mixup_prob = min(float(args.mixup_prob), float(FAST_MIXUP_PROB))
+        args.val_interval = max(int(args.val_interval), int(FAST_VAL_INTERVAL))
+        args.map_eval_interval = max(int(args.map_eval_interval), int(FAST_MAP_EVAL_INTERVAL))
+        if int(args.map_max_batches) <= 0:
+            args.map_max_batches = int(FAST_MAP_MAX_BATCHES)
+        args.prefetch_factor = max(1, int(args.prefetch_factor))
+        if not bool(args.cache_images):
+            args.cache_images = bool(FAST_CACHE_IMAGES)
+        if int(args.cache_max_images) <= 0:
+            args.cache_max_images = int(FAST_CACHE_MAX_IMAGES)
+        # Fast mode favors throughput over strict determinism.
+        if not bool(args.deterministic):
+            args.deterministic = bool(FAST_DETERMINISTIC)
+        if not bool(args.enable_tf32):
+            args.enable_tf32 = bool(FAST_ENABLE_TF32)
+    elif mode == "balanced":
+        args.val_interval = max(int(args.val_interval), 1)
+        args.map_eval_interval = max(int(args.map_eval_interval), 3)
+        args.prefetch_factor = max(1, int(args.prefetch_factor))
+        if int(args.map_max_batches) <= 0:
+            args.map_max_batches = 0
+    else:
+        # quality
+        args.img_size = int(max(args.img_size, IMG_SIZE))
+        args.val_interval = max(int(args.val_interval), 1)
+        args.map_eval_interval = max(int(args.map_eval_interval), 1)
+        args.map_max_batches = int(args.map_max_batches)
+        args.prefetch_factor = max(1, int(args.prefetch_factor))
+        if not bool(args.deterministic):
+            args.deterministic = True
+
+    return args
+
+
 def main() -> None:
-    args = parse_args()
-    seed_everything(args.seed)
-    torch.backends.cudnn.benchmark = False
-    torch.backends.cuda.matmul.allow_tf32 = False
-    torch.backends.cudnn.allow_tf32 = False
-    torch.set_float32_matmul_precision("high")
+    args = apply_speed_mode(parse_args())
+    seed_everything(args.seed, deterministic=bool(args.deterministic))
+    configure_precision_runtime(enable_tf32=bool(args.enable_tf32))
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     amp_enabled = (device.type == "cuda") and (not args.no_amp)
@@ -862,11 +966,13 @@ def main() -> None:
 
     train_ds = DetectionDataset(
         train_samples,
-        transforms=get_train_transforms(args.img_size),
+        transforms=get_train_transforms(args.img_size, fast_mode=(str(args.speed_mode).lower() == "fast")),
         img_size=args.img_size,
         train_mode=True,
         mosaic_prob=float(args.mosaic_prob),
         mixup_prob=float(args.mixup_prob),
+        cache_images=bool(args.cache_images),
+        cache_max_images=int(args.cache_max_images),
     )
     val_ds = DetectionDataset(
         val_samples,
@@ -875,6 +981,8 @@ def main() -> None:
         train_mode=False,
         mosaic_prob=0.0,
         mixup_prob=0.0,
+        cache_images=bool(args.cache_images),
+        cache_max_images=max(0, int(args.cache_max_images // 2)),
     )
 
     class_weights = None if args.no_class_weights else compute_class_weights(num_classes=num_classes)
@@ -895,6 +1003,7 @@ def main() -> None:
         sampler=train_sampler,
         pin_memory=pin_memory,
         seed=args.seed,
+        prefetch_factor=int(args.prefetch_factor),
     )
     val_loader = make_dataloader(
         val_ds,
@@ -903,6 +1012,7 @@ def main() -> None:
         num_workers=num_workers,
         pin_memory=pin_memory,
         seed=args.seed + 1000,
+        prefetch_factor=int(args.prefetch_factor),
     )
 
     model = AnchorFreeDetector(num_classes=num_classes, pretrained=True).to(device).to(memory_format=torch.channels_last)
@@ -963,10 +1073,15 @@ def main() -> None:
     print(f"Balanced sampling: {not args.no_balanced_sampling}")
     print(f"Class weights enabled: {not args.no_class_weights}")
     print(f"Seed: {args.seed}")
+    print(f"Speed mode: {args.speed_mode}")
+    print(f"Deterministic: {bool(args.deterministic)}, TF32: {bool(args.enable_tf32)}")
     print(f"Workers: requested={args.num_workers}, resolved={num_workers}, max_safe={max_workers}")
+    print(f"Prefetch factor: {int(args.prefetch_factor)}")
     print(f"Scheduler: {args.scheduler}")
     print(f"Early stopping patience: {args.early_stop_patience}")
+    print(f"Val interval: {int(args.val_interval)}, mAP interval: {int(args.map_eval_interval)}, mAP max batches: {int(args.map_max_batches)}")
     print(f"Mosaic prob: {float(args.mosaic_prob):.2f}, MixUp prob: {float(args.mixup_prob):.2f}")
+    print(f"Cache images: {bool(args.cache_images)} (max={int(args.cache_max_images)})")
     if class_weights is not None:
         print(f"Class weights: {[round(x, 4) for x in class_weights.tolist()]}")
 
@@ -980,21 +1095,31 @@ def main() -> None:
             scaler=scaler,
             amp_enabled=amp_enabled,
         )
-        val_metrics = validate_one_epoch(
-            model=model,
-            criterion=criterion,
-            loader=val_loader,
-            device=device,
-            amp_enabled=amp_enabled,
+        val_metrics: Optional[Dict[str, float]] = None
+        do_val = (
+            epoch == start_epoch
+            or epoch == args.epochs
+            or (epoch % max(1, int(args.val_interval)) == 0)
         )
-        if isinstance(scheduler, ReduceLROnPlateau):
-            scheduler.step(val_metrics["loss"])
+        if do_val:
+            val_metrics = validate_one_epoch(
+                model=model,
+                criterion=criterion,
+                loader=val_loader,
+                device=device,
+                amp_enabled=amp_enabled,
+            )
+            if isinstance(scheduler, ReduceLROnPlateau):
+                scheduler.step(val_metrics["loss"])
+            else:
+                scheduler.step()
         else:
-            scheduler.step()
+            if not isinstance(scheduler, ReduceLROnPlateau):
+                scheduler.step()
 
         map_out: Optional[Dict[str, Any]] = None
         eval_interval = max(1, int(args.map_eval_interval))
-        if (epoch % eval_interval == 0) or (epoch == start_epoch) or (epoch == args.epochs):
+        if do_val and ((epoch % eval_interval == 0) or (epoch == start_epoch) or (epoch == args.epochs)):
             map_out = evaluate_map50(
                 model=model,
                 loader=val_loader,
@@ -1004,15 +1129,17 @@ def main() -> None:
                 conf_thresh=float(args.map_conf_thresh),
                 nms_thresh=float(args.map_nms_thresh),
                 amp_enabled=amp_enabled,
+                max_batches=max(0, int(args.map_max_batches)),
             )
             best_map50 = max(best_map50, float(map_out["map50"]))
 
         lr_str = ",".join(f"{pg['lr']:.2e}" for pg in optimizer.param_groups)
+        val_loss_text = f"{val_metrics['loss']:.4f}" if val_metrics is not None else "skip"
         msg = (
             f"Epoch {epoch:03d}/{args.epochs:03d} | "
             f"train_loss={train_metrics['loss']:.4f} "
             f"(cls={train_metrics['loss_cls']:.4f}, reg={train_metrics['loss_reg']:.4f}, ctr={train_metrics['loss_ctr']:.4f}) | "
-            f"val_loss={val_metrics['loss']:.4f} | lr=[{lr_str}]"
+            f"val_loss={val_loss_text} | lr=[{lr_str}]"
         )
         if map_out is not None:
             msg += f" | mAP@0.5={float(map_out['map50']):.4f}"
@@ -1029,30 +1156,31 @@ def main() -> None:
             img_size=args.img_size,
         )
 
-        improved, should_stop = early_stopper.update(val_metrics["loss"])
-        if improved:
-            best_val_loss = val_metrics["loss"]
-            save_checkpoint(
-                path=best_path,
-                model=model,
-                optimizer=optimizer,
-                scheduler=scheduler,
-                epoch=epoch,
-                best_val_loss=best_val_loss,
-                classes=classes,
-                img_size=args.img_size,
-            )
-            print(f"Saved best checkpoint: {best_path} (val_loss={best_val_loss:.4f})")
-        else:
-            print(f"No val_loss improvement for {early_stopper.bad_epochs} epoch(s).")
+        if val_metrics is not None:
+            improved, should_stop = early_stopper.update(val_metrics["loss"])
+            if improved:
+                best_val_loss = val_metrics["loss"]
+                save_checkpoint(
+                    path=best_path,
+                    model=model,
+                    optimizer=optimizer,
+                    scheduler=scheduler,
+                    epoch=epoch,
+                    best_val_loss=best_val_loss,
+                    classes=classes,
+                    img_size=args.img_size,
+                )
+                print(f"Saved best checkpoint: {best_path} (val_loss={best_val_loss:.4f})")
+            else:
+                print(f"No val_loss improvement for {early_stopper.bad_epochs} epoch(s).")
 
-        if should_stop:
-            print(
-                f"Early stopping at epoch {epoch}: "
-                f"no val_loss improvement > {float(args.early_stop_delta)} for "
-                f"{int(args.early_stop_patience)} consecutive epoch(s)."
-            )
-            break
+            if should_stop:
+                print(
+                    f"Early stopping at epoch {epoch}: "
+                    f"no val_loss improvement > {float(args.early_stop_delta)} for "
+                    f"{int(args.early_stop_patience)} consecutive epoch(s)."
+                )
+                break
 
     if not best_path.exists():
         save_checkpoint(

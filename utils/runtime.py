@@ -73,6 +73,15 @@ def create_grad_scaler(device: torch.device, enabled: bool) -> Any:
     return torch.cuda.amp.GradScaler(enabled=amp_enabled)
 
 
+def configure_precision_runtime(enable_tf32: bool = True) -> None:
+    tf32 = bool(enable_tf32)
+    if hasattr(torch.backends.cuda, "matmul"):
+        torch.backends.cuda.matmul.allow_tf32 = tf32
+    if hasattr(torch.backends, "cudnn"):
+        torch.backends.cudnn.allow_tf32 = tf32
+    torch.set_float32_matmul_precision("high")
+
+
 def set_global_seed(seed: int, deterministic: bool = True) -> None:
     seed = int(seed)
     random.seed(seed)
@@ -92,6 +101,15 @@ def set_global_seed(seed: int, deterministic: bool = True) -> None:
             torch.backends.cudnn.benchmark = False
         if torch.cuda.is_available():
             os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+    else:
+        if hasattr(torch, "use_deterministic_algorithms"):
+            try:
+                torch.use_deterministic_algorithms(False)
+            except TypeError:
+                pass
+        if hasattr(torch.backends, "cudnn"):
+            torch.backends.cudnn.deterministic = False
+            torch.backends.cudnn.benchmark = True
 
 
 @dataclass

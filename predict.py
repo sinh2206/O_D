@@ -17,6 +17,8 @@ from utils.config import (
     CLASS_NAMES,
     CONF_THRESH,
     DEFAULT_SEED,
+    FAST_DETERMINISTIC,
+    FAST_ENABLE_TF32,
     LOW_LIGHT_CLAHE_CLIP,
     LOW_LIGHT_GAMMA,
     LOW_LIGHT_MEAN_THRESH,
@@ -29,10 +31,11 @@ from utils.config import (
     NMS_IOU_THRESH,
     NUM_CLASSES,
     STD,
+    TRAIN_SPEED_MODE,
 )
 from utils.model import AnchorFreeDetector
 from utils.nms import LetterboxMeta, postprocess_batch
-from utils.runtime import set_global_seed
+from utils.runtime import configure_precision_runtime, set_global_seed
 
 VALID_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 DEFAULT_VAL_IMAGE_DIR = Path("public/val/images")
@@ -789,14 +792,31 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--chair_suppress_iou", type=float, default=CHAIR_SUPPRESS_WITH_PERSON_IOU)
     parser.add_argument("--hardcase_topk", type=int, default=50)
     parser.add_argument("--hardcase_iou", type=float, default=0.5)
+    parser.add_argument("--speed_mode", type=str, default=TRAIN_SPEED_MODE, choices=["quality", "balanced", "fast"])
     parser.add_argument("--seed", type=int, default=DEFAULT_SEED)
+    parser.add_argument("--deterministic", action="store_true", help="Enable deterministic kernels (slower).")
+    parser.add_argument("--enable_tf32", action="store_true", help="Enable TF32 kernels on Ampere+ GPUs.")
     parser.add_argument("--device", type=str, default="auto", choices=["auto", "cuda", "cpu"])
     return parser.parse_args()
 
 
+def apply_speed_mode(args: argparse.Namespace) -> argparse.Namespace:
+    mode = str(args.speed_mode).strip().lower()
+    if mode == "fast":
+        if not bool(args.enable_tf32):
+            args.enable_tf32 = bool(FAST_ENABLE_TF32)
+        if not bool(args.deterministic):
+            args.deterministic = bool(FAST_DETERMINISTIC)
+        args.batch_size = max(1, int(args.batch_size))
+    elif mode == "quality":
+        if not bool(args.deterministic):
+            args.deterministic = True
+    return args
+
+
 def main() -> None:
-    args = parse_args()
-    set_global_seed(seed=int(args.seed), deterministic=True)
+    args = apply_speed_mode(parse_args())
+    set_global_seed(seed=int(args.seed), deterministic=bool(args.deterministic))
     if not args.checkpoint.exists():
         raise FileNotFoundError(f"Checkpoint not found: {args.checkpoint}")
     if not args.image_dir.exists():
@@ -815,9 +835,7 @@ def main() -> None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     else:
         device = torch.device(args.device)
-    torch.backends.cuda.matmul.allow_tf32 = False
-    torch.backends.cudnn.allow_tf32 = False
-    torch.set_float32_matmul_precision("high")
+    configure_precision_runtime(enable_tf32=bool(args.enable_tf32))
 
     model, ckpt_classes, ckpt_img_size = load_checkpoint_model(args.checkpoint, device=device)
     model = model.to(memory_format=torch.channels_last)
@@ -869,6 +887,7 @@ def main() -> None:
 
     print(f"Device: {device}")
     print(f"Seed: {args.seed}")
+    print(f"Speed mode: {args.speed_mode}, Deterministic: {bool(args.deterministic)}, TF32: {bool(args.enable_tf32)}")
     ckpt_meta = torch.load(str(args.checkpoint), map_location="cpu")
     print(
         "Checkpoint meta: "
