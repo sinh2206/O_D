@@ -4,7 +4,7 @@ from __future__ import annotations
 Shared configuration for the anchor-free object detection project.
 """
 
-IMG_SIZE = 704
+IMG_SIZE = 640
 
 CLASS_NAMES = ["person", "car", "dog", "cat", "chair"]
 NUM_CLASSES = len(CLASS_NAMES)
@@ -16,8 +16,10 @@ CLASS_FREQ_PRIOR_VAL = [0.5314, 0.1400, 0.1019, 0.0871, 0.1395]
 
 # Class emphasis factors used by train.py to derive final weights from the
 # observed class frequencies.
-CLASS_LOSS_WEIGHTS = [0.60, 1.25, 1.35, 1.45, 1.20]
-CLASS_SAMPLER_WEIGHTS = [0.70, 1.20, 1.30, 1.30, 1.15]
+# Chair is intentionally boosted because it has lower localization confidence
+# on many validation scenes despite moderate frequency.
+CLASS_LOSS_WEIGHTS = [0.60, 1.25, 1.35, 1.45, 1.40]
+CLASS_SAMPLER_WEIGHTS = [0.70, 1.20, 1.30, 1.30, 1.30]
 
 STRIDES = [8, 16, 32]
 FPN_CHANNELS = 128
@@ -30,7 +32,7 @@ NMS_IOU_THRESH = 0.50
 MAX_OBJECTS_PER_IMAGE = 15
 # Per-class confidence thresholds used after decode/NMS:
 # person, car, dog, cat, chair
-CLASS_CONF_THRESH = [0.35, 0.35, 0.35, 0.35, 0.35]
+CLASS_CONF_THRESH = [0.35, 0.35, 0.35, 0.35, 0.30]
 MIN_EXPORT_CONF = 0.3
 CLASS_SCORE_SCALES = [0.80, 1.10, 1.20, 1.20, 1.05]
 CHAIR_SUPPRESS_WITH_PERSON_IOU = 0.92

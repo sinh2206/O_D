@@ -1,108 +1,12 @@
 from __future__ import annotations
 
 import os
-import inspect
-from dataclasses import dataclass
-from datetime import timedelta
 from pathlib import Path
 from typing import Any, Optional, Tuple
 
 import torch
-import torch.distributed as dist
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
-
-
-@dataclass(frozen=True)
-class DistributedEnv:
-    enabled: bool
-    rank: int
-    local_rank: int
-    world_size: int
-
-
-def get_distributed_env() -> DistributedEnv:
-    world_size = int(os.environ.get("WORLD_SIZE", "1"))
-    rank = int(os.environ.get("RANK", "0"))
-    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
-    return DistributedEnv(
-        enabled=world_size > 1,
-        rank=rank,
-        local_rank=local_rank,
-        world_size=world_size,
-    )
-
-
-def init_distributed(
-    env: DistributedEnv,
-    backend: Optional[str] = None,
-    timeout_minutes: float = 30.0,
-) -> None:
-    if not env.enabled:
-        return
-    if dist.is_initialized():
-        return
-
-    if backend is None:
-        backend = "nccl" if torch.cuda.is_available() else "gloo"
-
-    if backend == "nccl" and not torch.cuda.is_available():
-        raise RuntimeError("NCCL backend requested but CUDA is not available.")
-
-    kwargs = {
-        "backend": backend,
-        "init_method": "env://",
-        "rank": env.rank,
-        "world_size": env.world_size,
-        "timeout": timedelta(minutes=float(timeout_minutes)),
-    }
-
-    # Ensure each rank binds to the expected CUDA device before NCCL init.
-    if backend == "nccl" and torch.cuda.is_available():
-        torch.cuda.set_device(int(env.local_rank))
-        try:
-            sig = inspect.signature(dist.init_process_group)
-            has_device_id = "device_id" in sig.parameters
-        except (TypeError, ValueError):
-            has_device_id = False
-        if has_device_id:
-            kwargs["device_id"] = torch.device("cuda", int(env.local_rank))
-
-    try:
-        dist.init_process_group(**kwargs)
-    except TypeError:
-        # Compatibility fallback for torch versions without `device_id`.
-        kwargs.pop("device_id", None)
-        dist.init_process_group(**kwargs)
-
-
-def cleanup_distributed() -> None:
-    if not dist.is_available() or not dist.is_initialized():
-        return
-    try:
-        if dist.get_backend() == "nccl" and torch.cuda.is_available():
-            dist.barrier(device_ids=[torch.cuda.current_device()])
-        else:
-            dist.barrier()
-    except Exception:
-        pass
-    dist.destroy_process_group()
-
-
-def is_main_process(env: Optional[DistributedEnv] = None) -> bool:
-    if env is not None:
-        return int(env.rank) == 0
-    if dist.is_available() and dist.is_initialized():
-        return dist.get_rank() == 0
-    return True
-
-
-def reduce_scalar(value: float, device: torch.device) -> float:
-    if not dist.is_available() or not dist.is_initialized():
-        return float(value)
-    tensor = torch.tensor(float(value), dtype=torch.float64, device=device)
-    dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
-    return float(tensor.item())
 
 
 def resolve_device(preferred: str = "auto") -> torch.device:
@@ -125,33 +29,6 @@ def device_summary(device: torch.device) -> str:
     props = torch.cuda.get_device_properties(idx)
     mem_gb = props.total_memory / float(1024**3)
     return f"cuda:{idx} ({props.name}, {mem_gb:.1f} GB)"
-
-
-def cuda_inventory() -> list[str]:
-    if not torch.cuda.is_available():
-        return []
-    out: list[str] = []
-    for idx in range(torch.cuda.device_count()):
-        props = torch.cuda.get_device_properties(idx)
-        mem_gb = props.total_memory / float(1024**3)
-        out.append(f"cuda:{idx} {props.name} ({mem_gb:.1f} GB)")
-    return out
-
-
-def compute_mode_label(
-    device: torch.device,
-    gpu_count: int,
-    distributed: bool = False,
-    world_size: int = 1,
-    data_parallel: bool = False,
-) -> str:
-    if device.type != "cuda" or gpu_count <= 0:
-        return "CPU"
-    if distributed and world_size > 1:
-        return f"GPUx{world_size} (DDP)"
-    if data_parallel and gpu_count > 1:
-        return f"GPUx{gpu_count} (DataParallel)"
-    return "GPUx1"
 
 
 def _cpu_limit_from_affinity() -> int:
