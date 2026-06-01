@@ -3,20 +3,25 @@ from __future__ import annotations
 import argparse
 import inspect
 import json
+import math
 import random
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import albumentations as A
 import cv2
 import numpy as np
 import torch
+import torch.distributed as dist
 from albumentations.pytorch import ToTensorV2
+from torch.amp import autocast
 from torch import nn
+from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
-from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
+from torch.utils.data import DataLoader, Dataset, Sampler, WeightedRandomSampler
+from torch.utils.data.distributed import DistributedSampler
 
 from utils.config import (
     CENTER_RADIUS,
@@ -39,6 +44,16 @@ from utils.config import (
 )
 from utils.loss import DetectionLoss
 from utils.model import AnchorFreeDetector
+from utils.runtime import (
+    cleanup_distributed,
+    create_grad_scaler,
+    get_distributed_env,
+    init_distributed,
+    is_main_process,
+    reduce_scalar,
+    resolve_num_workers,
+    should_pin_memory,
+)
 
 VALID_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 
@@ -51,6 +66,56 @@ class Sample:
     height: int
     boxes: List[List[float]]
     labels: List[int]
+
+
+class DistributedWeightedSampler(Sampler[int]):
+    """
+    Weighted sampler compatible with DDP.
+
+    Each rank samples from a common weighted index stream with independent
+    striding, so global weighted distribution is preserved.
+    """
+
+    def __init__(
+        self,
+        weights: torch.Tensor,
+        num_samples: int,
+        num_replicas: int,
+        rank: int,
+        replacement: bool = True,
+        seed: int = 42,
+    ) -> None:
+        super().__init__(None)
+        if num_replicas <= 0:
+            raise ValueError("num_replicas must be > 0")
+        if rank < 0 or rank >= num_replicas:
+            raise ValueError(f"rank must be in [0, {num_replicas - 1}]")
+        self.weights = torch.as_tensor(weights, dtype=torch.double)
+        self.num_samples = int(num_samples)
+        self.num_replicas = int(num_replicas)
+        self.rank = int(rank)
+        self.replacement = bool(replacement)
+        self.seed = int(seed)
+        self.epoch = 0
+        self.total_size = self.num_samples * self.num_replicas
+
+    def __iter__(self) -> Iterable[int]:
+        g = torch.Generator()
+        g.manual_seed(self.seed + self.epoch)
+        indices = torch.multinomial(
+            self.weights,
+            self.total_size,
+            replacement=self.replacement,
+            generator=g,
+        ).tolist()
+        rank_indices = indices[self.rank : self.total_size : self.num_replicas]
+        return iter(rank_indices)
+
+    def __len__(self) -> int:
+        return self.num_samples
+
+    def set_epoch(self, epoch: int) -> None:
+        self.epoch = int(epoch)
 
 
 def compute_class_weights(num_classes: int) -> torch.Tensor:
@@ -393,18 +458,24 @@ def make_dataloader(
     batch_size: int,
     shuffle: bool,
     num_workers: int,
-    sampler: Optional[WeightedRandomSampler] = None,
+    pin_memory: bool,
+    sampler: Optional[Sampler[int]] = None,
 ) -> DataLoader:
+    kwargs: Dict[str, Any] = {}
+    if num_workers > 0:
+        kwargs["prefetch_factor"] = 2
+
     return DataLoader(
         dataset,
         batch_size=batch_size,
         shuffle=(shuffle and sampler is None),
         sampler=sampler,
         num_workers=num_workers,
-        pin_memory=True,
+        pin_memory=pin_memory,
         persistent_workers=(num_workers > 0),
         drop_last=False,
         collate_fn=collate_fn,
+        **kwargs,
     )
 
 
@@ -414,29 +485,40 @@ def train_one_epoch(
     loader: DataLoader,
     optimizer: torch.optim.Optimizer,
     device: torch.device,
-    scaler: torch.cuda.amp.GradScaler,
+    scaler: Any,
     amp_enabled: bool,
+    accum_steps: int = 1,
 ) -> Dict[str, float]:
     model.train()
     running = {"loss": 0.0, "loss_cls": 0.0, "loss_reg": 0.0, "loss_ctr": 0.0}
     steps = 0
+    accum = max(1, int(accum_steps))
 
-    for images, targets in loader:
-        images = images.to(device, non_blocking=True).to(memory_format=torch.channels_last)
+    optimizer.zero_grad(set_to_none=True)
+
+    for batch_idx, (images, targets) in enumerate(loader, start=1):
+        images = images.to(device, non_blocking=True)
+        if device.type == "cuda":
+            images = images.to(memory_format=torch.channels_last)
         targets = move_targets_to_device(targets, device)
 
-        optimizer.zero_grad(set_to_none=True)
-        with torch.autocast(device_type=device.type, enabled=amp_enabled):
+        with autocast(device_type=device.type, enabled=amp_enabled):
             outputs = model(images)
             loss_dict = criterion(outputs, targets)
             loss = loss_dict["loss"]
 
         if torch.isnan(loss) or torch.isinf(loss):
+            optimizer.zero_grad(set_to_none=True)
             continue
 
-        scaler.scale(loss).backward()
-        scaler.step(optimizer)
-        scaler.update()
+        backward_loss = loss / float(accum)
+        scaler.scale(backward_loss).backward()
+
+        do_step = (batch_idx % accum == 0) or (batch_idx == len(loader))
+        if do_step:
+            scaler.step(optimizer)
+            scaler.update()
+            optimizer.zero_grad(set_to_none=True)
 
         running["loss"] += float(loss.detach().item())
         running["loss_cls"] += float(loss_dict["loss_cls"].item())
@@ -445,8 +527,8 @@ def train_one_epoch(
         steps += 1
 
     if steps == 0:
-        return {k: float("inf") for k in running}
-    return {k: v / steps for k, v in running.items()}
+        return {**{k: 0.0 for k in running}, "steps": 0.0}
+    return {**running, "steps": float(steps)}
 
 
 @torch.no_grad()
@@ -462,10 +544,12 @@ def validate_one_epoch(
     steps = 0
 
     for images, targets in loader:
-        images = images.to(device, non_blocking=True).to(memory_format=torch.channels_last)
+        images = images.to(device, non_blocking=True)
+        if device.type == "cuda":
+            images = images.to(memory_format=torch.channels_last)
         targets = move_targets_to_device(targets, device)
 
-        with torch.autocast(device_type=device.type, enabled=amp_enabled):
+        with autocast(device_type=device.type, enabled=amp_enabled):
             outputs = model(images)
             loss_dict = criterion(outputs, targets)
             loss = loss_dict["loss"]
@@ -477,16 +561,34 @@ def validate_one_epoch(
         steps += 1
 
     if steps == 0:
-        return {k: float("inf") for k in running}
-    return {k: v / steps for k, v in running.items()}
+        return {**{k: 0.0 for k in running}, "steps": 0.0}
+    return {**running, "steps": float(steps)}
 
 
-def build_optimizer(model: AnchorFreeDetector, lr_backbone: float, lr_head: float, weight_decay: float) -> torch.optim.Optimizer:
-    backbone_params = list(model.backbone_fpn.parameters())
+def finalize_epoch_metrics(raw: Dict[str, float], device: torch.device, distributed: bool) -> Dict[str, float]:
+    keys = ["loss", "loss_cls", "loss_reg", "loss_ctr", "steps"]
+    reduced = {k: float(raw.get(k, 0.0)) for k in keys}
+
+    if distributed:
+        for k in keys:
+            reduced[k] = reduce_scalar(reduced[k], device=device)
+
+    steps = max(1.0, reduced["steps"])
+    return {
+        "loss": reduced["loss"] / steps,
+        "loss_cls": reduced["loss_cls"] / steps,
+        "loss_reg": reduced["loss_reg"] / steps,
+        "loss_ctr": reduced["loss_ctr"] / steps,
+    }
+
+
+def build_optimizer(model: nn.Module, lr_backbone: float, lr_head: float, weight_decay: float) -> torch.optim.Optimizer:
+    m = model.module if isinstance(model, DDP) else model
+    backbone_params = list(m.backbone_fpn.parameters())
     head_params = (
-        list(model.head_s8.parameters())
-        + list(model.head_s16.parameters())
-        + list(model.head_s32.parameters())
+        list(m.head_s8.parameters())
+        + list(m.head_s16.parameters())
+        + list(m.head_s32.parameters())
     )
 
     return AdamW(
@@ -508,10 +610,11 @@ def save_checkpoint(
     classes: List[str],
     img_size: int,
 ) -> None:
+    model_to_save = model.module if isinstance(model, DDP) else model
     path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(
         {
-            "model_state_dict": model.state_dict(),
+            "model_state_dict": model_to_save.state_dict(),
             "optimizer_state_dict": optimizer.state_dict(),
             "scheduler_state_dict": scheduler.state_dict(),
             "epoch": epoch,
@@ -532,12 +635,26 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--val_image_dir", type=Path, required=True)
     parser.add_argument("--checkpoint_dir", type=Path, default=Path("./models"))
     parser.add_argument("--img_size", type=int, default=IMG_SIZE)
-    parser.add_argument("--batch_size", type=int, default=4)
+    parser.add_argument("--batch_size", type=int, default=8)
     parser.add_argument("--epochs", type=int, default=25)
     parser.add_argument("--lr_backbone", type=float, default=2e-4)
     parser.add_argument("--lr_head", type=float, default=2e-3)
     parser.add_argument("--weight_decay", type=float, default=1e-4)
     parser.add_argument("--num_workers", type=int, default=2)
+    parser.add_argument("--grad_accum_steps", type=int, default=1)
+    parser.add_argument(
+        "--ddp",
+        type=str,
+        default="auto",
+        choices=["auto", "on", "off"],
+        help="Use DistributedDataParallel. 'auto' enables when launched via torchrun.",
+    )
+    parser.add_argument(
+        "--ddp_timeout_min",
+        type=float,
+        default=30.0,
+        help="DDP init timeout in minutes.",
+    )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--resume", type=Path, default=None)
     parser.add_argument("--label_smoothing", type=float, default=LABEL_SMOOTHING)
@@ -551,147 +668,270 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    seed_everything(args.seed)
-    torch.backends.cudnn.benchmark = True
-    torch.backends.cuda.matmul.allow_tf32 = True
-    torch.backends.cudnn.allow_tf32 = True
-    torch.set_float32_matmul_precision("high")
+    dist_env = get_distributed_env()
+    if args.ddp == "on" and not dist_env.enabled:
+        raise RuntimeError(
+            "DDP is forced but WORLD_SIZE is not set. Launch with torchrun, e.g. "
+            "`torchrun --standalone --nproc_per_node=2 train.py ...`"
+        )
+    if args.ddp == "off":
+        dist_env = dist_env.__class__(enabled=False, rank=0, local_rank=0, world_size=1)
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    amp_enabled = (device.type == "cuda") and (not args.no_amp)
-
-    train_samples, classes = parse_samples(args.train_data, args.image_dir, class_names=None)
-    val_samples, _ = parse_samples(args.val_data, args.val_image_dir, class_names=classes)
-    num_classes = len(classes)
-
-    train_ds = DetectionDataset(train_samples, transforms=get_train_transforms(args.img_size))
-    val_ds = DetectionDataset(val_samples, transforms=get_val_transforms(args.img_size))
-
-    class_weights = None if args.no_class_weights else compute_class_weights(num_classes=num_classes)
-    train_sampler = None
-    if not args.no_balanced_sampling and class_weights is not None:
-        sample_weights = build_sample_weights(train_samples, class_weights)
-        train_sampler = WeightedRandomSampler(
-            weights=sample_weights,
-            num_samples=len(sample_weights),
-            replacement=True,
+    if dist_env.enabled and dist_env.world_size <= 1:
+        raise RuntimeError(
+            "DDP requested but WORLD_SIZE<=1. Launch with torchrun, e.g. "
+            "`torchrun --standalone --nproc_per_node=2 train.py ...`"
         )
 
-    train_loader = make_dataloader(
-        train_ds,
-        batch_size=args.batch_size,
-        shuffle=True,
-        num_workers=args.num_workers,
-        sampler=train_sampler,
-    )
-    val_loader = make_dataloader(val_ds, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers)
+    if dist_env.enabled:
+        init_distributed(dist_env, backend="nccl", timeout_minutes=float(args.ddp_timeout_min))
 
-    model = AnchorFreeDetector(num_classes=num_classes, pretrained=True).to(device).to(memory_format=torch.channels_last)
-    criterion = DetectionLoss(
-        num_classes=num_classes,
-        strides=STRIDES,
-        class_weights=class_weights,
-        label_smoothing=float(args.label_smoothing),
-        center_radius=float(args.center_radius),
-        use_scale_ranges=not args.no_scale_ranges,
-    ).to(device)
-    optimizer = build_optimizer(model, lr_backbone=args.lr_backbone, lr_head=args.lr_head, weight_decay=args.weight_decay)
-    scheduler = CosineAnnealingLR(optimizer, T_max=max(args.epochs, 1))
-    scaler = torch.cuda.amp.GradScaler(enabled=amp_enabled)
+    try:
+        local_seed = int(args.seed) + int(dist_env.rank)
+        seed_everything(local_seed)
+        torch.backends.cudnn.benchmark = True
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        torch.set_float32_matmul_precision("high")
 
-    start_epoch = 1
-    best_val_loss = float("inf")
-    if args.resume is not None and args.resume.exists():
-        ckpt = torch.load(str(args.resume), map_location=device)
-        try:
-            model.load_state_dict(ckpt["model_state_dict"], strict=True)
-        except RuntimeError as exc:
-            missing, unexpected = model.load_state_dict(ckpt["model_state_dict"], strict=False)
-            print(f"Resume checkpoint partially loaded ({exc}).")
-            print(f"Missing keys: {missing}")
-            print(f"Unexpected keys: {unexpected}")
-        if "optimizer_state_dict" in ckpt:
-            optimizer.load_state_dict(ckpt["optimizer_state_dict"])
-        if "scheduler_state_dict" in ckpt:
-            scheduler.load_state_dict(ckpt["scheduler_state_dict"])
-        start_epoch = int(ckpt.get("epoch", 0)) + 1
-        best_val_loss = float(ckpt.get("best_val_loss", float("inf")))
+        if dist_env.enabled:
+            if not torch.cuda.is_available():
+                raise RuntimeError("DDP requires CUDA GPUs on this script.")
+            torch.cuda.set_device(dist_env.local_rank)
+            device = torch.device(f"cuda:{dist_env.local_rank}")
+        else:
+            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    args.checkpoint_dir.mkdir(parents=True, exist_ok=True)
-    best_path = args.checkpoint_dir / "best.pth"
-    last_path = args.checkpoint_dir / "last.pth"
+        amp_enabled = (device.type == "cuda") and (not args.no_amp)
+        num_workers, max_workers = resolve_num_workers(int(args.num_workers))
+        pin_memory = should_pin_memory(device)
 
-    print(f"Device: {device}, AMP: {amp_enabled}")
-    print(f"Train samples: {len(train_ds)}, Val samples: {len(val_ds)}, Classes: {classes}")
-    print(f"Balanced sampling: {not args.no_balanced_sampling}")
-    print(f"Class weights enabled: {not args.no_class_weights}")
-    if class_weights is not None:
-        print(f"Class weights: {[round(x, 4) for x in class_weights.tolist()]}")
+        train_samples, classes = parse_samples(args.train_data, args.image_dir, class_names=None)
+        val_samples, _ = parse_samples(args.val_data, args.val_image_dir, class_names=classes)
+        num_classes = len(classes)
 
-    for epoch in range(start_epoch, args.epochs + 1):
-        train_metrics = train_one_epoch(
-            model=model,
-            criterion=criterion,
-            loader=train_loader,
-            optimizer=optimizer,
-            device=device,
-            scaler=scaler,
-            amp_enabled=amp_enabled,
-        )
-        val_metrics = validate_one_epoch(
-            model=model,
-            criterion=criterion,
-            loader=val_loader,
-            device=device,
-            amp_enabled=amp_enabled,
-        )
-        scheduler.step()
+        train_ds = DetectionDataset(train_samples, transforms=get_train_transforms(args.img_size))
+        val_ds = DetectionDataset(val_samples, transforms=get_val_transforms(args.img_size))
 
-        print(
-            f"Epoch {epoch:03d}/{args.epochs:03d} | "
-            f"train_loss={train_metrics['loss']:.4f} "
-            f"(cls={train_metrics['loss_cls']:.4f}, reg={train_metrics['loss_reg']:.4f}, ctr={train_metrics['loss_ctr']:.4f}) | "
-            f"val_loss={val_metrics['loss']:.4f}"
-        )
+        global_batch_size = max(1, int(args.batch_size))
+        local_batch_size = global_batch_size
+        if dist_env.enabled:
+            if global_batch_size < dist_env.world_size:
+                raise ValueError(
+                    f"--batch_size ({global_batch_size}) must be >= world_size ({dist_env.world_size}) in DDP mode."
+                )
+            local_batch_size = global_batch_size // dist_env.world_size
+            if global_batch_size % dist_env.world_size != 0 and is_main_process(dist_env):
+                effective = local_batch_size * dist_env.world_size
+                print(
+                    f"Warning: batch_size {global_batch_size} not divisible by world_size {dist_env.world_size}. "
+                    f"Using effective global batch size {effective}."
+                )
 
-        save_checkpoint(
-            path=last_path,
-            model=model,
-            optimizer=optimizer,
-            scheduler=scheduler,
-            epoch=epoch,
-            best_val_loss=best_val_loss,
-            classes=classes,
-            img_size=args.img_size,
-        )
+        class_weights = None if args.no_class_weights else compute_class_weights(num_classes=num_classes)
 
-        if val_metrics["loss"] < best_val_loss:
-            best_val_loss = val_metrics["loss"]
-            save_checkpoint(
-                path=best_path,
-                model=model,
-                optimizer=optimizer,
-                scheduler=scheduler,
-                epoch=epoch,
-                best_val_loss=best_val_loss,
-                classes=classes,
-                img_size=args.img_size,
+        train_sampler: Optional[Sampler[int]] = None
+        val_sampler: Optional[Sampler[int]] = None
+
+        if dist_env.enabled:
+            if (not args.no_balanced_sampling) and class_weights is not None:
+                sample_weights = build_sample_weights(train_samples, class_weights)
+                per_rank_samples = int(math.ceil(len(sample_weights) / float(dist_env.world_size)))
+                train_sampler = DistributedWeightedSampler(
+                    weights=sample_weights,
+                    num_samples=per_rank_samples,
+                    num_replicas=dist_env.world_size,
+                    rank=dist_env.rank,
+                    replacement=True,
+                    seed=int(args.seed),
+                )
+            else:
+                train_sampler = DistributedSampler(
+                    train_ds,
+                    num_replicas=dist_env.world_size,
+                    rank=dist_env.rank,
+                    shuffle=True,
+                    seed=int(args.seed),
+                    drop_last=False,
+                )
+
+            val_sampler = DistributedSampler(
+                val_ds,
+                num_replicas=dist_env.world_size,
+                rank=dist_env.rank,
+                shuffle=False,
+                drop_last=False,
             )
-            print(f"Saved best checkpoint: {best_path} (val_loss={best_val_loss:.4f})")
+        else:
+            if not args.no_balanced_sampling and class_weights is not None:
+                sample_weights = build_sample_weights(train_samples, class_weights)
+                train_sampler = WeightedRandomSampler(
+                    weights=sample_weights,
+                    num_samples=len(sample_weights),
+                    replacement=True,
+                )
 
-    if not best_path.exists():
-        save_checkpoint(
-            path=best_path,
-            model=model,
-            optimizer=optimizer,
-            scheduler=scheduler,
-            epoch=args.epochs,
-            best_val_loss=best_val_loss,
-            classes=classes,
-            img_size=args.img_size,
+        train_loader = make_dataloader(
+            train_ds,
+            batch_size=local_batch_size,
+            shuffle=True,
+            num_workers=num_workers,
+            pin_memory=pin_memory,
+            sampler=train_sampler,
+        )
+        val_loader = make_dataloader(
+            val_ds,
+            batch_size=local_batch_size,
+            shuffle=False,
+            num_workers=num_workers,
+            pin_memory=pin_memory,
+            sampler=val_sampler,
         )
 
-    print(f"Training done. Best model: {best_path}")
+        model = AnchorFreeDetector(num_classes=num_classes, pretrained=True).to(device)
+        if device.type == "cuda":
+            model = model.to(memory_format=torch.channels_last)
+        criterion = DetectionLoss(
+            num_classes=num_classes,
+            strides=STRIDES,
+            class_weights=class_weights,
+            label_smoothing=float(args.label_smoothing),
+            center_radius=float(args.center_radius),
+            use_scale_ranges=not args.no_scale_ranges,
+        ).to(device)
+
+        if dist_env.enabled:
+            model = DDP(
+                model,
+                device_ids=[dist_env.local_rank],
+                output_device=dist_env.local_rank,
+                find_unused_parameters=False,
+            )
+
+        optimizer = build_optimizer(model, lr_backbone=args.lr_backbone, lr_head=args.lr_head, weight_decay=args.weight_decay)
+        scheduler = CosineAnnealingLR(optimizer, T_max=max(args.epochs, 1))
+        scaler = create_grad_scaler(device=device, enabled=amp_enabled)
+
+        start_epoch = 1
+        best_val_loss = float("inf")
+        if args.resume is not None and args.resume.exists():
+            ckpt = torch.load(str(args.resume), map_location=device)
+            model_state = ckpt.get("model_state_dict", ckpt)
+            model_target = model.module if isinstance(model, DDP) else model
+            try:
+                model_target.load_state_dict(model_state, strict=True)
+            except RuntimeError as exc:
+                missing, unexpected = model_target.load_state_dict(model_state, strict=False)
+                if is_main_process(dist_env):
+                    print(f"Resume checkpoint partially loaded ({exc}).")
+                    print(f"Missing keys: {missing}")
+                    print(f"Unexpected keys: {unexpected}")
+            if "optimizer_state_dict" in ckpt:
+                optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+            if "scheduler_state_dict" in ckpt:
+                scheduler.load_state_dict(ckpt["scheduler_state_dict"])
+            start_epoch = int(ckpt.get("epoch", 0)) + 1
+            best_val_loss = float(ckpt.get("best_val_loss", float("inf")))
+
+        args.checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        best_path = args.checkpoint_dir / "best.pth"
+        last_path = args.checkpoint_dir / "last.pth"
+
+        if is_main_process(dist_env):
+            print(f"Device: {device}, AMP: {amp_enabled}")
+            print(
+                f"DDP: {dist_env.enabled}, world_size={dist_env.world_size}, "
+                f"rank={dist_env.rank}, local_rank={dist_env.local_rank}"
+            )
+            print(f"Num workers: {num_workers} (max safe: {max_workers}), pin_memory={pin_memory}")
+            print(f"Train samples: {len(train_ds)}, Val samples: {len(val_ds)}, Classes: {classes}")
+            print(
+                f"Batch size global/local: {global_batch_size}/{local_batch_size}, "
+                f"grad_accum_steps={max(1, int(args.grad_accum_steps))}"
+            )
+            print(f"Balanced sampling: {not args.no_balanced_sampling}")
+            print(f"Class weights enabled: {not args.no_class_weights}")
+            if class_weights is not None:
+                print(f"Class weights: {[round(x, 4) for x in class_weights.tolist()]}")
+
+        for epoch in range(start_epoch, args.epochs + 1):
+            if isinstance(train_sampler, (DistributedSampler, DistributedWeightedSampler)):
+                train_sampler.set_epoch(epoch)
+
+            train_raw = train_one_epoch(
+                model=model,
+                criterion=criterion,
+                loader=train_loader,
+                optimizer=optimizer,
+                device=device,
+                scaler=scaler,
+                amp_enabled=amp_enabled,
+                accum_steps=max(1, int(args.grad_accum_steps)),
+            )
+            val_raw = validate_one_epoch(
+                model=model,
+                criterion=criterion,
+                loader=val_loader,
+                device=device,
+                amp_enabled=amp_enabled,
+            )
+
+            train_metrics = finalize_epoch_metrics(train_raw, device=device, distributed=dist_env.enabled)
+            val_metrics = finalize_epoch_metrics(val_raw, device=device, distributed=dist_env.enabled)
+            scheduler.step()
+
+            if is_main_process(dist_env):
+                print(
+                    f"Epoch {epoch:03d}/{args.epochs:03d} | "
+                    f"train_loss={train_metrics['loss']:.4f} "
+                    f"(cls={train_metrics['loss_cls']:.4f}, reg={train_metrics['loss_reg']:.4f}, ctr={train_metrics['loss_ctr']:.4f}) | "
+                    f"val_loss={val_metrics['loss']:.4f}"
+                )
+
+                save_checkpoint(
+                    path=last_path,
+                    model=model,
+                    optimizer=optimizer,
+                    scheduler=scheduler,
+                    epoch=epoch,
+                    best_val_loss=best_val_loss,
+                    classes=classes,
+                    img_size=args.img_size,
+                )
+
+                if val_metrics["loss"] < best_val_loss:
+                    best_val_loss = val_metrics["loss"]
+                    save_checkpoint(
+                        path=best_path,
+                        model=model,
+                        optimizer=optimizer,
+                        scheduler=scheduler,
+                        epoch=epoch,
+                        best_val_loss=best_val_loss,
+                        classes=classes,
+                        img_size=args.img_size,
+                    )
+                    print(f"Saved best checkpoint: {best_path} (val_loss={best_val_loss:.4f})")
+
+            if dist_env.enabled:
+                dist.barrier()
+
+        if is_main_process(dist_env):
+            if not best_path.exists():
+                save_checkpoint(
+                    path=best_path,
+                    model=model,
+                    optimizer=optimizer,
+                    scheduler=scheduler,
+                    epoch=args.epochs,
+                    best_val_loss=best_val_loss,
+                    classes=classes,
+                    img_size=args.img_size,
+                )
+            print(f"Training done. Best model: {best_path}")
+    finally:
+        if dist_env.enabled:
+            cleanup_distributed()
 
 
 if __name__ == "__main__":

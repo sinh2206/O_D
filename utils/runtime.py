@@ -1,12 +1,86 @@
 from __future__ import annotations
 
 import os
+from dataclasses import dataclass
+from datetime import timedelta
 from pathlib import Path
 from typing import Any, Optional, Tuple
 
 import torch
+import torch.distributed as dist
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
+
+
+@dataclass(frozen=True)
+class DistributedEnv:
+    enabled: bool
+    rank: int
+    local_rank: int
+    world_size: int
+
+
+def get_distributed_env() -> DistributedEnv:
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    rank = int(os.environ.get("RANK", "0"))
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    return DistributedEnv(
+        enabled=world_size > 1,
+        rank=rank,
+        local_rank=local_rank,
+        world_size=world_size,
+    )
+
+
+def init_distributed(
+    env: DistributedEnv,
+    backend: Optional[str] = None,
+    timeout_minutes: float = 30.0,
+) -> None:
+    if not env.enabled:
+        return
+    if dist.is_initialized():
+        return
+
+    if backend is None:
+        backend = "nccl" if torch.cuda.is_available() else "gloo"
+
+    if backend == "nccl" and not torch.cuda.is_available():
+        raise RuntimeError("NCCL backend requested but CUDA is not available.")
+
+    dist.init_process_group(
+        backend=backend,
+        init_method="env://",
+        rank=env.rank,
+        world_size=env.world_size,
+        timeout=timedelta(minutes=float(timeout_minutes)),
+    )
+
+
+def cleanup_distributed() -> None:
+    if not dist.is_available() or not dist.is_initialized():
+        return
+    try:
+        dist.barrier()
+    except Exception:
+        pass
+    dist.destroy_process_group()
+
+
+def is_main_process(env: Optional[DistributedEnv] = None) -> bool:
+    if env is not None:
+        return int(env.rank) == 0
+    if dist.is_available() and dist.is_initialized():
+        return dist.get_rank() == 0
+    return True
+
+
+def reduce_scalar(value: float, device: torch.device) -> float:
+    if not dist.is_available() or not dist.is_initialized():
+        return float(value)
+    tensor = torch.tensor(float(value), dtype=torch.float64, device=device)
+    dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
+    return float(tensor.item())
 
 
 def resolve_device(preferred: str = "auto") -> torch.device:

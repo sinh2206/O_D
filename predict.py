@@ -9,6 +9,7 @@ from typing import Dict, List, Optional, Sequence, Tuple
 import cv2
 import numpy as np
 import torch
+from torch import nn
 
 from utils.config import (
     CHAIR_SUPPRESS_WITH_PERSON_IOU,
@@ -31,6 +32,7 @@ from utils.config import (
 )
 from utils.model import AnchorFreeDetector
 from utils.nms import LetterboxMeta, postprocess_batch
+from utils.runtime import resolve_device
 
 VALID_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 DEFAULT_VAL_IMAGE_DIR = Path("public/val/images")
@@ -662,7 +664,7 @@ def suppress_chair_inside_person(predictions: List[dict], iou_thresh: float) -> 
 
 @torch.no_grad()
 def run_inference(
-    model: AnchorFreeDetector,
+    model: nn.Module,
     image_paths: List[Path],
     device: torch.device,
     batch_size: int,
@@ -672,6 +674,55 @@ def run_inference(
     class_names: Sequence[str],
     center_combine: str = INFER_CENTER_COMBINE,
 ) -> List[dict]:
+    def _infer_tensor_batch(
+        batch_tensors: List[torch.Tensor],
+        batch_ids: List[str],
+        batch_metas: List[LetterboxMeta],
+    ) -> List[dict]:
+        if len(batch_tensors) == 0:
+            return []
+
+        images = torch.stack(batch_tensors, dim=0).to(device, non_blocking=True)
+        if device.type == "cuda":
+            images = images.to(memory_format=torch.channels_last)
+
+        with torch.autocast(device_type=device.type, enabled=amp_enabled):
+            outputs = model(images)
+
+        return postprocess_batch(
+            outputs=outputs,
+            image_ids=batch_ids,
+            metas=batch_metas,
+            class_names=class_names,
+            num_classes=len(class_names),
+            img_size=img_size,
+            conf_thresh=conf_thresh,
+            nms_thresh=nms_thresh,
+            reg_decode="auto",
+            center_combine=str(center_combine),
+            min_box_size=MIN_BOX_SIZE,
+        )
+
+    def _infer_with_oom_split(
+        batch_tensors: List[torch.Tensor],
+        batch_ids: List[str],
+        batch_metas: List[LetterboxMeta],
+    ) -> List[dict]:
+        try:
+            return _infer_tensor_batch(batch_tensors, batch_ids, batch_metas)
+        except RuntimeError as exc:
+            if "out of memory" not in str(exc).lower():
+                raise
+            if len(batch_tensors) <= 1:
+                raise
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
+
+            mid = len(batch_tensors) // 2
+            left = _infer_with_oom_split(batch_tensors[:mid], batch_ids[:mid], batch_metas[:mid])
+            right = _infer_with_oom_split(batch_tensors[mid:], batch_ids[mid:], batch_metas[mid:])
+            return left + right
+
     results: List[dict] = []
     amp_enabled = device.type == "cuda"
 
@@ -693,23 +744,7 @@ def run_inference(
         if not tensors:
             continue
 
-        images = torch.stack(tensors, dim=0).to(device, non_blocking=True).to(memory_format=torch.channels_last)
-        with torch.autocast(device_type=device.type, enabled=amp_enabled):
-            outputs = model(images)
-
-        batch_results = postprocess_batch(
-            outputs=outputs,
-            image_ids=image_ids,
-            metas=metas,
-            class_names=class_names,
-            num_classes=len(class_names),
-            img_size=img_size,
-            conf_thresh=conf_thresh,
-            nms_thresh=nms_thresh,
-            reg_decode="auto",
-            center_combine=str(center_combine),
-            min_box_size=MIN_BOX_SIZE,
-        )
+        batch_results = _infer_with_oom_split(tensors, image_ids, metas)
         results.extend(batch_results)
 
     return results
@@ -753,6 +788,42 @@ def load_checkpoint_model(checkpoint_path: Path, device: torch.device) -> Tuple[
     return model, list(classes), img_size
 
 
+class InferenceModelAdapter(nn.Module):
+    """
+    Keep only tensors needed by postprocess to make DataParallel gather stable
+    and lighter on memory.
+    """
+
+    def __init__(self, model: nn.Module) -> None:
+        super().__init__()
+        self.model = model
+
+    def forward(self, x: torch.Tensor):  # type: ignore[override]
+        out = self.model(x)
+        if not isinstance(out, dict):
+            return out
+        return {
+            "cls_logits": out["cls_logits"],
+            "reg_preds": out["reg_preds"],
+            "center_logits": out.get("center_logits", None),
+        }
+
+
+def maybe_enable_data_parallel(model: nn.Module, device: torch.device, mode: str) -> nn.Module:
+    if device.type != "cuda":
+        return model
+    if str(mode).lower() == "off":
+        return model
+
+    gpu_count = torch.cuda.device_count()
+    if gpu_count <= 1:
+        return model
+
+    if str(mode).lower() in {"auto", "on"}:
+        return nn.DataParallel(model, device_ids=list(range(gpu_count)))
+    return model
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Predict val set, export integer bbox JSON, and save hardcase summary.")
     parser.add_argument("--image_dir", type=Path, default=DEFAULT_VAL_IMAGE_DIR)
@@ -768,7 +839,7 @@ def parse_args() -> argparse.Namespace:
         help="Path to trained model checkpoint (.pth). '--model_path' is kept as a backward-compatible alias.",
     )
     parser.add_argument("--img_size", type=int, default=IMG_SIZE)
-    parser.add_argument("--batch_size", type=int, default=4)
+    parser.add_argument("--batch_size", type=int, default=8)
     parser.add_argument("--conf_thresh", type=float, default=CONF_THRESH)
     parser.add_argument("--nms_thresh", type=float, default=NMS_IOU_THRESH)
     parser.add_argument(
@@ -787,6 +858,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--chair_suppress_iou", type=float, default=CHAIR_SUPPRESS_WITH_PERSON_IOU)
     parser.add_argument("--hardcase_topk", type=int, default=50)
     parser.add_argument("--hardcase_iou", type=float, default=0.5)
+    parser.add_argument(
+        "--multi_gpu",
+        type=str,
+        default="auto",
+        choices=["auto", "on", "off"],
+        help="Inference on multi-GPU using DataParallel.",
+    )
     parser.add_argument("--device", type=str, default="auto", choices=["auto", "cuda", "cpu"])
     return parser.parse_args()
 
@@ -807,16 +885,17 @@ def main() -> None:
     if args.results_dir.resolve() != DEFAULT_RESULTS_DIR.resolve():
         raise ValueError(f"--results_dir must be '{DEFAULT_RESULTS_DIR}'. Got: {args.results_dir}")
 
-    if args.device == "auto":
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    else:
-        device = torch.device(args.device)
+    device = resolve_device(args.device)
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
     torch.set_float32_matmul_precision("high")
 
     model, ckpt_classes, ckpt_img_size = load_checkpoint_model(args.checkpoint, device=device)
-    model = model.to(memory_format=torch.channels_last)
+    if device.type == "cuda":
+        model = model.to(memory_format=torch.channels_last)
+    model = InferenceModelAdapter(model)
+    model = maybe_enable_data_parallel(model, device=device, mode=str(args.multi_gpu))
+    model.eval()
     class_names = ckpt_classes if ckpt_classes else CLASS_NAMES
     img_size = args.img_size if args.img_size > 0 else ckpt_img_size
 
@@ -863,7 +942,10 @@ def main() -> None:
         iou_thresh=float(args.hardcase_iou),
     )
 
+    dp_enabled = isinstance(model, nn.DataParallel)
     print(f"Device: {device}")
+    if device.type == "cuda":
+        print(f"CUDA GPUs visible: {torch.cuda.device_count()}, DataParallel: {dp_enabled}")
     ckpt_meta = torch.load(str(args.checkpoint), map_location="cpu")
     print(
         "Checkpoint meta: "
