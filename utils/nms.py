@@ -26,22 +26,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 import torch
 
 try:
-    from .config import (
-        CLASS_NAMES,
-        CLASS_SCORE_SCALES,
-        CONF_THRESH,
-        IMG_SIZE,
-        INFER_CENTER_COMBINE,
-        INTER_CLASS_CONTAIN_RATIO,
-        INTER_CLASS_IOU_SUPPRESS,
-        INTRA_CLASS_CONTAIN_SCORE_EPS,
-        MAX_OBJECTS_PER_IMAGE,
-        MIN_BOX_SIZE,
-        MIN_CLASS_SCORE,
-        NMS_IOU_THRESH,
-        NUM_CLASSES,
-        STRIDES,
-    )
+    from .config import CLASS_NAMES, CLASS_SCORE_SCALES, CONF_THRESH, IMG_SIZE, INFER_CENTER_COMBINE, MAX_OBJECTS_PER_IMAGE, MIN_BOX_SIZE, NMS_IOU_THRESH, NUM_CLASSES, STRIDES
 except Exception:
     # Safe fallbacks when config.py is not present.
     CLASS_NAMES = ["person", "car", "dog", "cat", "chair"]
@@ -54,10 +39,6 @@ except Exception:
     STRIDES = [8, 16, 32]
     MAX_OBJECTS_PER_IMAGE = 15
     MIN_BOX_SIZE = 1.0
-    MIN_CLASS_SCORE = 0.24
-    INTRA_CLASS_CONTAIN_SCORE_EPS = 0.03
-    INTER_CLASS_IOU_SUPPRESS = 0.92
-    INTER_CLASS_CONTAIN_RATIO = 0.85
 
 
 @dataclass
@@ -182,7 +163,6 @@ def decode_level(
     reg_decode: str = "auto",
     center_combine: str = INFER_CENTER_COMBINE,
     background_index: Optional[int] = None,
-    min_class_score: float = MIN_CLASS_SCORE,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Decode one FPN level for a single image.
@@ -229,7 +209,7 @@ def decode_level(
     else:
         conf = cls_score
 
-    keep = (conf > float(conf_thresh)) & (cls_score >= float(min_class_score))
+    keep = conf > float(conf_thresh)
     if not torch.any(keep):
         return (
             torch.zeros((0, 4), dtype=torch.float32, device=device),
@@ -277,7 +257,6 @@ def decode_multilevel(
     reg_decode: str = "auto",
     center_combine: str = INFER_CENTER_COMBINE,
     background_index: Optional[int] = None,
-    min_class_score: float = MIN_CLASS_SCORE,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Decode and confidence-filter all FPN levels for one image in batch.
@@ -318,7 +297,6 @@ def decode_multilevel(
             reg_decode=reg_decode,
             center_combine=center_combine,
             background_index=background_index,
-            min_class_score=float(min_class_score),
         )
 
         if b.numel() > 0:
@@ -403,18 +381,9 @@ def _suppress_same_class_contained(
             if not (cand_inside_kept or kept_inside_cand):
                 continue
 
-            area_ratio = min(candidate_area, kept_area) / max(max(candidate_area, kept_area), 1e-6)
-            if area_ratio < 0.55:
-                # Likely distinct same-class objects at different scales.
-                continue
-
             # If one box fully contains the other and scores are close, prefer
             # the larger box to avoid losing full-object detections.
-            if (
-                kept_inside_cand
-                and candidate_area > kept_area
-                and candidate_score + float(INTRA_CLASS_CONTAIN_SCORE_EPS) >= kept_score
-            ):
+            if kept_inside_cand and candidate_area > kept_area and candidate_score + 0.03 >= kept_score:
                 replace_slot = slot
                 break
 
@@ -424,63 +393,6 @@ def _suppress_same_class_contained(
         if replace_slot >= 0:
             keep[replace_slot] = idx
             continue
-
-        if not drop:
-            keep.append(idx)
-
-    if not keep:
-        device = boxes.device
-        return (
-            torch.zeros((0, 4), dtype=boxes.dtype, device=device),
-            torch.zeros((0,), dtype=scores.dtype, device=device),
-            torch.zeros((0,), dtype=class_ids.dtype, device=device),
-        )
-
-    keep_idx = torch.tensor(keep, dtype=torch.long, device=boxes.device)
-    return boxes[keep_idx], scores[keep_idx], class_ids[keep_idx]
-
-
-def _suppress_cross_class_conflicts(
-    boxes: torch.Tensor,
-    scores: torch.Tensor,
-    class_ids: torch.Tensor,
-    iou_thresh: float = INTER_CLASS_IOU_SUPPRESS,
-    contain_ratio: float = INTER_CLASS_CONTAIN_RATIO,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    if boxes.numel() == 0:
-        return boxes, scores, class_ids
-
-    order = torch.argsort(scores, descending=True)
-    keep: List[int] = []
-
-    for idx in order.tolist():
-        cand_box = boxes[idx]
-        cand_cls = int(class_ids[idx].item())
-        cand_area = _box_area_xyxy(cand_box)
-        drop = False
-
-        for kept_idx in keep:
-            kept_cls = int(class_ids[kept_idx].item())
-            if kept_cls == cand_cls:
-                continue
-
-            kept_box = boxes[kept_idx]
-            kept_area = _box_area_xyxy(kept_box)
-            iou = float(_box_iou_xyxy(cand_box, kept_box.view(1, 4))[0].item())
-            if iou >= float(iou_thresh):
-                drop = True
-                break
-
-            cand_inside_kept = _is_fully_inside_xyxy(cand_box, kept_box)
-            kept_inside_cand = _is_fully_inside_xyxy(kept_box, cand_box)
-            if not (cand_inside_kept or kept_inside_cand):
-                continue
-
-            area_ratio = min(cand_area, kept_area) / max(max(cand_area, kept_area), 1e-6)
-            if area_ratio < float(contain_ratio):
-                continue
-            drop = True
-            break
 
         if not drop:
             keep.append(idx)
@@ -608,7 +520,6 @@ def postprocess_single_image(
     center_combine: str = INFER_CENTER_COMBINE,
     background_index: Optional[int] = None,
     min_box_size: float = MIN_BOX_SIZE,
-    min_class_score: float = MIN_CLASS_SCORE,
 ) -> Dict[str, Any]:
     """
     Full decode + NMS + remap pipeline for one image.
@@ -635,7 +546,6 @@ def postprocess_single_image(
         reg_decode=reg_decode,
         center_combine=center_combine,
         background_index=background_index,
-        min_class_score=min_class_score,
     )
 
     if boxes.numel() == 0:
@@ -661,13 +571,6 @@ def postprocess_single_image(
     cls_ids = cls_ids[valid]
 
     boxes, scores, cls_ids = _suppress_same_class_contained(boxes, scores, cls_ids)
-    boxes, scores, cls_ids = _suppress_cross_class_conflicts(
-        boxes,
-        scores,
-        cls_ids,
-        iou_thresh=float(INTER_CLASS_IOU_SUPPRESS),
-        contain_ratio=float(INTER_CLASS_CONTAIN_RATIO),
-    )
 
     if boxes.shape[0] > int(MAX_OBJECTS_PER_IMAGE):
         topk = torch.argsort(scores, descending=True)[: int(MAX_OBJECTS_PER_IMAGE)]
@@ -707,7 +610,6 @@ def postprocess_batch(
     center_combine: str = INFER_CENTER_COMBINE,
     background_index: Optional[int] = None,
     min_box_size: float = MIN_BOX_SIZE,
-    min_class_score: float = MIN_CLASS_SCORE,
 ) -> List[Dict[str, Any]]:
     """Batch wrapper for JSON-ready predictions."""
     bsz = outputs["cls_logits"][0].shape[0]
@@ -736,7 +638,6 @@ def postprocess_batch(
                 center_combine=center_combine,
                 background_index=background_index,
                 min_box_size=min_box_size,
-                min_class_score=min_class_score,
             )
         )
     return results

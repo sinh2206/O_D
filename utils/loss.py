@@ -398,7 +398,7 @@ def _assign_level_targets(
     ltrb = torch.stack([l, t, r, b], dim=-1)  # (P, N, 4) order l,t,r,b
     tlbr = torch.stack([t, l, b, r], dim=-1)  # (P, N, 4) order t,l,b,r
 
-    inside_box = (ltrb.min(dim=-1).values > -1e-3)
+    inside_box = (ltrb.min(dim=-1).values > 0.0)
 
     # Center sampling region.
     gx = 0.5 * (x1 + x2)
@@ -413,15 +413,7 @@ def _assign_level_targets(
     inside_center = (x >= cx1) & (x <= cx2) & (y >= cy1) & (y <= cy2)
     inside_center = inside_center.to(dtype=torch.bool)
 
-    # Tiny objects can lose all positives if center sampling is too strict.
-    # For those GTs, allow all points inside the GT box.
-    gt_w = (x2 - x1).clamp(min=0.0)
-    gt_h = (y2 - y1).clamp(min=0.0)
-    tiny_limit = 3.0 * float(stride)
-    small_gt = (gt_w <= tiny_limit) | (gt_h <= tiny_limit)
-
-    in_range = torch.ones_like(inside_box, dtype=torch.bool)
-    candidate = inside_box & (inside_center | small_gt)
+    candidate = inside_box & inside_center
 
     if scale_range is not None:
         max_dist = ltrb.max(dim=-1).values
@@ -432,40 +424,8 @@ def _assign_level_targets(
             in_range = max_dist >= lo
         candidate = candidate & in_range
 
-    # Force at least a few positives for tiny objects that still end up with
-    # no valid candidate points on this level.
-    force_match_topk = 4
-    tiny_object_area_px = 1200.0
-    gt_area_flat = _box_area(gt_boxes)
-    if candidate.shape[1] > 0:
-        px = points_xy[:, 0]
-        py = points_xy[:, 1]
-        for gt_i in range(candidate.shape[1]):
-            if torch.any(candidate[:, gt_i]):
-                continue
-            if float(gt_area_flat[gt_i].item()) > tiny_object_area_px:
-                continue
-
-            relaxed = inside_box[:, gt_i] & in_range[:, gt_i]
-            if torch.any(relaxed):
-                candidate[:, gt_i] = relaxed
-                continue
-
-            available = in_range[:, gt_i]
-            if not torch.any(available):
-                available = torch.ones_like(available, dtype=torch.bool)
-            available_idx = torch.where(available)[0]
-            if available_idx.numel() == 0:
-                continue
-
-            dist2 = (px[available_idx] - gx[0, gt_i]) ** 2 + (py[available_idx] - gy[0, gt_i]) ** 2
-            k = min(force_match_topk, int(available_idx.numel()))
-            top_local = torch.topk(dist2, k=k, largest=False).indices
-            force_idx = available_idx[top_local]
-            candidate[force_idx, gt_i] = True
-
     # Resolve overlaps by smallest GT area.
-    gt_area = gt_area_flat.view(1, -1).expand(p, -1)
+    gt_area = _box_area(gt_boxes).view(1, -1).expand(p, -1)
     inf = torch.full_like(gt_area, 1e12)
     candidate_area = torch.where(candidate, gt_area, inf)
 

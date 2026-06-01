@@ -6,7 +6,7 @@ import json
 import random
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import albumentations as A
 import cv2
@@ -39,7 +39,6 @@ from utils.config import (
 )
 from utils.loss import DetectionLoss
 from utils.model import AnchorFreeDetector
-from utils.runtime import create_grad_scaler, resolve_num_workers, should_pin_memory
 
 VALID_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 
@@ -90,9 +89,9 @@ def build_sample_weights(samples: List[Sample], class_weights: torch.Tensor) -> 
     ws = np.ones((len(samples),), dtype=np.float64)
     for i, s in enumerate(samples):
         if len(s.labels) == 0:
-            # Slightly upsample empty scenes; they are important for lowering
+            # Do not downsample empty scenes; they are important for lowering
             # false positives on background-only images.
-            ws[i] = 1.20
+            ws[i] = 1.0
             continue
         labels = np.asarray(s.labels, dtype=np.int64)
         labels = labels[(labels >= 0) & (labels < len(cw))]
@@ -249,11 +248,11 @@ def make_pad_if_needed(img_size: int):
 def get_train_transforms(img_size: int) -> A.Compose:
     affine_params = inspect.signature(A.Affine.__init__).parameters
     affine_kwargs = dict(
-        scale=(0.90, 1.20),
+        scale=(0.85, 1.25),
         translate_percent=(-0.04, 0.04),
-        rotate=(-3, 3),
+        rotate=(-4, 4),
         shear=(-1.0, 1.0),
-        p=0.15,
+        p=0.20,
     )
     if "border_mode" in affine_params:
         affine_kwargs["border_mode"] = cv2.BORDER_CONSTANT
@@ -277,16 +276,17 @@ def get_train_transforms(img_size: int) -> A.Compose:
 
     downscale_params = inspect.signature(A.Downscale.__init__).parameters
     if "scale_range" in downscale_params:
-        downscale_aug = A.Downscale(scale_range=(0.72, 0.92), p=1.0)
+        downscale_aug = A.Downscale(scale_range=(0.60, 0.85), p=1.0)
     else:
-        downscale_aug = A.Downscale(scale_min=0.72, scale_max=0.92, p=1.0)
+        downscale_aug = A.Downscale(scale_min=0.60, scale_max=0.85, p=1.0)
 
     return A.Compose(
         [
             A.LongestMaxSize(max_size=img_size, interpolation=cv2.INTER_LINEAR),
             make_pad_if_needed(img_size),
             A.HorizontalFlip(p=0.5),
-            A.RandomRotate90(p=0.03),
+            A.VerticalFlip(p=0.08),
+            A.RandomRotate90(p=0.22),
             A.CLAHE(clip_limit=2.2, tile_grid_size=(8, 8), p=0.2),
             A.OneOf(
                 [
@@ -294,11 +294,9 @@ def get_train_transforms(img_size: int) -> A.Compose:
                     A.MotionBlur(blur_limit=5, p=1.0),
                     downscale_aug,
                 ],
-                p=0.18,
+                p=0.30,
             ),
-            A.Sharpen(alpha=(0.05, 0.22), lightness=(0.88, 1.18), p=0.16),
             A.RandomGamma(gamma_limit=(88, 122), p=0.25),
-            A.RandomBrightnessContrast(brightness_limit=0.14, contrast_limit=0.14, p=0.25),
             A.ColorJitter(brightness=0.12, contrast=0.12, saturation=0.1, hue=0.05, p=0.45),
             affine,
             A.Normalize(mean=MEAN, std=STD),
@@ -395,7 +393,6 @@ def make_dataloader(
     batch_size: int,
     shuffle: bool,
     num_workers: int,
-    pin_memory: bool,
     sampler: Optional[WeightedRandomSampler] = None,
 ) -> DataLoader:
     return DataLoader(
@@ -404,7 +401,7 @@ def make_dataloader(
         shuffle=(shuffle and sampler is None),
         sampler=sampler,
         num_workers=num_workers,
-        pin_memory=bool(pin_memory),
+        pin_memory=True,
         persistent_workers=(num_workers > 0),
         drop_last=False,
         collate_fn=collate_fn,
@@ -417,7 +414,7 @@ def train_one_epoch(
     loader: DataLoader,
     optimizer: torch.optim.Optimizer,
     device: torch.device,
-    scaler: Any,
+    scaler: torch.cuda.amp.GradScaler,
     amp_enabled: bool,
 ) -> Dict[str, float]:
     model.train()
@@ -535,8 +532,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--val_image_dir", type=Path, required=True)
     parser.add_argument("--checkpoint_dir", type=Path, default=Path("./models"))
     parser.add_argument("--img_size", type=int, default=IMG_SIZE)
-    parser.add_argument("--batch_size", type=int, default=8)
-    parser.add_argument("--epochs", type=int, default=20)
+    parser.add_argument("--batch_size", type=int, default=4)
+    parser.add_argument("--epochs", type=int, default=25)
     parser.add_argument("--lr_backbone", type=float, default=2e-4)
     parser.add_argument("--lr_head", type=float, default=2e-3)
     parser.add_argument("--weight_decay", type=float, default=1e-4)
@@ -570,13 +567,6 @@ def main() -> None:
     train_ds = DetectionDataset(train_samples, transforms=get_train_transforms(args.img_size))
     val_ds = DetectionDataset(val_samples, transforms=get_val_transforms(args.img_size))
 
-    resolved_workers, max_workers = resolve_num_workers(int(args.num_workers))
-    if resolved_workers != int(args.num_workers):
-        print(
-            f"Adjusted num_workers from {args.num_workers} to {resolved_workers} "
-            f"(max suggested on this runtime: {max_workers})"
-        )
-
     class_weights = None if args.no_class_weights else compute_class_weights(num_classes=num_classes)
     train_sampler = None
     if not args.no_balanced_sampling and class_weights is not None:
@@ -591,17 +581,10 @@ def main() -> None:
         train_ds,
         batch_size=args.batch_size,
         shuffle=True,
-        num_workers=resolved_workers,
-        pin_memory=should_pin_memory(device),
+        num_workers=args.num_workers,
         sampler=train_sampler,
     )
-    val_loader = make_dataloader(
-        val_ds,
-        batch_size=args.batch_size,
-        shuffle=False,
-        num_workers=resolved_workers,
-        pin_memory=should_pin_memory(device),
-    )
+    val_loader = make_dataloader(val_ds, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers)
 
     model = AnchorFreeDetector(num_classes=num_classes, pretrained=True).to(device).to(memory_format=torch.channels_last)
     criterion = DetectionLoss(
@@ -614,7 +597,7 @@ def main() -> None:
     ).to(device)
     optimizer = build_optimizer(model, lr_backbone=args.lr_backbone, lr_head=args.lr_head, weight_decay=args.weight_decay)
     scheduler = CosineAnnealingLR(optimizer, T_max=max(args.epochs, 1))
-    scaler = create_grad_scaler(device, enabled=amp_enabled)
+    scaler = torch.cuda.amp.GradScaler(enabled=amp_enabled)
 
     start_epoch = 1
     best_val_loss = float("inf")
