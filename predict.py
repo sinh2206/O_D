@@ -16,6 +16,7 @@ from utils.config import (
     CLASS_CONF_THRESH,
     CLASS_NAMES,
     CONF_THRESH,
+    DEFAULT_SEED,
     LOW_LIGHT_CLAHE_CLIP,
     LOW_LIGHT_GAMMA,
     LOW_LIGHT_MEAN_THRESH,
@@ -31,6 +32,7 @@ from utils.config import (
 )
 from utils.model import AnchorFreeDetector
 from utils.nms import LetterboxMeta, postprocess_batch
+from utils.runtime import set_global_seed
 
 VALID_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 DEFAULT_VAL_IMAGE_DIR = Path("public/val/images")
@@ -787,12 +789,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--chair_suppress_iou", type=float, default=CHAIR_SUPPRESS_WITH_PERSON_IOU)
     parser.add_argument("--hardcase_topk", type=int, default=50)
     parser.add_argument("--hardcase_iou", type=float, default=0.5)
+    parser.add_argument("--seed", type=int, default=DEFAULT_SEED)
     parser.add_argument("--device", type=str, default="auto", choices=["auto", "cuda", "cpu"])
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
+    set_global_seed(seed=int(args.seed), deterministic=True)
     if not args.checkpoint.exists():
         raise FileNotFoundError(f"Checkpoint not found: {args.checkpoint}")
     if not args.image_dir.exists():
@@ -811,8 +815,8 @@ def main() -> None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     else:
         device = torch.device(args.device)
-    torch.backends.cuda.matmul.allow_tf32 = True
-    torch.backends.cudnn.allow_tf32 = True
+    torch.backends.cuda.matmul.allow_tf32 = False
+    torch.backends.cudnn.allow_tf32 = False
     torch.set_float32_matmul_precision("high")
 
     model, ckpt_classes, ckpt_img_size = load_checkpoint_model(args.checkpoint, device=device)
@@ -864,6 +868,7 @@ def main() -> None:
     )
 
     print(f"Device: {device}")
+    print(f"Seed: {args.seed}")
     ckpt_meta = torch.load(str(args.checkpoint), map_location="cpu")
     print(
         "Checkpoint meta: "

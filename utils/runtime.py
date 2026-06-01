@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import os
+import random
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional, Tuple
 
+import numpy as np
 import torch
 from torch.optim import AdamW
-from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
+from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, ReduceLROnPlateau, SequentialLR
 
 
 def resolve_device(preferred: str = "auto") -> torch.device:
@@ -68,6 +71,59 @@ def create_grad_scaler(device: torch.device, enabled: bool) -> Any:
         except TypeError:
             return torch.amp.GradScaler(enabled=amp_enabled)
     return torch.cuda.amp.GradScaler(enabled=amp_enabled)
+
+
+def set_global_seed(seed: int, deterministic: bool = True) -> None:
+    seed = int(seed)
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    os.environ["PYTHONHASHSEED"] = str(seed)
+
+    if deterministic:
+        if hasattr(torch, "use_deterministic_algorithms"):
+            try:
+                torch.use_deterministic_algorithms(True, warn_only=True)
+            except TypeError:
+                torch.use_deterministic_algorithms(True)
+        if hasattr(torch.backends, "cudnn"):
+            torch.backends.cudnn.deterministic = True
+            torch.backends.cudnn.benchmark = False
+        if torch.cuda.is_available():
+            os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+
+
+@dataclass
+class EarlyStopping:
+    patience: int = 5
+    min_delta: float = 1e-4
+    mode: str = "min"
+    best: Optional[float] = None
+    bad_epochs: int = 0
+
+    def update(self, value: float) -> Tuple[bool, bool]:
+        current = float(value)
+        improved = False
+        mode = str(self.mode).strip().lower()
+
+        if self.best is None:
+            improved = True
+        elif mode == "min":
+            improved = current < (float(self.best) - float(self.min_delta))
+        elif mode == "max":
+            improved = current > (float(self.best) + float(self.min_delta))
+        else:
+            raise ValueError(f"Unsupported EarlyStopping mode: {self.mode}")
+
+        if improved:
+            self.best = current
+            self.bad_epochs = 0
+            return True, False
+
+        self.bad_epochs += 1
+        should_stop = self.bad_epochs >= max(1, int(self.patience))
+        return False, bool(should_stop)
 
 
 def save_checkpoint(
@@ -147,9 +203,23 @@ def get_optimizer(
 def get_scheduler(
     optimizer: torch.optim.Optimizer,
     epochs: int,
+    mode: str = "cosine",
     warmup_epochs: int = 3,
     min_lr_ratio: float = 0.05,
+    plateau_factor: float = 0.5,
+    plateau_patience: int = 2,
+    plateau_min_lr: float = 1e-6,
 ) -> torch.optim.lr_scheduler.LRScheduler:
+    mode = str(mode).strip().lower()
+    if mode == "plateau":
+        return ReduceLROnPlateau(
+            optimizer,
+            mode="min",
+            factor=float(plateau_factor),
+            patience=max(1, int(plateau_patience)),
+            min_lr=float(plateau_min_lr),
+        )
+
     total_epochs = max(1, int(epochs))
     warm = max(0, min(int(warmup_epochs), total_epochs - 1))
 

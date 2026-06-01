@@ -52,3 +52,24 @@ LAMBDA_CLS = 1.25
 LAMBDA_REG = 1.0
 LAMBDA_CTR = 0.35
 LABEL_SMOOTHING = 0.0
+
+# Reproducibility defaults.
+DEFAULT_SEED = 42
+
+# Training policy defaults.
+DEFAULT_SCHEDULER = "plateau"  # "plateau" or "cosine"
+PLATEAU_FACTOR = 0.5
+PLATEAU_PATIENCE = 2
+PLATEAU_MIN_LR = 1e-6
+
+EARLY_STOP_PATIENCE = 5
+EARLY_STOP_DELTA = 1e-4
+
+# Strong augmentation defaults.
+MOSAIC_PROB = 0.35
+MIXUP_PROB = 0.20
+
+# Online validation mAP settings.
+MAP_EVAL_INTERVAL = 2
+MAP_CONF_THRESH = 0.35
+MAP_NMS_THRESH = 0.50
