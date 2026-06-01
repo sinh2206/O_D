@@ -90,7 +90,7 @@ class DistributedWeightedSampler(Sampler[int]):
         replacement: bool = True,
         seed: int = 42,
     ) -> None:
-        super().__init__(None)
+        super().__init__()
         if num_replicas <= 0:
             raise ValueError("num_replicas must be > 0")
         if rank < 0 or rank >= num_replicas:
@@ -968,7 +968,10 @@ def main() -> None:
                     print(f"Saved best checkpoint: {best_path} (val_loss={best_val_loss:.4f})")
 
             if dist_env.enabled:
-                dist.barrier()
+                if device.type == "cuda":
+                    dist.barrier(device_ids=[torch.cuda.current_device()])
+                else:
+                    dist.barrier()
 
         if is_main_process(dist_env):
             if not best_path.exists():

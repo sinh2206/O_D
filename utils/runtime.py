@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import inspect
 from dataclasses import dataclass
 from datetime import timedelta
 from pathlib import Path
@@ -48,20 +49,41 @@ def init_distributed(
     if backend == "nccl" and not torch.cuda.is_available():
         raise RuntimeError("NCCL backend requested but CUDA is not available.")
 
-    dist.init_process_group(
-        backend=backend,
-        init_method="env://",
-        rank=env.rank,
-        world_size=env.world_size,
-        timeout=timedelta(minutes=float(timeout_minutes)),
-    )
+    kwargs = {
+        "backend": backend,
+        "init_method": "env://",
+        "rank": env.rank,
+        "world_size": env.world_size,
+        "timeout": timedelta(minutes=float(timeout_minutes)),
+    }
+
+    # Ensure each rank binds to the expected CUDA device before NCCL init.
+    if backend == "nccl" and torch.cuda.is_available():
+        torch.cuda.set_device(int(env.local_rank))
+        try:
+            sig = inspect.signature(dist.init_process_group)
+            has_device_id = "device_id" in sig.parameters
+        except (TypeError, ValueError):
+            has_device_id = False
+        if has_device_id:
+            kwargs["device_id"] = torch.device("cuda", int(env.local_rank))
+
+    try:
+        dist.init_process_group(**kwargs)
+    except TypeError:
+        # Compatibility fallback for torch versions without `device_id`.
+        kwargs.pop("device_id", None)
+        dist.init_process_group(**kwargs)
 
 
 def cleanup_distributed() -> None:
     if not dist.is_available() or not dist.is_initialized():
         return
     try:
-        dist.barrier()
+        if dist.get_backend() == "nccl" and torch.cuda.is_available():
+            dist.barrier(device_ids=[torch.cuda.current_device()])
+        else:
+            dist.barrier()
     except Exception:
         pass
     dist.destroy_process_group()
