@@ -16,6 +16,10 @@ from utils.config import (
     CLASS_CONF_THRESH,
     CLASS_NAMES,
     CONF_THRESH,
+    INTER_CLASS_CONTAIN_RATIO,
+    INTER_CLASS_IOU_SUPPRESS,
+    LARGE_BOX_AREA_RATIO,
+    LARGE_BOX_LOW_CONF,
     LOW_LIGHT_CLAHE_CLIP,
     LOW_LIGHT_GAMMA,
     LOW_LIGHT_MEAN_THRESH,
@@ -23,6 +27,7 @@ from utils.config import (
     INFER_CENTER_COMBINE,
     MAX_OBJECTS_PER_IMAGE,
     MIN_BOX_SIZE,
+    MIN_CLASS_SCORE,
     MIN_EXPORT_CONF,
     MEAN,
     NMS_IOU_THRESH,
@@ -178,6 +183,11 @@ def _suppress_same_class_contained_int(boxes: List[dict]) -> List[dict]:
             if not (cand_inside_kept or kept_inside_cand):
                 continue
 
+            area_ratio = min(area, kept_area) / max(max(area, kept_area), 1e-6)
+            if area_ratio < 0.55:
+                # Keep likely distinct same-class objects with very different size.
+                continue
+
             if kept_inside_cand and area > kept_area and score + 0.03 >= kept_score:
                 replace_idx = k_idx
                 break
@@ -195,6 +205,60 @@ def _suppress_same_class_contained_int(boxes: List[dict]) -> List[dict]:
             new_box = dict(box)
             new_box["bbox"] = bbox_i
             kept.append(new_box)
+
+    return kept
+
+
+def _box_iou_int(a: Sequence[int], b: Sequence[int]) -> float:
+    xx1 = max(int(a[0]), int(b[0]))
+    yy1 = max(int(a[1]), int(b[1]))
+    xx2 = min(int(a[2]), int(b[2]))
+    yy2 = min(int(a[3]), int(b[3]))
+    w = max(0, xx2 - xx1)
+    h = max(0, yy2 - yy1)
+    inter = float(w * h)
+    area_a = float(max(0, int(a[2]) - int(a[0])) * max(0, int(a[3]) - int(a[1])))
+    area_b = float(max(0, int(b[2]) - int(b[0])) * max(0, int(b[3]) - int(b[1])))
+    return inter / max(area_a + area_b - inter, 1e-6)
+
+
+def _suppress_cross_class_conflicts_int(
+    boxes: List[dict],
+    iou_thresh: float = INTER_CLASS_IOU_SUPPRESS,
+    contain_ratio: float = INTER_CLASS_CONTAIN_RATIO,
+) -> List[dict]:
+    ordered = sorted(boxes, key=lambda b: float(b.get("confidence", 0.0)), reverse=True)
+    kept: List[dict] = []
+
+    for box in ordered:
+        cls = str(box.get("class", ""))
+        bbox = box.get("bbox", [])
+        if not isinstance(bbox, list) or len(bbox) != 4:
+            continue
+        bbox_i = [int(v) for v in bbox]
+        area_i = float(max(0, bbox_i[2] - bbox_i[0]) * max(0, bbox_i[3] - bbox_i[1]))
+
+        drop = False
+        for kept_box in kept:
+            if str(kept_box.get("class", "")) == cls:
+                continue
+            kept_bbox = [int(v) for v in kept_box.get("bbox", [0, 0, 0, 0])]
+            kept_area = float(max(0, kept_bbox[2] - kept_bbox[0]) * max(0, kept_bbox[3] - kept_bbox[1]))
+            iou = _box_iou_int(bbox_i, kept_bbox)
+            if iou >= float(iou_thresh):
+                drop = True
+                break
+            if not (_is_fully_inside(bbox_i, kept_bbox) or _is_fully_inside(kept_bbox, bbox_i)):
+                continue
+            area_ratio = min(area_i, kept_area) / max(max(area_i, kept_area), 1e-6)
+            if area_ratio >= float(contain_ratio):
+                drop = True
+                break
+
+        if not drop:
+            box_new = dict(box)
+            box_new["bbox"] = bbox_i
+            kept.append(box_new)
 
     return kept
 
@@ -310,6 +374,10 @@ def sanitize_predictions_for_export(
                 else:
                     continue
 
+            area_ratio = (float(ix2 - ix1) * float(iy2 - iy1)) / max(float(w * h), 1.0)
+            if area_ratio >= float(LARGE_BOX_AREA_RATIO) and conf < float(LARGE_BOX_LOW_CONF):
+                continue
+
             cleaned.append(
                 {
                     "class": cls_name,
@@ -319,6 +387,7 @@ def sanitize_predictions_for_export(
             )
 
         cleaned = _suppress_same_class_contained_int(cleaned)
+        cleaned = _suppress_cross_class_conflicts_int(cleaned)
         cleaned = sorted(cleaned, key=lambda b: float(b.get("confidence", 0.0)), reverse=True)[: max(0, int(max_objects))]
         out.append({"image_id": image_id, "boxes": cleaned})
 
@@ -656,6 +725,7 @@ def run_inference(
     nms_thresh: float,
     class_names: Sequence[str],
     center_combine: str = INFER_CENTER_COMBINE,
+    min_class_score: float = MIN_CLASS_SCORE,
 ) -> List[dict]:
     def _infer_batch(
         batch_tensors: List[torch.Tensor],
@@ -663,6 +733,7 @@ def run_inference(
         batch_metas: List[LetterboxMeta],
         conf_value: float,
         center_mode: str,
+        min_cls_score: float,
     ) -> List[dict]:
         images = torch.stack(batch_tensors, dim=0).to(device, non_blocking=True).to(memory_format=torch.channels_last)
         with torch.autocast(device_type=device.type, enabled=amp_enabled):
@@ -679,11 +750,13 @@ def run_inference(
             reg_decode="auto",
             center_combine=str(center_mode),
             min_box_size=MIN_BOX_SIZE,
+            min_class_score=float(min_cls_score),
         )
 
     results: List[dict] = []
     amp_enabled = device.type == "cuda"
     fallback_conf = max(0.12, float(conf_thresh) * 0.65)
+    fallback_cls_score = max(0.16, float(min_class_score) * 0.75)
 
     for start in range(0, len(image_paths), batch_size):
         batch_paths = image_paths[start : start + batch_size]
@@ -711,10 +784,11 @@ def run_inference(
             batch_metas=metas,
             conf_value=float(conf_thresh),
             center_mode=str(center_combine),
+            min_cls_score=float(min_class_score),
         )
 
-        # Fallback only for empty outputs: lower confidence once on original
-        # image, then try horizontal-flip inference if still empty.
+        # Empty-image fallback: slightly lower thresholds on original view,
+        # then try horizontal flip if still empty.
         for i, pred in enumerate(batch_results):
             if len(pred.get("boxes", [])) > 0:
                 continue
@@ -730,6 +804,7 @@ def run_inference(
                 batch_metas=[m_low],
                 conf_value=float(fallback_conf),
                 center_mode="sqrt",
+                min_cls_score=float(fallback_cls_score),
             )[0]
             if len(low_res.get("boxes", [])) > 0:
                 batch_results[i] = low_res
@@ -743,6 +818,7 @@ def run_inference(
                 batch_metas=[m_flip],
                 conf_value=float(fallback_conf),
                 center_mode="sqrt",
+                min_cls_score=float(fallback_cls_score),
             )[0]
             if len(flip_res.get("boxes", [])) == 0:
                 continue
@@ -763,7 +839,6 @@ def run_inference(
                 remapped_boxes.append(new_item)
 
             batch_results[i] = {"image_id": image_ids[i], "boxes": remapped_boxes}
-
         results.extend(batch_results)
 
     return results
@@ -841,6 +916,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--chair_suppress_iou", type=float, default=CHAIR_SUPPRESS_WITH_PERSON_IOU)
     parser.add_argument("--hardcase_topk", type=int, default=50)
     parser.add_argument("--hardcase_iou", type=float, default=0.5)
+    parser.add_argument("--min_class_score", type=float, default=MIN_CLASS_SCORE)
     parser.add_argument("--device", type=str, default="auto", choices=["auto", "cuda", "cpu"])
     return parser.parse_args()
 
@@ -892,6 +968,7 @@ def main() -> None:
         nms_thresh=float(args.nms_thresh),
         class_names=class_names,
         center_combine=str(args.center_combine),
+        min_class_score=float(args.min_class_score),
     )
     predictions = apply_class_thresholds(predictions, class_names=class_names, class_conf_thresh=class_conf)
     predictions = suppress_chair_inside_person(predictions, iou_thresh=float(args.chair_suppress_iou))

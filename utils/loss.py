@@ -28,7 +28,6 @@ import torch.nn.functional as F
 try:
     from .config import (
         CENTER_RADIUS,
-        FORCE_MATCH_TOPK,
         FOCAL_ALPHA,
         FOCAL_GAMMA,
         LABEL_SMOOTHING,
@@ -38,17 +37,12 @@ try:
         NEGATIVE_FOCAL_WEIGHT,
         NUM_CLASSES,
         STRIDES,
-        TARGET_INSIDE_EPS,
-        TINY_OBJECT_AREA_PX,
     )
 except Exception:
     # Safe fallbacks so this module still works if config.py is not available.
     NUM_CLASSES = 5
     STRIDES = [8, 16, 32]
     CENTER_RADIUS = 2.0
-    FORCE_MATCH_TOPK = 4
-    TARGET_INSIDE_EPS = 1e-3
-    TINY_OBJECT_AREA_PX = 1200.0
     FOCAL_GAMMA = 2.0
     FOCAL_ALPHA = 0.25
     LABEL_SMOOTHING = 0.01
@@ -404,7 +398,7 @@ def _assign_level_targets(
     ltrb = torch.stack([l, t, r, b], dim=-1)  # (P, N, 4) order l,t,r,b
     tlbr = torch.stack([t, l, b, r], dim=-1)  # (P, N, 4) order t,l,b,r
 
-    inside_box = ltrb.min(dim=-1).values > (-float(TARGET_INSIDE_EPS))
+    inside_box = (ltrb.min(dim=-1).values > -1e-3)
 
     # Center sampling region.
     gx = 0.5 * (x1 + x2)
@@ -419,8 +413,15 @@ def _assign_level_targets(
     inside_center = (x >= cx1) & (x <= cx2) & (y >= cy1) & (y <= cy2)
     inside_center = inside_center.to(dtype=torch.bool)
 
+    # Tiny objects can lose all positives if center sampling is too strict.
+    # For those GTs, allow all points inside the GT box.
+    gt_w = (x2 - x1).clamp(min=0.0)
+    gt_h = (y2 - y1).clamp(min=0.0)
+    tiny_limit = 3.0 * float(stride)
+    small_gt = (gt_w <= tiny_limit) | (gt_h <= tiny_limit)
+
     in_range = torch.ones_like(inside_box, dtype=torch.bool)
-    candidate = inside_box & inside_center
+    candidate = inside_box & (inside_center | small_gt)
 
     if scale_range is not None:
         max_dist = ltrb.max(dim=-1).values
@@ -431,9 +432,10 @@ def _assign_level_targets(
             in_range = max_dist >= lo
         candidate = candidate & in_range
 
-    # Tiny or heavily occluded objects may not have any point that satisfies
-    # both inside-box and center-sampling constraints on a level. Force a few
-    # nearest points so each tiny GT still contributes positive supervision.
+    # Force at least a few positives for tiny objects that still end up with
+    # no valid candidate points on this level.
+    force_match_topk = 4
+    tiny_object_area_px = 1200.0
     gt_area_flat = _box_area(gt_boxes)
     if candidate.shape[1] > 0:
         px = points_xy[:, 0]
@@ -441,7 +443,7 @@ def _assign_level_targets(
         for gt_i in range(candidate.shape[1]):
             if torch.any(candidate[:, gt_i]):
                 continue
-            if float(gt_area_flat[gt_i].item()) > float(TINY_OBJECT_AREA_PX):
+            if float(gt_area_flat[gt_i].item()) > tiny_object_area_px:
                 continue
 
             relaxed = inside_box[:, gt_i] & in_range[:, gt_i]
@@ -457,7 +459,7 @@ def _assign_level_targets(
                 continue
 
             dist2 = (px[available_idx] - gx[0, gt_i]) ** 2 + (py[available_idx] - gy[0, gt_i]) ** 2
-            k = min(int(FORCE_MATCH_TOPK), int(available_idx.numel()))
+            k = min(force_match_topk, int(available_idx.numel()))
             top_local = torch.topk(dist2, k=k, largest=False).indices
             force_idx = available_idx[top_local]
             candidate[force_idx, gt_i] = True

@@ -6,7 +6,7 @@ import json
 import random
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import albumentations as A
 import cv2
@@ -15,7 +15,7 @@ import torch
 from albumentations.pytorch import ToTensorV2
 from torch import nn
 from torch.optim import AdamW
-from torch.optim.lr_scheduler import ReduceLROnPlateau
+from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
 
 from utils.config import (
@@ -90,9 +90,9 @@ def build_sample_weights(samples: List[Sample], class_weights: torch.Tensor) -> 
     ws = np.ones((len(samples),), dtype=np.float64)
     for i, s in enumerate(samples):
         if len(s.labels) == 0:
-            # Do not downsample empty scenes; they are important for lowering
+            # Slightly upsample empty scenes; they are important for lowering
             # false positives on background-only images.
-            ws[i] = 1.0
+            ws[i] = 1.20
             continue
         labels = np.asarray(s.labels, dtype=np.int64)
         labels = labels[(labels >= 0) & (labels < len(cw))]
@@ -246,43 +246,14 @@ def make_pad_if_needed(img_size: int):
     return A.PadIfNeeded(**kwargs)
 
 
-def make_coarse_dropout() -> A.BasicTransform:
-    params = inspect.signature(A.CoarseDropout.__init__).parameters
-    if "num_holes_range" in params:
-        kwargs = {
-            "num_holes_range": (1, 4),
-            "hole_height_range": (0.04, 0.18),
-            "hole_width_range": (0.04, 0.18),
-            "fill": 114,
-            "p": 0.20,
-        }
-        if "fill_mask" in params:
-            kwargs["fill_mask"] = 0
-        return A.CoarseDropout(**kwargs)
-
-    kwargs = {
-        "max_holes": 4,
-        "min_holes": 1,
-        "max_height": 72,
-        "max_width": 72,
-        "min_height": 12,
-        "min_width": 12,
-        "fill_value": 114,
-        "p": 0.20,
-    }
-    if "mask_fill_value" in params:
-        kwargs["mask_fill_value"] = 0
-    return A.CoarseDropout(**kwargs)
-
-
 def get_train_transforms(img_size: int) -> A.Compose:
     affine_params = inspect.signature(A.Affine.__init__).parameters
     affine_kwargs = dict(
-        scale=(0.85, 1.25),
+        scale=(0.90, 1.20),
         translate_percent=(-0.04, 0.04),
-        rotate=(-4, 4),
+        rotate=(-3, 3),
         shear=(-1.0, 1.0),
-        p=0.20,
+        p=0.15,
     )
     if "border_mode" in affine_params:
         affine_kwargs["border_mode"] = cv2.BORDER_CONSTANT
@@ -306,15 +277,16 @@ def get_train_transforms(img_size: int) -> A.Compose:
 
     downscale_params = inspect.signature(A.Downscale.__init__).parameters
     if "scale_range" in downscale_params:
-        downscale_aug = A.Downscale(scale_range=(0.75, 0.92), p=1.0)
+        downscale_aug = A.Downscale(scale_range=(0.72, 0.92), p=1.0)
     else:
-        downscale_aug = A.Downscale(scale_min=0.75, scale_max=0.92, p=1.0)
+        downscale_aug = A.Downscale(scale_min=0.72, scale_max=0.92, p=1.0)
 
     return A.Compose(
         [
             A.LongestMaxSize(max_size=img_size, interpolation=cv2.INTER_LINEAR),
             make_pad_if_needed(img_size),
             A.HorizontalFlip(p=0.5),
+            A.RandomRotate90(p=0.03),
             A.CLAHE(clip_limit=2.2, tile_grid_size=(8, 8), p=0.2),
             A.OneOf(
                 [
@@ -322,11 +294,12 @@ def get_train_transforms(img_size: int) -> A.Compose:
                     A.MotionBlur(blur_limit=5, p=1.0),
                     downscale_aug,
                 ],
-                p=0.22,
+                p=0.18,
             ),
+            A.Sharpen(alpha=(0.05, 0.22), lightness=(0.88, 1.18), p=0.16),
             A.RandomGamma(gamma_limit=(88, 122), p=0.25),
+            A.RandomBrightnessContrast(brightness_limit=0.14, contrast_limit=0.14, p=0.25),
             A.ColorJitter(brightness=0.12, contrast=0.12, saturation=0.1, hue=0.05, p=0.45),
-            make_coarse_dropout(),
             affine,
             A.Normalize(mean=MEAN, std=STD),
             ToTensorV2(),
@@ -422,14 +395,9 @@ def make_dataloader(
     batch_size: int,
     shuffle: bool,
     num_workers: int,
+    pin_memory: bool,
     sampler: Optional[WeightedRandomSampler] = None,
-    pin_memory: bool = False,
 ) -> DataLoader:
-    kwargs = {}
-    if num_workers > 0:
-        kwargs["prefetch_factor"] = 2
-        kwargs["persistent_workers"] = True
-
     return DataLoader(
         dataset,
         batch_size=batch_size,
@@ -437,9 +405,9 @@ def make_dataloader(
         sampler=sampler,
         num_workers=num_workers,
         pin_memory=bool(pin_memory),
+        persistent_workers=(num_workers > 0),
         drop_last=False,
         collate_fn=collate_fn,
-        **kwargs,
     )
 
 
@@ -449,7 +417,7 @@ def train_one_epoch(
     loader: DataLoader,
     optimizer: torch.optim.Optimizer,
     device: torch.device,
-    scaler,
+    scaler: Any,
     amp_enabled: bool,
 ) -> Dict[str, float]:
     model.train()
@@ -537,7 +505,7 @@ def save_checkpoint(
     path: Path,
     model: nn.Module,
     optimizer: torch.optim.Optimizer,
-    scheduler: torch.optim.lr_scheduler.LRScheduler,
+    scheduler: CosineAnnealingLR,
     epoch: int,
     best_val_loss: float,
     classes: List[str],
@@ -568,20 +536,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--checkpoint_dir", type=Path, default=Path("./models"))
     parser.add_argument("--img_size", type=int, default=IMG_SIZE)
     parser.add_argument("--batch_size", type=int, default=8)
-    parser.add_argument("--epochs", type=int, default=25)
+    parser.add_argument("--epochs", type=int, default=20)
     parser.add_argument("--lr_backbone", type=float, default=2e-4)
     parser.add_argument("--lr_head", type=float, default=2e-3)
     parser.add_argument("--weight_decay", type=float, default=1e-4)
-    parser.add_argument("--num_workers", type=int, default=-1)
+    parser.add_argument("--num_workers", type=int, default=2)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--resume", type=Path, default=None)
     parser.add_argument("--label_smoothing", type=float, default=LABEL_SMOOTHING)
     parser.add_argument("--center_radius", type=float, default=CENTER_RADIUS)
-    parser.add_argument("--lr_patience", type=int, default=2)
-    parser.add_argument("--lr_factor", type=float, default=0.5)
-    parser.add_argument("--min_lr", type=float, default=1e-6)
-    parser.add_argument("--early_stop_patience", type=int, default=6)
-    parser.add_argument("--early_stop_min_delta", type=float, default=1e-4)
     parser.add_argument("--no_scale_ranges", action="store_true")
     parser.add_argument("--no_balanced_sampling", action="store_true")
     parser.add_argument("--no_class_weights", action="store_true")
@@ -599,8 +562,6 @@ def main() -> None:
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     amp_enabled = (device.type == "cuda") and (not args.no_amp)
-    resolved_workers, max_workers = resolve_num_workers(int(args.num_workers))
-    pin_memory = should_pin_memory(device)
 
     train_samples, classes = parse_samples(args.train_data, args.image_dir, class_names=None)
     val_samples, _ = parse_samples(args.val_data, args.val_image_dir, class_names=classes)
@@ -608,6 +569,13 @@ def main() -> None:
 
     train_ds = DetectionDataset(train_samples, transforms=get_train_transforms(args.img_size))
     val_ds = DetectionDataset(val_samples, transforms=get_val_transforms(args.img_size))
+
+    resolved_workers, max_workers = resolve_num_workers(int(args.num_workers))
+    if resolved_workers != int(args.num_workers):
+        print(
+            f"Adjusted num_workers from {args.num_workers} to {resolved_workers} "
+            f"(max suggested on this runtime: {max_workers})"
+        )
 
     class_weights = None if args.no_class_weights else compute_class_weights(num_classes=num_classes)
     train_sampler = None
@@ -624,15 +592,15 @@ def main() -> None:
         batch_size=args.batch_size,
         shuffle=True,
         num_workers=resolved_workers,
+        pin_memory=should_pin_memory(device),
         sampler=train_sampler,
-        pin_memory=pin_memory,
     )
     val_loader = make_dataloader(
         val_ds,
         batch_size=args.batch_size,
         shuffle=False,
         num_workers=resolved_workers,
-        pin_memory=pin_memory,
+        pin_memory=should_pin_memory(device),
     )
 
     model = AnchorFreeDetector(num_classes=num_classes, pretrained=True).to(device).to(memory_format=torch.channels_last)
@@ -645,16 +613,8 @@ def main() -> None:
         use_scale_ranges=not args.no_scale_ranges,
     ).to(device)
     optimizer = build_optimizer(model, lr_backbone=args.lr_backbone, lr_head=args.lr_head, weight_decay=args.weight_decay)
-    scheduler = ReduceLROnPlateau(
-        optimizer,
-        mode="min",
-        factor=float(args.lr_factor),
-        patience=max(0, int(args.lr_patience)),
-        threshold=float(args.early_stop_min_delta),
-        threshold_mode="abs",
-        min_lr=float(args.min_lr),
-    )
-    scaler = create_grad_scaler(device=device, enabled=amp_enabled)
+    scheduler = CosineAnnealingLR(optimizer, T_max=max(args.epochs, 1))
+    scaler = create_grad_scaler(device, enabled=amp_enabled)
 
     start_epoch = 1
     best_val_loss = float("inf")
@@ -680,15 +640,10 @@ def main() -> None:
 
     print(f"Device: {device}, AMP: {amp_enabled}")
     print(f"Train samples: {len(train_ds)}, Val samples: {len(val_ds)}, Classes: {classes}")
-    print(f"Num workers: {resolved_workers} (system safe max: {max_workers}), pin_memory={pin_memory}")
     print(f"Balanced sampling: {not args.no_balanced_sampling}")
     print(f"Class weights enabled: {not args.no_class_weights}")
     if class_weights is not None:
         print(f"Class weights: {[round(x, 4) for x in class_weights.tolist()]}")
-
-    no_improve_epochs = 0
-    min_delta = max(0.0, float(args.early_stop_min_delta))
-    stop_patience = max(0, int(args.early_stop_patience))
 
     for epoch in range(start_epoch, args.epochs + 1):
         train_metrics = train_one_epoch(
@@ -707,15 +662,13 @@ def main() -> None:
             device=device,
             amp_enabled=amp_enabled,
         )
-        val_loss = float(val_metrics["loss"])
-        scheduler.step(val_loss)
-        current_lr = float(optimizer.param_groups[0]["lr"])
+        scheduler.step()
 
         print(
             f"Epoch {epoch:03d}/{args.epochs:03d} | "
             f"train_loss={train_metrics['loss']:.4f} "
             f"(cls={train_metrics['loss_cls']:.4f}, reg={train_metrics['loss_reg']:.4f}, ctr={train_metrics['loss_ctr']:.4f}) | "
-            f"val_loss={val_loss:.4f} | lr={current_lr:.2e}"
+            f"val_loss={val_metrics['loss']:.4f}"
         )
 
         save_checkpoint(
@@ -729,9 +682,8 @@ def main() -> None:
             img_size=args.img_size,
         )
 
-        if val_loss + min_delta < best_val_loss:
-            best_val_loss = val_loss
-            no_improve_epochs = 0
+        if val_metrics["loss"] < best_val_loss:
+            best_val_loss = val_metrics["loss"]
             save_checkpoint(
                 path=best_path,
                 model=model,
@@ -743,13 +695,6 @@ def main() -> None:
                 img_size=args.img_size,
             )
             print(f"Saved best checkpoint: {best_path} (val_loss={best_val_loss:.4f})")
-        else:
-            no_improve_epochs += 1
-            if stop_patience > 0:
-                print(f"No val improvement for {no_improve_epochs}/{stop_patience} epoch(s).")
-                if no_improve_epochs >= stop_patience:
-                    print(f"Early stopping at epoch {epoch}: best_val_loss={best_val_loss:.4f}")
-                    break
 
     if not best_path.exists():
         save_checkpoint(
