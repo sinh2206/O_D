@@ -203,6 +203,20 @@ def seed_everything(seed: int) -> None:
     torch.cuda.manual_seed_all(seed)
 
 
+def dataloader_worker_init_fn(worker_id: int) -> None:
+    # Prevent OpenCV thread oversubscription/deadlocks in multi-worker loading.
+    try:
+        cv2.setNumThreads(0)
+        cv2.ocl.setUseOpenCL(False)
+    except Exception:
+        pass
+
+    base_seed = int(torch.initial_seed()) % (2**32)
+    seed = base_seed + int(worker_id)
+    random.seed(seed)
+    np.random.seed(seed)
+
+
 def imread_unicode(path: Path) -> Optional[np.ndarray]:
     if not path.exists():
         return None
@@ -465,6 +479,7 @@ def make_dataloader(
     num_workers: int,
     pin_memory: bool,
     sampler: Optional[Sampler[int]] = None,
+    persistent_workers: bool = True,
 ) -> DataLoader:
     kwargs: Dict[str, Any] = {}
     if num_workers > 0:
@@ -477,11 +492,24 @@ def make_dataloader(
         sampler=sampler,
         num_workers=num_workers,
         pin_memory=pin_memory,
-        persistent_workers=(num_workers > 0),
+        persistent_workers=(num_workers > 0 and persistent_workers),
         drop_last=False,
         collate_fn=collate_fn,
+        worker_init_fn=dataloader_worker_init_fn,
         **kwargs,
     )
+
+
+def sync_should_skip_step(local_skip: bool, device: torch.device) -> bool:
+    """
+    In DDP, every rank must follow the same backward/step path.
+    If any rank has invalid loss, all ranks skip that iteration.
+    """
+    if not (dist.is_available() and dist.is_initialized()):
+        return bool(local_skip)
+    flag = torch.tensor(1 if local_skip else 0, device=device, dtype=torch.int32)
+    dist.all_reduce(flag, op=dist.ReduceOp.MAX)
+    return bool(flag.item() > 0)
 
 
 def train_one_epoch(
@@ -512,7 +540,14 @@ def train_one_epoch(
             loss_dict = criterion(outputs, targets)
             loss = loss_dict["loss"]
 
-        if torch.isnan(loss) or torch.isinf(loss):
+        local_invalid = not bool(torch.isfinite(loss.detach()).item())
+        if not local_invalid:
+            for v in loss_dict.values():
+                if torch.is_tensor(v) and not bool(torch.isfinite(v.detach()).all().item()):
+                    local_invalid = True
+                    break
+        should_skip = sync_should_skip_step(local_invalid, device=device)
+        if should_skip:
             optimizer.zero_grad(set_to_none=True)
             continue
 
@@ -645,7 +680,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lr_backbone", type=float, default=2e-4)
     parser.add_argument("--lr_head", type=float, default=2e-3)
     parser.add_argument("--weight_decay", type=float, default=1e-4)
-    parser.add_argument("--num_workers", type=int, default=4)
+    parser.add_argument("--num_workers", type=int, default=2)
     parser.add_argument("--grad_accum_steps", type=int, default=1)
     parser.add_argument(
         "--ddp",
@@ -703,7 +738,31 @@ def maybe_auto_relaunch_ddp(args: argparse.Namespace) -> None:
     env = os.environ.copy()
     env["OD_AUTO_DDP_LAUNCHED"] = "1"
 
+    cpu_count = max(1, int(os.cpu_count() or 1))
+    omp_threads = max(1, cpu_count // max(gpu_count, 1))
+    env.setdefault("OMP_NUM_THREADS", str(omp_threads))
+    env.setdefault("MKL_NUM_THREADS", str(omp_threads))
+
+    # Safer NCCL defaults for notebook/managed environments (Kaggle/Colab).
+    env.setdefault("NCCL_ASYNC_ERROR_HANDLING", "1")
+    env.setdefault("TORCH_NCCL_BLOCKING_WAIT", "1")
+    env.setdefault("TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC", "1800")
+    env.setdefault("TORCH_DISTRIBUTED_DEBUG", "DETAIL")
+    is_managed_notebook = ("KAGGLE_URL_BASE" in env) or ("COLAB_GPU" in env)
+    if is_managed_notebook:
+        env.setdefault("NCCL_IB_DISABLE", "1")
+        env.setdefault("NCCL_P2P_DISABLE", "1")
+        env.setdefault("NCCL_SOCKET_IFNAME", "lo")
+
     print(f"[Auto-DDP] Detected {gpu_count} GPUs. Relaunching with torch.distributed.run ...")
+    print(
+        "[Auto-DDP] NCCL env: "
+        f"OMP_NUM_THREADS={env.get('OMP_NUM_THREADS')}, "
+        f"NCCL_ASYNC_ERROR_HANDLING={env.get('NCCL_ASYNC_ERROR_HANDLING')}, "
+        f"TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC={env.get('TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC')}, "
+        f"NCCL_P2P_DISABLE={env.get('NCCL_P2P_DISABLE', '0')}, "
+        f"NCCL_IB_DISABLE={env.get('NCCL_IB_DISABLE', '0')}"
+    )
     exit_code = subprocess.call(cmd, env=env)
     raise SystemExit(exit_code)
 
@@ -732,6 +791,8 @@ def main() -> None:
     try:
         local_seed = int(args.seed) + int(dist_env.rank)
         seed_everything(local_seed)
+        cv2.setNumThreads(0)
+        cv2.ocl.setUseOpenCL(False)
         torch.backends.cudnn.benchmark = True
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
@@ -821,6 +882,7 @@ def main() -> None:
             num_workers=num_workers,
             pin_memory=pin_memory,
             sampler=train_sampler,
+            persistent_workers=not dist_env.enabled,
         )
         val_loader = make_dataloader(
             val_ds,
@@ -829,9 +891,11 @@ def main() -> None:
             num_workers=num_workers,
             pin_memory=pin_memory,
             sampler=val_sampler,
+            persistent_workers=not dist_env.enabled,
         )
 
-        model = AnchorFreeDetector(num_classes=num_classes, pretrained=True).to(device)
+        pretrained_backbone = (not dist_env.enabled) or (int(dist_env.rank) == 0)
+        model = AnchorFreeDetector(num_classes=num_classes, pretrained=pretrained_backbone).to(device)
         if device.type == "cuda":
             model = model.to(memory_format=torch.channels_last)
         criterion = DetectionLoss(
