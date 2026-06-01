@@ -105,6 +105,33 @@ def device_summary(device: torch.device) -> str:
     return f"cuda:{idx} ({props.name}, {mem_gb:.1f} GB)"
 
 
+def cuda_inventory() -> list[str]:
+    if not torch.cuda.is_available():
+        return []
+    out: list[str] = []
+    for idx in range(torch.cuda.device_count()):
+        props = torch.cuda.get_device_properties(idx)
+        mem_gb = props.total_memory / float(1024**3)
+        out.append(f"cuda:{idx} {props.name} ({mem_gb:.1f} GB)")
+    return out
+
+
+def compute_mode_label(
+    device: torch.device,
+    gpu_count: int,
+    distributed: bool = False,
+    world_size: int = 1,
+    data_parallel: bool = False,
+) -> str:
+    if device.type != "cuda" or gpu_count <= 0:
+        return "CPU"
+    if distributed and world_size > 1:
+        return f"GPUx{world_size} (DDP)"
+    if data_parallel and gpu_count > 1:
+        return f"GPUx{gpu_count} (DataParallel)"
+    return "GPUx1"
+
+
 def _cpu_limit_from_affinity() -> int:
     cpu_count = os.cpu_count() or 1
     try:

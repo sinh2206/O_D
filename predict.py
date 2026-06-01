@@ -32,7 +32,7 @@ from utils.config import (
 )
 from utils.model import AnchorFreeDetector
 from utils.nms import LetterboxMeta, postprocess_batch
-from utils.runtime import resolve_device
+from utils.runtime import compute_mode_label, cuda_inventory, resolve_device
 
 VALID_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 DEFAULT_VAL_IMAGE_DIR = Path("public/val/images")
@@ -943,9 +943,19 @@ def main() -> None:
     )
 
     dp_enabled = isinstance(model, nn.DataParallel)
+    gpu_count = torch.cuda.device_count() if torch.cuda.is_available() else 0
+    mode = compute_mode_label(
+        device=device,
+        gpu_count=gpu_count,
+        distributed=False,
+        world_size=1,
+        data_parallel=dp_enabled,
+    )
+    print(f"Compute mode: {mode}")
     print(f"Device: {device}")
-    if device.type == "cuda":
-        print(f"CUDA GPUs visible: {torch.cuda.device_count()}, DataParallel: {dp_enabled}")
+    if gpu_count > 0:
+        print(f"CUDA inventory: {cuda_inventory()}")
+        print(f"DataParallel: {dp_enabled}")
     ckpt_meta = torch.load(str(args.checkpoint), map_location="cpu")
     print(
         "Checkpoint meta: "

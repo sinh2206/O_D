@@ -4,7 +4,10 @@ import argparse
 import inspect
 import json
 import math
+import os
 import random
+import subprocess
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
@@ -47,6 +50,8 @@ from utils.model import AnchorFreeDetector
 from utils.runtime import (
     cleanup_distributed,
     create_grad_scaler,
+    cuda_inventory,
+    compute_mode_label,
     get_distributed_env,
     init_distributed,
     is_main_process,
@@ -640,7 +645,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lr_backbone", type=float, default=2e-4)
     parser.add_argument("--lr_head", type=float, default=2e-3)
     parser.add_argument("--weight_decay", type=float, default=1e-4)
-    parser.add_argument("--num_workers", type=int, default=2)
+    parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--grad_accum_steps", type=int, default=1)
     parser.add_argument(
         "--ddp",
@@ -666,8 +671,46 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def maybe_auto_relaunch_ddp(args: argparse.Namespace) -> None:
+    """
+    If user runs `python train.py ...` on a multi-GPU machine, relaunch
+    automatically with torch distributed so all GPUs are used.
+    """
+    ddp_mode = str(args.ddp).lower()
+    if ddp_mode not in {"auto", "on"}:
+        return
+    if os.environ.get("WORLD_SIZE"):
+        return
+    if os.environ.get("OD_AUTO_DDP_LAUNCHED") == "1":
+        return
+    if not torch.cuda.is_available():
+        return
+
+    gpu_count = int(torch.cuda.device_count())
+    if gpu_count <= 1:
+        return
+
+    cmd = [
+        sys.executable,
+        "-m",
+        "torch.distributed.run",
+        "--standalone",
+        "--nnodes=1",
+        f"--nproc_per_node={gpu_count}",
+        sys.argv[0],
+        *sys.argv[1:],
+    ]
+    env = os.environ.copy()
+    env["OD_AUTO_DDP_LAUNCHED"] = "1"
+
+    print(f"[Auto-DDP] Detected {gpu_count} GPUs. Relaunching with torch.distributed.run ...")
+    exit_code = subprocess.call(cmd, env=env)
+    raise SystemExit(exit_code)
+
+
 def main() -> None:
     args = parse_args()
+    maybe_auto_relaunch_ddp(args)
     dist_env = get_distributed_env()
     if args.ddp == "on" and not dist_env.enabled:
         raise RuntimeError(
@@ -838,11 +881,22 @@ def main() -> None:
         last_path = args.checkpoint_dir / "last.pth"
 
         if is_main_process(dist_env):
+            gpu_count = torch.cuda.device_count() if torch.cuda.is_available() else 0
+            mode = compute_mode_label(
+                device=device,
+                gpu_count=gpu_count,
+                distributed=dist_env.enabled,
+                world_size=dist_env.world_size,
+                data_parallel=False,
+            )
+            print(f"Compute mode: {mode}")
             print(f"Device: {device}, AMP: {amp_enabled}")
             print(
                 f"DDP: {dist_env.enabled}, world_size={dist_env.world_size}, "
                 f"rank={dist_env.rank}, local_rank={dist_env.local_rank}"
             )
+            if gpu_count > 0:
+                print(f"CUDA inventory: {cuda_inventory()}")
             print(f"Num workers: {num_workers} (max safe: {max_workers}), pin_memory={pin_memory}")
             print(f"Train samples: {len(train_ds)}, Val samples: {len(val_ds)}, Classes: {classes}")
             print(
