@@ -16,9 +16,6 @@ from utils.config import (
     CLASS_CONF_THRESH,
     CLASS_NAMES,
     CONF_THRESH,
-    DEFAULT_SEED,
-    FAST_DETERMINISTIC,
-    FAST_ENABLE_TF32,
     LOW_LIGHT_CLAHE_CLIP,
     LOW_LIGHT_GAMMA,
     LOW_LIGHT_MEAN_THRESH,
@@ -31,11 +28,9 @@ from utils.config import (
     NMS_IOU_THRESH,
     NUM_CLASSES,
     STD,
-    TRAIN_SPEED_MODE,
 )
 from utils.model import AnchorFreeDetector
 from utils.nms import LetterboxMeta, postprocess_batch
-from utils.runtime import configure_precision_runtime, set_global_seed
 
 VALID_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 DEFAULT_VAL_IMAGE_DIR = Path("public/val/images")
@@ -597,21 +592,6 @@ def draw_prediction(image_bgr: np.ndarray, boxes: Sequence[dict], class_names: S
     return out
 
 
-def box_iou(a: Sequence[float], b: Sequence[float]) -> float:
-    ax1, ay1, ax2, ay2 = [float(v) for v in a]
-    bx1, by1, bx2, by2 = [float(v) for v in b]
-    xx1 = max(ax1, bx1)
-    yy1 = max(ay1, by1)
-    xx2 = min(ax2, bx2)
-    yy2 = min(ay2, by2)
-    w = max(0.0, xx2 - xx1)
-    h = max(0.0, yy2 - yy1)
-    inter = w * h
-    area_a = max(0.0, ax2 - ax1) * max(0.0, ay2 - ay1)
-    area_b = max(0.0, bx2 - bx1) * max(0.0, by2 - by1)
-    return inter / (area_a + area_b - inter + 1e-9)
-
-
 def apply_class_thresholds(
     predictions: List[dict],
     class_names: Sequence[str],
@@ -677,14 +657,40 @@ def run_inference(
     class_names: Sequence[str],
     center_combine: str = INFER_CENTER_COMBINE,
 ) -> List[dict]:
+    def _infer_batch(
+        batch_tensors: List[torch.Tensor],
+        batch_ids: List[str],
+        batch_metas: List[LetterboxMeta],
+        conf_value: float,
+        center_mode: str,
+    ) -> List[dict]:
+        images = torch.stack(batch_tensors, dim=0).to(device, non_blocking=True).to(memory_format=torch.channels_last)
+        with torch.autocast(device_type=device.type, enabled=amp_enabled):
+            out = model(images)
+        return postprocess_batch(
+            outputs=out,
+            image_ids=batch_ids,
+            metas=batch_metas,
+            class_names=class_names,
+            num_classes=len(class_names),
+            img_size=img_size,
+            conf_thresh=float(conf_value),
+            nms_thresh=nms_thresh,
+            reg_decode="auto",
+            center_combine=str(center_mode),
+            min_box_size=MIN_BOX_SIZE,
+        )
+
     results: List[dict] = []
     amp_enabled = device.type == "cuda"
+    fallback_conf = max(0.12, float(conf_thresh) * 0.65)
 
     for start in range(0, len(image_paths), batch_size):
         batch_paths = image_paths[start : start + batch_size]
         tensors: List[torch.Tensor] = []
         metas: List[LetterboxMeta] = []
         image_ids: List[str] = []
+        valid_paths: List[Path] = []
 
         for p in batch_paths:
             image = imread_unicode(p)
@@ -694,27 +700,70 @@ def run_inference(
             tensors.append(tensor)
             metas.append(meta)
             image_ids.append(p.name)
+            valid_paths.append(p)
 
         if not tensors:
             continue
 
-        images = torch.stack(tensors, dim=0).to(device, non_blocking=True).to(memory_format=torch.channels_last)
-        with torch.autocast(device_type=device.type, enabled=amp_enabled):
-            outputs = model(images)
-
-        batch_results = postprocess_batch(
-            outputs=outputs,
-            image_ids=image_ids,
-            metas=metas,
-            class_names=class_names,
-            num_classes=len(class_names),
-            img_size=img_size,
-            conf_thresh=conf_thresh,
-            nms_thresh=nms_thresh,
-            reg_decode="auto",
-            center_combine=str(center_combine),
-            min_box_size=MIN_BOX_SIZE,
+        batch_results = _infer_batch(
+            batch_tensors=tensors,
+            batch_ids=image_ids,
+            batch_metas=metas,
+            conf_value=float(conf_thresh),
+            center_mode=str(center_combine),
         )
+
+        # Fallback only for empty outputs: lower confidence once on original
+        # image, then try horizontal-flip inference if still empty.
+        for i, pred in enumerate(batch_results):
+            if len(pred.get("boxes", [])) > 0:
+                continue
+
+            raw_img = imread_unicode(valid_paths[i])
+            if raw_img is None:
+                continue
+
+            t_low, m_low = letterbox_preprocess(raw_img, img_size=img_size)
+            low_res = _infer_batch(
+                batch_tensors=[t_low],
+                batch_ids=[image_ids[i]],
+                batch_metas=[m_low],
+                conf_value=float(fallback_conf),
+                center_mode="sqrt",
+            )[0]
+            if len(low_res.get("boxes", [])) > 0:
+                batch_results[i] = low_res
+                continue
+
+            flip_img = cv2.flip(raw_img, 1)
+            t_flip, m_flip = letterbox_preprocess(flip_img, img_size=img_size)
+            flip_res = _infer_batch(
+                batch_tensors=[t_flip],
+                batch_ids=[image_ids[i]],
+                batch_metas=[m_flip],
+                conf_value=float(fallback_conf),
+                center_mode="sqrt",
+            )[0]
+            if len(flip_res.get("boxes", [])) == 0:
+                continue
+
+            w = int(m_flip.orig_w)
+            remapped_boxes: List[dict] = []
+            for box in flip_res.get("boxes", []):
+                b = box.get("bbox", [0.0, 0.0, 0.0, 0.0])
+                if not isinstance(b, list) or len(b) != 4:
+                    continue
+                x1, y1, x2, y2 = [float(v) for v in b]
+                nx1 = max(0.0, min(float(w), float(w) - x2))
+                nx2 = max(0.0, min(float(w), float(w) - x1))
+                if nx2 <= nx1:
+                    continue
+                new_item = dict(box)
+                new_item["bbox"] = [nx1, float(y1), nx2, float(y2)]
+                remapped_boxes.append(new_item)
+
+            batch_results[i] = {"image_id": image_ids[i], "boxes": remapped_boxes}
+
         results.extend(batch_results)
 
     return results
@@ -792,31 +841,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--chair_suppress_iou", type=float, default=CHAIR_SUPPRESS_WITH_PERSON_IOU)
     parser.add_argument("--hardcase_topk", type=int, default=50)
     parser.add_argument("--hardcase_iou", type=float, default=0.5)
-    parser.add_argument("--speed_mode", type=str, default=TRAIN_SPEED_MODE, choices=["quality", "balanced", "fast"])
-    parser.add_argument("--seed", type=int, default=DEFAULT_SEED)
-    parser.add_argument("--deterministic", action="store_true", help="Enable deterministic kernels (slower).")
-    parser.add_argument("--enable_tf32", action="store_true", help="Enable TF32 kernels on Ampere+ GPUs.")
     parser.add_argument("--device", type=str, default="auto", choices=["auto", "cuda", "cpu"])
     return parser.parse_args()
 
 
-def apply_speed_mode(args: argparse.Namespace) -> argparse.Namespace:
-    mode = str(args.speed_mode).strip().lower()
-    if mode == "fast":
-        if not bool(args.enable_tf32):
-            args.enable_tf32 = bool(FAST_ENABLE_TF32)
-        if not bool(args.deterministic):
-            args.deterministic = bool(FAST_DETERMINISTIC)
-        args.batch_size = max(1, int(args.batch_size))
-    elif mode == "quality":
-        if not bool(args.deterministic):
-            args.deterministic = True
-    return args
-
-
 def main() -> None:
-    args = apply_speed_mode(parse_args())
-    set_global_seed(seed=int(args.seed), deterministic=bool(args.deterministic))
+    args = parse_args()
     if not args.checkpoint.exists():
         raise FileNotFoundError(f"Checkpoint not found: {args.checkpoint}")
     if not args.image_dir.exists():
@@ -835,7 +865,9 @@ def main() -> None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     else:
         device = torch.device(args.device)
-    configure_precision_runtime(enable_tf32=bool(args.enable_tf32))
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    torch.set_float32_matmul_precision("high")
 
     model, ckpt_classes, ckpt_img_size = load_checkpoint_model(args.checkpoint, device=device)
     model = model.to(memory_format=torch.channels_last)
@@ -886,8 +918,6 @@ def main() -> None:
     )
 
     print(f"Device: {device}")
-    print(f"Seed: {args.seed}")
-    print(f"Speed mode: {args.speed_mode}, Deterministic: {bool(args.deterministic)}, TF32: {bool(args.enable_tf32)}")
     ckpt_meta = torch.load(str(args.checkpoint), map_location="cpu")
     print(
         "Checkpoint meta: "

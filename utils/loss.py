@@ -28,6 +28,7 @@ import torch.nn.functional as F
 try:
     from .config import (
         CENTER_RADIUS,
+        FORCE_MATCH_TOPK,
         FOCAL_ALPHA,
         FOCAL_GAMMA,
         LABEL_SMOOTHING,
@@ -37,12 +38,17 @@ try:
         NEGATIVE_FOCAL_WEIGHT,
         NUM_CLASSES,
         STRIDES,
+        TARGET_INSIDE_EPS,
+        TINY_OBJECT_AREA_PX,
     )
 except Exception:
     # Safe fallbacks so this module still works if config.py is not available.
     NUM_CLASSES = 5
     STRIDES = [8, 16, 32]
     CENTER_RADIUS = 2.0
+    FORCE_MATCH_TOPK = 4
+    TARGET_INSIDE_EPS = 1e-3
+    TINY_OBJECT_AREA_PX = 1200.0
     FOCAL_GAMMA = 2.0
     FOCAL_ALPHA = 0.25
     LABEL_SMOOTHING = 0.01
@@ -398,7 +404,7 @@ def _assign_level_targets(
     ltrb = torch.stack([l, t, r, b], dim=-1)  # (P, N, 4) order l,t,r,b
     tlbr = torch.stack([t, l, b, r], dim=-1)  # (P, N, 4) order t,l,b,r
 
-    inside_box = (ltrb.min(dim=-1).values > 0.0)
+    inside_box = ltrb.min(dim=-1).values > (-float(TARGET_INSIDE_EPS))
 
     # Center sampling region.
     gx = 0.5 * (x1 + x2)
@@ -413,6 +419,7 @@ def _assign_level_targets(
     inside_center = (x >= cx1) & (x <= cx2) & (y >= cy1) & (y <= cy2)
     inside_center = inside_center.to(dtype=torch.bool)
 
+    in_range = torch.ones_like(inside_box, dtype=torch.bool)
     candidate = inside_box & inside_center
 
     if scale_range is not None:
@@ -424,8 +431,39 @@ def _assign_level_targets(
             in_range = max_dist >= lo
         candidate = candidate & in_range
 
+    # Tiny or heavily occluded objects may not have any point that satisfies
+    # both inside-box and center-sampling constraints on a level. Force a few
+    # nearest points so each tiny GT still contributes positive supervision.
+    gt_area_flat = _box_area(gt_boxes)
+    if candidate.shape[1] > 0:
+        px = points_xy[:, 0]
+        py = points_xy[:, 1]
+        for gt_i in range(candidate.shape[1]):
+            if torch.any(candidate[:, gt_i]):
+                continue
+            if float(gt_area_flat[gt_i].item()) > float(TINY_OBJECT_AREA_PX):
+                continue
+
+            relaxed = inside_box[:, gt_i] & in_range[:, gt_i]
+            if torch.any(relaxed):
+                candidate[:, gt_i] = relaxed
+                continue
+
+            available = in_range[:, gt_i]
+            if not torch.any(available):
+                available = torch.ones_like(available, dtype=torch.bool)
+            available_idx = torch.where(available)[0]
+            if available_idx.numel() == 0:
+                continue
+
+            dist2 = (px[available_idx] - gx[0, gt_i]) ** 2 + (py[available_idx] - gy[0, gt_i]) ** 2
+            k = min(int(FORCE_MATCH_TOPK), int(available_idx.numel()))
+            top_local = torch.topk(dist2, k=k, largest=False).indices
+            force_idx = available_idx[top_local]
+            candidate[force_idx, gt_i] = True
+
     # Resolve overlaps by smallest GT area.
-    gt_area = _box_area(gt_boxes).view(1, -1).expand(p, -1)
+    gt_area = gt_area_flat.view(1, -1).expand(p, -1)
     inf = torch.full_like(gt_area, 1e12)
     candidate_area = torch.where(candidate, gt_area, inf)
 

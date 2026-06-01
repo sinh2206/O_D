@@ -347,7 +347,8 @@ def _is_fully_inside_xyxy(inner: torch.Tensor, outer: torch.Tensor) -> bool:
 
 
 def _box_area_xyxy(box: torch.Tensor) -> float:
-    return float(max(0.0, float(box[2]) - float(box[0])) * max(0.0, float(box[3]) - float(box[1])))
+    b = box.detach()
+    return float(max(0.0, float(b[2]) - float(b[0])) * max(0.0, float(b[3]) - float(b[1])))
 
 
 def _suppress_same_class_contained(
