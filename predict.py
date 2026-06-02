@@ -782,14 +782,9 @@ def parse_args() -> argparse.Namespace:
         "--class_conf",
         type=str,
         default=",".join(str(x) for x in CLASS_CONF_THRESH),
-        help="Per-class thresholds in CLASS_NAMES order, e.g. '0.35,0.35,0.35,0.35,0.30'",
+        help="Per-class thresholds in CLASS_NAMES order, e.g. '0.38,0.40,0.40,0.40,0.72'",
     )
     parser.add_argument("--chair_suppress_iou", type=float, default=CHAIR_SUPPRESS_WITH_PERSON_IOU)
-    parser.add_argument(
-        "--no_chair_suppress",
-        action="store_true",
-        help="Disable chair-inside-person suppression rule.",
-    )
     parser.add_argument("--hardcase_topk", type=int, default=50)
     parser.add_argument("--hardcase_iou", type=float, default=0.5)
     parser.add_argument("--device", type=str, default="auto", choices=["auto", "cuda", "cpu"])
@@ -828,14 +823,6 @@ def main() -> None:
     class_conf = [float(x.strip()) for x in str(args.class_conf).split(",") if x.strip()]
     if len(class_conf) != len(class_names):
         raise ValueError(f"--class_conf must have {len(class_names)} values (got {len(class_conf)}).")
-    effective_conf_thresh = float(args.conf_thresh)
-    min_class_conf = min(float(x) for x in class_conf) if class_conf else effective_conf_thresh
-    if effective_conf_thresh > min_class_conf:
-        effective_conf_thresh = min_class_conf
-        print(
-            f"Adjusted decode conf_thresh to {effective_conf_thresh:.3f} "
-            f"to preserve boxes before per-class filtering."
-        )
 
     image_paths = collect_images(args.image_dir)
     if not image_paths:
@@ -847,14 +834,13 @@ def main() -> None:
         device=device,
         batch_size=max(1, args.batch_size),
         img_size=img_size,
-        conf_thresh=effective_conf_thresh,
+        conf_thresh=float(args.conf_thresh),
         nms_thresh=float(args.nms_thresh),
         class_names=class_names,
         center_combine=str(args.center_combine),
     )
     predictions = apply_class_thresholds(predictions, class_names=class_names, class_conf_thresh=class_conf)
-    if not args.no_chair_suppress:
-        predictions = suppress_chair_inside_person(predictions, iou_thresh=float(args.chair_suppress_iou))
+    predictions = suppress_chair_inside_person(predictions, iou_thresh=float(args.chair_suppress_iou))
 
     predictions = sanitize_predictions_for_export(
         predictions=predictions,
@@ -886,7 +872,6 @@ def main() -> None:
         f"img_size={ckpt_meta.get('img_size', 'NA')}"
     )
     print(f"Predicted images: {len(predictions)}")
-    print(f"Decode conf_thresh used: {effective_conf_thresh:.3f}")
     print(f"Saved JSON: {args.output}")
     print(f"Hardcase items: {hardcase_count}")
     print(f"Hardcase summary: {summary_path}")

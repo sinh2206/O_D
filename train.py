@@ -80,7 +80,7 @@ def compute_class_weights(num_classes: int) -> torch.Tensor:
     return torch.as_tensor(weights, dtype=torch.float32)
 
 
-def build_sample_weights(samples: List[Sample], class_weights: torch.Tensor, chair_idx: Optional[int] = None) -> torch.Tensor:
+def build_sample_weights(samples: List[Sample], class_weights: torch.Tensor) -> torch.Tensor:
     cw = class_weights.cpu().numpy().astype(np.float64)
     class_sampler_weights = np.asarray(CLASS_SAMPLER_WEIGHTS, dtype=np.float64)
     if class_sampler_weights.size != cw.size:
@@ -103,13 +103,6 @@ def build_sample_weights(samples: List[Sample], class_weights: torch.Tensor, cha
         base_weight = float(np.mean(cw[labels] * class_sampler_weights[labels]))
         crowd_bonus = 1.0 + 0.12 * float(min(labels.size, 10))
         small_bonus = 1.0
-        chair_bonus = 1.0
-        if chair_idx is not None:
-            chair_count = int(np.sum(labels == int(chair_idx)))
-            if chair_count > 0:
-                # Slightly oversample chair-rich scenes because chair recall is
-                # highly sensitive to context and scale variations.
-                chair_bonus = 1.0 + 0.12 * float(min(chair_count, 3))
         if s.width > 0 and s.height > 0 and len(s.boxes) > 0:
             img_area = float(max(s.width * s.height, 1))
             box_areas = np.asarray(
@@ -126,7 +119,7 @@ def build_sample_weights(samples: List[Sample], class_weights: torch.Tensor, cha
                 )
                 small_bonus = 1.0 + float(SMALL_OBJECT_BONUS) * float(smallness)
 
-        ws[i] = max(1.0, base_weight * crowd_bonus * small_bonus * chair_bonus)
+        ws[i] = max(1.0, base_weight * crowd_bonus * small_bonus)
 
     ws = ws / max(ws.mean(), 1e-12)
     ws = np.clip(ws, 0.25, 4.5)
@@ -540,7 +533,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--checkpoint_dir", type=Path, default=Path("./models"))
     parser.add_argument("--img_size", type=int, default=IMG_SIZE)
     parser.add_argument("--batch_size", type=int, default=8)
-    parser.add_argument("--epochs", type=int, default=20)
+    parser.add_argument("--epochs", type=int, default=25)
     parser.add_argument("--lr_backbone", type=float, default=2e-4)
     parser.add_argument("--lr_head", type=float, default=2e-3)
     parser.add_argument("--weight_decay", type=float, default=1e-4)
@@ -576,9 +569,8 @@ def main() -> None:
 
     class_weights = None if args.no_class_weights else compute_class_weights(num_classes=num_classes)
     train_sampler = None
-    chair_idx = classes.index("chair") if "chair" in classes else None
     if not args.no_balanced_sampling and class_weights is not None:
-        sample_weights = build_sample_weights(train_samples, class_weights, chair_idx=chair_idx)
+        sample_weights = build_sample_weights(train_samples, class_weights)
         train_sampler = WeightedRandomSampler(
             weights=sample_weights,
             num_samples=len(sample_weights),
