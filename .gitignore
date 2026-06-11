@@ -3,3 +3,4 @@ example.py
 
 __pycache__/
 *.pyc
+results/*
