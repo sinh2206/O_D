@@ -615,7 +615,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lr_backbone", type=float, default=2e-4)
     parser.add_argument("--lr_head", type=float, default=2e-3)
     parser.add_argument("--weight_decay", type=float, default=1e-4)
-    parser.add_argument("--num_workers", type=int, default=-1)
+    parser.add_argument("--num_workers", type=int, default=2)
     parser.add_argument("--grad_accum_steps", type=int, default=2)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--resume", type=Path, default=None)
