@@ -245,62 +245,14 @@ def make_pad_if_needed(img_size: int):
     return A.PadIfNeeded(**kwargs)
 
 
-def make_coarse_dropout(img_size: int):
-    params = inspect.signature(A.CoarseDropout.__init__).parameters
-    kwargs = {"p": 0.18}
-
-    if "num_holes_range" in params:
-        kwargs.update(
-            {
-                "num_holes_range": (1, 3),
-                "hole_height_range": (0.03, 0.10),
-                "hole_width_range": (0.03, 0.14),
-            }
-        )
-        if "fill" in params:
-            kwargs["fill"] = (114, 114, 114)
-        if "fill_mask" in params:
-            kwargs["fill_mask"] = 0
-    else:
-        kwargs.update(
-            {
-                "min_holes": 1,
-                "max_holes": 3,
-                "min_height": max(4, int(0.03 * img_size)),
-                "max_height": max(8, int(0.10 * img_size)),
-                "min_width": max(4, int(0.03 * img_size)),
-                "max_width": max(8, int(0.14 * img_size)),
-            }
-        )
-        if "fill_value" in params:
-            kwargs["fill_value"] = (114, 114, 114)
-        if "mask_fill_value" in params:
-            kwargs["mask_fill_value"] = 0
-
-    return A.CoarseDropout(**kwargs)
-
-
-def make_image_compression():
-    params = inspect.signature(A.ImageCompression.__init__).parameters
-    kwargs = {"p": 0.18}
-    if "quality_range" in params:
-        kwargs["quality_range"] = (65, 95)
-    else:
-        if "quality_lower" in params:
-            kwargs["quality_lower"] = 65
-        if "quality_upper" in params:
-            kwargs["quality_upper"] = 95
-    return A.ImageCompression(**kwargs)
-
-
 def get_train_transforms(img_size: int) -> A.Compose:
     affine_params = inspect.signature(A.Affine.__init__).parameters
     affine_kwargs = dict(
-        scale=(0.82, 1.28),
-        translate_percent=(-0.05, 0.05),
-        rotate=(-5, 5),
+        scale=(0.85, 1.25),
+        translate_percent=(-0.04, 0.04),
+        rotate=(-4, 4),
         shear=(-1.0, 1.0),
-        p=0.25,
+        p=0.20,
     )
     if "border_mode" in affine_params:
         affine_kwargs["border_mode"] = cv2.BORDER_CONSTANT
@@ -333,20 +285,20 @@ def get_train_transforms(img_size: int) -> A.Compose:
             A.LongestMaxSize(max_size=img_size, interpolation=cv2.INTER_LINEAR),
             make_pad_if_needed(img_size),
             A.HorizontalFlip(p=0.5),
+            A.VerticalFlip(p=0.08),
+            A.RandomRotate90(p=0.22),
             A.CLAHE(clip_limit=2.2, tile_grid_size=(8, 8), p=0.2),
             A.OneOf(
                 [
                     A.GaussianBlur(blur_limit=(3, 7), p=1.0),
                     A.MotionBlur(blur_limit=5, p=1.0),
                     downscale_aug,
-                    make_image_compression(),
                 ],
-                p=0.35,
+                p=0.30,
             ),
             A.RandomGamma(gamma_limit=(88, 122), p=0.25),
             A.ColorJitter(brightness=0.12, contrast=0.12, saturation=0.1, hue=0.05, p=0.45),
             affine,
-            make_coarse_dropout(img_size),
             A.Normalize(mean=MEAN, std=STD),
             ToTensorV2(),
         ],
@@ -580,8 +532,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--val_image_dir", type=Path, required=True)
     parser.add_argument("--checkpoint_dir", type=Path, default=Path("./models"))
     parser.add_argument("--img_size", type=int, default=IMG_SIZE)
-    parser.add_argument("--batch_size", type=int, default=4)
-    parser.add_argument("--epochs", type=int, default=20)
+    parser.add_argument("--batch_size", type=int, default=8)
+    parser.add_argument("--epochs", type=int, default=35)
     parser.add_argument("--lr_backbone", type=float, default=2e-4)
     parser.add_argument("--lr_head", type=float, default=2e-3)
     parser.add_argument("--weight_decay", type=float, default=1e-4)
