@@ -46,11 +46,13 @@ def resolve_num_workers(requested: int) -> Tuple[int, int]:
     max_safe = _cpu_limit_from_affinity()
     if "COLAB_GPU" in os.environ:
         max_safe = min(max_safe, 2)
+    elif "KAGGLE_KERNEL_RUN_TYPE" in os.environ or "KAGGLE_URL_BASE" in os.environ:
+        max_safe = min(max_safe, 6)
 
     if requested < 0:
         if max_safe <= 2:
             return max_safe, max_safe
-        return min(4, max_safe), max_safe
+        return min(6, max_safe), max_safe
 
     resolved = max(0, min(int(requested), max_safe))
     return resolved, max_safe
