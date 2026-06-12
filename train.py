@@ -36,9 +36,19 @@ from utils.config import (
     SMALL_OBJECT_BONUS,
     STD,
     STRIDES,
+    TRAIN_AFFINE_PROB,
+    TRAIN_AFFINE_ROTATE,
+    TRAIN_AFFINE_SCALE,
+    TRAIN_AFFINE_SHEAR,
+    TRAIN_AFFINE_TRANSLATE,
+    TRAIN_DEGRADE_ONEOF_PROB,
+    TRAIN_DOWNSCALE_SCALE,
+    TRAIN_ENABLE_DOWNSCALE,
+    TRAIN_RANDOM_CROP_PROB,
 )
 from utils.loss import DetectionLoss
 from utils.model import AnchorFreeDetector
+from utils.runtime import create_grad_scaler, resolve_num_workers, should_pin_memory
 
 VALID_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 
@@ -53,13 +63,33 @@ class Sample:
     labels: List[int]
 
 
-def compute_class_weights(num_classes: int) -> torch.Tensor:
+def compute_class_weights(
+    num_classes: int,
+    train_samples: Optional[List[Sample]] = None,
+    val_samples: Optional[List[Sample]] = None,
+) -> torch.Tensor:
     if num_classes <= 0:
         return torch.zeros((0,), dtype=torch.float32)
 
-    freq_train = np.asarray(CLASS_FREQ_PRIOR_TRAIN, dtype=np.float64)
-    freq_val = np.asarray(CLASS_FREQ_PRIOR_VAL, dtype=np.float64)
-    if freq_train.size != num_classes or freq_val.size != num_classes:
+    def _freq_from_samples(samples: List[Sample]) -> np.ndarray:
+        counts = np.zeros((num_classes,), dtype=np.float64)
+        for s in samples:
+            if not s.labels:
+                continue
+            labels = np.asarray(s.labels, dtype=np.int64)
+            labels = labels[(labels >= 0) & (labels < num_classes)]
+            if labels.size == 0:
+                continue
+            binc = np.bincount(labels, minlength=num_classes).astype(np.float64)
+            counts += binc
+        if counts.sum() <= 0:
+            return np.zeros((num_classes,), dtype=np.float64)
+        return counts / counts.sum()
+
+    freq_train = _freq_from_samples(train_samples) if train_samples else np.asarray(CLASS_FREQ_PRIOR_TRAIN, dtype=np.float64)
+    freq_val = _freq_from_samples(val_samples) if val_samples else np.asarray(CLASS_FREQ_PRIOR_VAL, dtype=np.float64)
+
+    if freq_train.size != num_classes or freq_val.size != num_classes or freq_train.sum() <= 0 or freq_val.sum() <= 0:
         weights = np.ones((num_classes,), dtype=np.float64)
         return torch.as_tensor(weights, dtype=torch.float32)
 
@@ -248,11 +278,11 @@ def make_pad_if_needed(img_size: int):
 def get_train_transforms(img_size: int) -> A.Compose:
     affine_params = inspect.signature(A.Affine.__init__).parameters
     affine_kwargs = dict(
-        scale=(0.85, 1.25),
-        translate_percent=(-0.04, 0.04),
-        rotate=(-4, 4),
-        shear=(-1.0, 1.0),
-        p=0.20,
+        scale=TRAIN_AFFINE_SCALE,
+        translate_percent=TRAIN_AFFINE_TRANSLATE,
+        rotate=TRAIN_AFFINE_ROTATE,
+        shear=TRAIN_AFFINE_SHEAR,
+        p=TRAIN_AFFINE_PROB,
     )
     if "border_mode" in affine_params:
         affine_kwargs["border_mode"] = cv2.BORDER_CONSTANT
@@ -274,28 +304,43 @@ def get_train_transforms(img_size: int) -> A.Compose:
 
     affine = A.Affine(**affine_kwargs)
 
-    downscale_params = inspect.signature(A.Downscale.__init__).parameters
-    if "scale_range" in downscale_params:
-        downscale_aug = A.Downscale(scale_range=(0.60, 0.85), p=1.0)
-    else:
-        downscale_aug = A.Downscale(scale_min=0.60, scale_max=0.85, p=1.0)
+    degrade_choices = [
+        A.GaussianBlur(blur_limit=(3, 7), p=1.0),
+        A.MotionBlur(blur_limit=5, p=1.0),
+    ]
+    if TRAIN_ENABLE_DOWNSCALE:
+        downscale_params = inspect.signature(A.Downscale.__init__).parameters
+        if "scale_range" in downscale_params:
+            downscale_aug = A.Downscale(scale_range=TRAIN_DOWNSCALE_SCALE, p=1.0)
+        else:
+            downscale_aug = A.Downscale(
+                scale_min=TRAIN_DOWNSCALE_SCALE[0],
+                scale_max=TRAIN_DOWNSCALE_SCALE[1],
+                p=1.0,
+            )
+        degrade_choices.append(downscale_aug)
+
+    try:
+        crop_aug = A.RandomSizedBBoxSafeCrop(
+            height=img_size,
+            width=img_size,
+            erosion_rate=0.0,
+            p=TRAIN_RANDOM_CROP_PROB,
+        )
+    except TypeError:
+        crop_aug = A.NoOp(p=1.0)
 
     return A.Compose(
         [
+            crop_aug,
             A.LongestMaxSize(max_size=img_size, interpolation=cv2.INTER_LINEAR),
             make_pad_if_needed(img_size),
             A.HorizontalFlip(p=0.5),
-            A.VerticalFlip(p=0.08),
-            A.RandomRotate90(p=0.22),
+            A.VerticalFlip(p=0.05),
+            A.RandomRotate90(p=0.12),
             A.CLAHE(clip_limit=2.2, tile_grid_size=(8, 8), p=0.2),
-            A.OneOf(
-                [
-                    A.GaussianBlur(blur_limit=(3, 7), p=1.0),
-                    A.MotionBlur(blur_limit=5, p=1.0),
-                    downscale_aug,
-                ],
-                p=0.30,
-            ),
+            A.OneOf(degrade_choices, p=TRAIN_DEGRADE_ONEOF_PROB),
+            A.Sharpen(alpha=(0.15, 0.35), lightness=(0.85, 1.15), p=0.16),
             A.RandomGamma(gamma_limit=(88, 122), p=0.25),
             A.ColorJitter(brightness=0.12, contrast=0.12, saturation=0.1, hue=0.05, p=0.45),
             affine,
@@ -394,6 +439,7 @@ def make_dataloader(
     shuffle: bool,
     num_workers: int,
     sampler: Optional[WeightedRandomSampler] = None,
+    pin_memory: bool = False,
 ) -> DataLoader:
     return DataLoader(
         dataset,
@@ -401,7 +447,7 @@ def make_dataloader(
         shuffle=(shuffle and sampler is None),
         sampler=sampler,
         num_workers=num_workers,
-        pin_memory=True,
+        pin_memory=pin_memory,
         persistent_workers=(num_workers > 0),
         drop_last=False,
         collate_fn=collate_fn,
@@ -416,27 +462,35 @@ def train_one_epoch(
     device: torch.device,
     scaler: torch.cuda.amp.GradScaler,
     amp_enabled: bool,
+    grad_accum_steps: int = 1,
 ) -> Dict[str, float]:
     model.train()
     running = {"loss": 0.0, "loss_cls": 0.0, "loss_reg": 0.0, "loss_ctr": 0.0}
     steps = 0
+    grad_accum_steps = max(1, int(grad_accum_steps))
 
-    for images, targets in loader:
+    optimizer.zero_grad(set_to_none=True)
+    for batch_idx, (images, targets) in enumerate(loader, start=1):
         images = images.to(device, non_blocking=True).to(memory_format=torch.channels_last)
         targets = move_targets_to_device(targets, device)
 
-        optimizer.zero_grad(set_to_none=True)
         with torch.autocast(device_type=device.type, enabled=amp_enabled):
             outputs = model(images)
             loss_dict = criterion(outputs, targets)
             loss = loss_dict["loss"]
 
         if torch.isnan(loss) or torch.isinf(loss):
+            optimizer.zero_grad(set_to_none=True)
             continue
 
-        scaler.scale(loss).backward()
-        scaler.step(optimizer)
-        scaler.update()
+        loss_to_backprop = loss / float(grad_accum_steps)
+        scaler.scale(loss_to_backprop).backward()
+
+        should_step = (batch_idx % grad_accum_steps == 0) or (batch_idx == len(loader))
+        if should_step:
+            scaler.step(optimizer)
+            scaler.update()
+            optimizer.zero_grad(set_to_none=True)
 
         running["loss"] += float(loss.detach().item())
         running["loss_cls"] += float(loss_dict["loss_cls"].item())
@@ -484,7 +538,8 @@ def validate_one_epoch(
 def build_optimizer(model: AnchorFreeDetector, lr_backbone: float, lr_head: float, weight_decay: float) -> torch.optim.Optimizer:
     backbone_params = list(model.backbone_fpn.parameters())
     head_params = (
-        list(model.head_s8.parameters())
+        list(model.head_s4.parameters())
+        + list(model.head_s8.parameters())
         + list(model.head_s16.parameters())
         + list(model.head_s32.parameters())
     )
@@ -509,9 +564,10 @@ def save_checkpoint(
     img_size: int,
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
+    model_to_save = model.module if isinstance(model, nn.DataParallel) else model
     torch.save(
         {
-            "model_state_dict": model.state_dict(),
+            "model_state_dict": model_to_save.state_dict(),
             "optimizer_state_dict": optimizer.state_dict(),
             "scheduler_state_dict": scheduler.state_dict(),
             "epoch": epoch,
@@ -525,19 +581,20 @@ def save_checkpoint(
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Train anchor-free detector (ResNet34 + 3-level FPN).")
+    parser = argparse.ArgumentParser(description="Train anchor-free detector (ResNet34 + 4-level FPN).")
     parser.add_argument("--train_data", type=Path, required=True)
     parser.add_argument("--val_data", type=Path, required=True)
     parser.add_argument("--image_dir", type=Path, required=True)
     parser.add_argument("--val_image_dir", type=Path, required=True)
     parser.add_argument("--checkpoint_dir", type=Path, default=Path("./models"))
     parser.add_argument("--img_size", type=int, default=IMG_SIZE)
-    parser.add_argument("--batch_size", type=int, default=8)
-    parser.add_argument("--epochs", type=int, default=35)
+    parser.add_argument("--batch_size", type=int, default=4)
+    parser.add_argument("--epochs", type=int, default=30)
     parser.add_argument("--lr_backbone", type=float, default=2e-4)
     parser.add_argument("--lr_head", type=float, default=2e-3)
     parser.add_argument("--weight_decay", type=float, default=1e-4)
-    parser.add_argument("--num_workers", type=int, default=2)
+    parser.add_argument("--num_workers", type=int, default=-1)
+    parser.add_argument("--grad_accum_steps", type=int, default=2)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--resume", type=Path, default=None)
     parser.add_argument("--label_smoothing", type=float, default=LABEL_SMOOTHING)
@@ -559,6 +616,8 @@ def main() -> None:
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     amp_enabled = (device.type == "cuda") and (not args.no_amp)
+    resolved_workers, max_safe_workers = resolve_num_workers(int(args.num_workers))
+    pin_memory = should_pin_memory(device)
 
     train_samples, classes = parse_samples(args.train_data, args.image_dir, class_names=None)
     val_samples, _ = parse_samples(args.val_data, args.val_image_dir, class_names=classes)
@@ -567,7 +626,11 @@ def main() -> None:
     train_ds = DetectionDataset(train_samples, transforms=get_train_transforms(args.img_size))
     val_ds = DetectionDataset(val_samples, transforms=get_val_transforms(args.img_size))
 
-    class_weights = None if args.no_class_weights else compute_class_weights(num_classes=num_classes)
+    class_weights = None if args.no_class_weights else compute_class_weights(
+        num_classes=num_classes,
+        train_samples=train_samples,
+        val_samples=val_samples,
+    )
     train_sampler = None
     if not args.no_balanced_sampling and class_weights is not None:
         sample_weights = build_sample_weights(train_samples, class_weights)
@@ -581,12 +644,22 @@ def main() -> None:
         train_ds,
         batch_size=args.batch_size,
         shuffle=True,
-        num_workers=args.num_workers,
+        num_workers=resolved_workers,
         sampler=train_sampler,
+        pin_memory=pin_memory,
     )
-    val_loader = make_dataloader(val_ds, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers)
+    val_loader = make_dataloader(
+        val_ds,
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=resolved_workers,
+        pin_memory=pin_memory,
+    )
 
-    model = AnchorFreeDetector(num_classes=num_classes, pretrained=True).to(device).to(memory_format=torch.channels_last)
+    base_model = AnchorFreeDetector(num_classes=num_classes, pretrained=True).to(device).to(memory_format=torch.channels_last)
+    num_visible_gpus = torch.cuda.device_count() if device.type == "cuda" else 0
+    multi_gpu_enabled = device.type == "cuda" and num_visible_gpus > 1
+    model: nn.Module = nn.DataParallel(base_model) if multi_gpu_enabled else base_model
     criterion = DetectionLoss(
         num_classes=num_classes,
         strides=STRIDES,
@@ -595,18 +668,30 @@ def main() -> None:
         center_radius=float(args.center_radius),
         use_scale_ranges=not args.no_scale_ranges,
     ).to(device)
-    optimizer = build_optimizer(model, lr_backbone=args.lr_backbone, lr_head=args.lr_head, weight_decay=args.weight_decay)
+    optimizer = build_optimizer(base_model, lr_backbone=args.lr_backbone, lr_head=args.lr_head, weight_decay=args.weight_decay)
     scheduler = CosineAnnealingLR(optimizer, T_max=max(args.epochs, 1))
-    scaler = torch.cuda.amp.GradScaler(enabled=amp_enabled)
+    scaler = create_grad_scaler(device=device, enabled=amp_enabled)
 
     start_epoch = 1
     best_val_loss = float("inf")
     if args.resume is not None and args.resume.exists():
         ckpt = torch.load(str(args.resume), map_location=device)
+        ckpt_strides = ckpt.get("strides", None)
+        if ckpt_strides is not None:
+            try:
+                ckpt_strides = [int(x) for x in ckpt_strides]
+            except Exception:
+                ckpt_strides = None
+        if ckpt_strides is not None and ckpt_strides != list(STRIDES):
+            print(
+                "Warning: resume checkpoint was trained with strides "
+                f"{ckpt_strides}, while current model expects {list(STRIDES)}. "
+                "The new stride-4 branch will stay newly initialized and needs fine-tuning."
+            )
         try:
-            model.load_state_dict(ckpt["model_state_dict"], strict=True)
+            base_model.load_state_dict(ckpt["model_state_dict"], strict=True)
         except RuntimeError as exc:
-            missing, unexpected = model.load_state_dict(ckpt["model_state_dict"], strict=False)
+            missing, unexpected = base_model.load_state_dict(ckpt["model_state_dict"], strict=False)
             print(f"Resume checkpoint partially loaded ({exc}).")
             print(f"Missing keys: {missing}")
             print(f"Unexpected keys: {unexpected}")
@@ -622,9 +707,13 @@ def main() -> None:
     last_path = args.checkpoint_dir / "last.pth"
 
     print(f"Device: {device}, AMP: {amp_enabled}")
+    print(f"Visible GPUs: {num_visible_gpus}, DataParallel: {multi_gpu_enabled}")
     print(f"Train samples: {len(train_ds)}, Val samples: {len(val_ds)}, Classes: {classes}")
     print(f"Balanced sampling: {not args.no_balanced_sampling}")
     print(f"Class weights enabled: {not args.no_class_weights}")
+    print(f"Num workers: requested={args.num_workers}, resolved={resolved_workers}, max_safe={max_safe_workers}")
+    print(f"Pin memory: {pin_memory}")
+    print(f"Grad accumulation steps: {max(1, int(args.grad_accum_steps))}")
     if class_weights is not None:
         print(f"Class weights: {[round(x, 4) for x in class_weights.tolist()]}")
 
@@ -637,6 +726,7 @@ def main() -> None:
             device=device,
             scaler=scaler,
             amp_enabled=amp_enabled,
+            grad_accum_steps=max(1, int(args.grad_accum_steps)),
         )
         val_metrics = validate_one_epoch(
             model=model,

@@ -1,0 +1,196 @@
+Đánh giá nhanh từ train.py, predict.py, utils/ và results/hardcase_summary.json
+
+1. Hiện trạng
+
+- mAP@0.5 hiện tại: 0.725082
+- Micro recall: 0.790698
+- Micro precision: 0.492906
+- Trong 50 hardcase có 23 ảnh pred_count = 0, tức là mô hình hoàn toàn không trả ra box nào ở khá nhiều ca lỗi nặng.
+- Nếu chia GT theo kích thước tương đối trên ảnh:
+- Small: recall 133 / 284 = 0.4683
+- Medium: recall 751 / 970 = 0.7742
+- Large: recall 714 / 767 = 0.9309
+- Nghĩa là điểm nghẽn lớn nhất hiện tại là small object, không phải large object.
+- Với hardcase đang miss, số GT chưa bắt được theo size là:
+- Small: 42
+- Medium: 27
+- Large: 8
+- Recall small object theo lớp đang rất yếu:
+- person: 77 / 170 = 0.4529
+- car: 54 / 88 = 0.6136
+- dog: 1 / 6 = 0.1667
+- cat: 0 / 3 = 0.0
+- chair: 1 / 17 = 0.0588
+- Large object nhìn chung không phải vấn đề chính toàn cục, nhưng vẫn có vài hardcase lớn bị miss do nhầm lớp hoặc do pipeline hậu xử lý quá chặt.
+
+2. Kết luận ngắn
+
+- Nếu muốn tăng mAP rõ rệt, nên ưu tiên sửa cho small object trước.
+- Large object miss có tồn tại, nhưng ít hơn nhiều. Nhóm này nên xử lý bằng giảm nhầm lớp và nới hậu xử lý, không phải ưu tiên hàng đầu bằng thay backbone ngay.
+
+3. Các thay đổi nên làm, theo thứ tự ưu tiên
+
+Ưu tiên A. Thêm nhánh stride 4 để bắt vật thể nhỏ
+
+- File liên quan: utils/model.py, utils/config.py, train.py
+- Hiện tại model chỉ có FPN các mức STRIDES = [8, 16, 32].
+- Với ảnh 640x640, object rất nhỏ dễ bị “rơi” ngay từ stride 8 vì grid quá thưa.
+- Nên sửa:
+- Trong utils/model.py, lấy thêm feature map stride 4 từ layer1 của ResNet.
+- Thêm lateral 64 -> FPN_CHANNELS cho mức stride 4.
+- Thêm head_s4 tương tự head_s8, head_s16, head_s32.
+- Trả outputs với strides [4, 8, 16, 32].
+- Trong utils/config.py, đổi STRIDES = [4, 8, 16, 32].
+- Trong train.py, nhớ cộng tham số head_s4 vào build_optimizer().
+- Đây là thay đổi có xác suất cải thiện small-object recall mạnh nhất.
+
+Ưu tiên B. Tăng độ phân giải train/infer
+
+- File liên quan: utils/config.py, train.py, predict.py
+- IMG_SIZE hiện là 640.
+- Vì small recall chỉ 46.8%, nên nên thử 768 hoặc 800 trước.
+- Gợi ý:
+- Train với 768.
+- Infer cũng dùng 768.
+- Nếu đủ VRAM thì sau khi có stride 4, combo stride 4 + img_size 768 thường đáng thử nhất.
+
+Ưu tiên C. Giảm augmentation làm nhỏ vật thể quá mức
+
+- File liên quan: train.py, hàm get_train_transforms()
+- Hiện có A.Downscale(scale_range=(0.72, 0.90), p=1.0) nằm trong OneOf với p=0.18.
+- Với bài toán đang yếu ở small object, Downscale có thể làm mất luôn chi tiết tiny object.
+- Nên sửa:
+- Giảm mạnh xác suất Downscale, hoặc tắt hẳn trong vài lần ablation đầu.
+- A.Affine hiện có scale=(0.85, 1.25), tức là có cả zoom-out. Zoom-out cũng làm vật thể nhỏ khó học hơn.
+- Nên đổi thành scale=(0.95, 1.25) hoặc scale=(1.0, 1.35) nếu muốn ưu tiên small object.
+- RandomSizedBBoxSafeCrop hiện p=0.24. Có thể tăng lên khoảng 0.30 đến 0.40 để crop gần object hơn, giúp object nhỏ phóng to tương đối trên khung hình.
+
+Ưu tiên D. Tăng trọng số sampling cho small-object image
+
+- File liên quan: utils/config.py, train.py
+- Trong train.py đã có small_bonus trong build_sample_weights(), nhưng hiện:
+- SMALL_OBJECT_AREA_RATIO = 0.012
+- SMALL_OBJECT_BONUS = 0.70
+- Vì small recall còn quá thấp, nên có thể thử:
+- SMALL_OBJECT_AREA_RATIO = 0.02
+- SMALL_OBJECT_BONUS = 1.1 đến 1.4
+- Ý tưởng là làm cho ảnh có small object được lặp lại nhiều hơn trong sampler.
+
+Ưu tiên E. Tích hợp Mosaic/MixUp đang có sẵn trong utils/process.py vào train thật
+
+- File liên quan: utils/process.py, train.py
+- utils/process.py đã có build_mosaic() và maybe_mixup(), nhưng train.py hiện chưa dùng.
+- Đây là phần rất đáng tận dụng, nhất là cho small object và crowded scene.
+- Nên làm:
+- Tạo một nhánh augmentation trong DetectionDataset để thỉnh thoảng build mosaic trước khi qua Albumentations.
+- Không nên bật quá mạnh từ đầu. Có thể thử mosaic p khoảng 0.20 đến 0.35, mixup p khoảng 0.10 đến 0.20.
+
+Ưu tiên F. Nới target assignment cho tiny object
+
+- File liên quan: utils/config.py, utils/loss.py
+- Hiện target assignment có:
+- CENTER_RADIUS = 2.5
+- TINY_OBJECT_MAX_SIDE_FACTOR = 2.0
+- TINY_ASSIGN_EXPAND_STRIDE = 0.75
+- Với small object, positive point rất dễ quá ít.
+- Nên thử:
+- CENTER_RADIUS = 3.0 hoặc 3.5
+- TINY_OBJECT_MAX_SIDE_FACTOR = 3.0
+- TINY_ASSIGN_EXPAND_STRIDE = 1.0 hoặc 1.25
+- Ngoài ra có thể ablation thêm cờ --no_scale_ranges để xem việc bỏ scale-range cứng có giúp small object hay không.
+- Nếu không thêm stride 4, phần nới assignment này càng quan trọng.
+
+Ưu tiên G. Chọn best checkpoint theo mAP thay vì chỉ theo val_loss
+
+- File liên quan: train.py
+- Hiện train.py lưu best.pth theo val_loss nhỏ nhất.
+- Nhưng mục tiêu cuối là mAP, và val_loss không phải lúc nào cũng đồng biến với mAP.
+- Nên sửa:
+- Sau mỗi epoch hoặc mỗi vài epoch, chạy predict + evaluate trên val.
+- Lưu thêm best_map.pth theo mAP@0.5 cao nhất.
+- Đây là thay đổi rất nên làm vì có thể giúp tăng mAP mà không đổi kiến trúc.
+
+Ưu tiên H. Dùng scheduler có warmup thay vì CosineAnnealingLR thuần
+
+- File liên quan: train.py, utils/runtime.py
+- train.py đang dùng CosineAnnealingLR trực tiếp.
+- Trong utils/runtime.py đã có get_scheduler() với Linear warmup + Cosine.
+- Nên đổi sang scheduler có warmup, đặc biệt khi backbone pretrained và head learning rate cao hơn backbone.
+- Sau đó có thể tăng số epoch lên 45 đến 60, nhưng chỉ nên làm khi đã chọn checkpoint theo mAP.
+
+Ưu tiên I. Nới hậu xử lý để giảm số ảnh “không ra box nào”
+
+- File liên quan: utils/config.py, predict.py, utils/nms.py
+- Hiện notebook đang chạy predict.py mà TTA fallback = False.
+- Trong hardcase có 23/50 ảnh pred_count = 0, nên inference đang hơi bảo thủ.
+- Các thử nghiệm inference-only nên làm trước vì rẻ:
+- Bật --tta_fallback.
+- Đổi center_combine từ "sqrt" sang "soft".
+- Giảm MIN_EXPORT_CONF từ 0.30 xuống 0.20 hoặc 0.25.
+- Tối ưu lại CLASS_CONF_THRESH theo từng lớp thay vì dùng gần như đồng đều 0.35.
+- Vì chair đang precision rất thấp, không nên hạ chair threshold quá mạnh.
+- Ngược lại person/car/dog có thể thử hạ nhẹ để cứu recall.
+
+Gợi ý lệnh thử nhanh không cần train lại:
+
+python predict.py --image_dir ./public/val/images --output val_predictions_tta.json --model_path ./models/best.pth --tta_fallback --center_combine soft --class_conf 0.30,0.30,0.30,0.30,0.40
+
+python public/tools/evaluate_predictions.py --ground_truth public/annotations/val.json --predictions val_predictions_tta.json --output val_score_tta.json
+
+Ưu tiên J. Xem lại heuristic suppress box cùng lớp bị chứa nhau
+
+- File liên quan: predict.py, utils/nms.py
+- Hiện có _suppress_same_class_contained() và _suppress_same_class_contained_int().
+- Heuristic này có thể làm mất object nhỏ nằm trong object lớn cùng lớp, nhất là crowded small-person hoặc small-chair.
+- Đây không phải bước chuẩn của detector thông thường, nên nên ablation:
+- Tắt heuristic này một lần để đo lại mAP.
+- Nếu mAP tăng hoặc small recall tăng, nên bỏ hẳn hoặc nới điều kiện suppress.
+
+Ưu tiên K. Xem lại suppress_chair_inside_person()
+
+- File liên quan: predict.py
+- Heuristic này được thêm để giảm FP của chair.
+- Tuy nhiên chair hiện vừa AP thấp vừa precision rất thấp, nên có thể heuristic này đang đúng hướng cho precision nhưng có nguy cơ làm giảm recall ở vài ca.
+- Nên giữ đây như một ablation riêng:
+- Chạy 1 lần có suppress.
+- Chạy 1 lần không suppress.
+- So mAP và riêng AP của chair.
+
+4. Riêng cho large object bị miss
+
+- Large recall toàn cục đang là 93.1%, nên không phải điểm nghẽn chính.
+- Nhưng vẫn có 8 large GT bị miss trong nhóm hardcase.
+- Một phần trong số này có dấu hiệu nhầm lớp hơn là không thấy object.
+- Ví dụ có ca dog lớn bị đoán thành cat.
+- Vì vậy với large object, nên ưu tiên:
+- Nới hậu xử lý và centerness ở predict.py trước.
+- Kiểm tra heuristic suppress box.
+- Kiểm tra confusion dog/cat, person/chair.
+- Chỉ khi đã làm các bước trên mà large miss vẫn còn đáng kể mới tính tới việc tăng capacity head hoặc backbone.
+
+5. Thứ tự thử thực tế mình đề xuất
+
+Bước 1. Không train lại, chỉ thử inference:
+- bật --tta_fallback
+- center_combine = soft
+- hạ nhẹ class_conf cho person/car/dog
+- đo lại val_score.json
+
+Bước 2. Train lại bản nhẹ:
+- bỏ hoặc giảm Downscale
+- giảm zoom-out trong Affine
+- tăng small-object sampling bonus
+- chọn best checkpoint theo mAP
+
+Bước 3. Train lại bản mạnh:
+- thêm stride 4 branch
+- img_size = 768
+- nới tiny assignment
+- tích hợp mosaic/mixup từ utils/process.py
+
+6. Kết luận cuối
+
+- Nếu chỉ chọn một thay đổi lớn nhất để tăng mAP cho bài này, mình chọn:
+- thêm nhánh stride 4 + tăng img_size + giảm augmentation làm nhỏ object.
+- Nếu chỉ chọn một thay đổi rẻ nhất để thử ngay, mình chọn:
+- predict.py với --tta_fallback và center_combine = soft, sau đó tối ưu lại class_conf theo val.
