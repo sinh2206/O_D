@@ -60,6 +60,30 @@ def should_pin_memory(device: torch.device) -> bool:
     return device.type == "cuda" and torch.cuda.is_available()
 
 
+def should_use_channels_last(device: torch.device, requested: bool = False) -> bool:
+    return bool(requested and device.type == "cuda" and torch.cuda.is_available())
+
+
+def should_use_data_parallel(device: torch.device, requested: bool = False) -> bool:
+    return bool(requested and device.type == "cuda" and torch.cuda.is_available() and torch.cuda.device_count() > 1)
+
+
+def should_use_non_blocking(device: torch.device, requested: bool = False) -> bool:
+    return bool(requested and device.type == "cuda" and torch.cuda.is_available())
+
+
+def move_tensor_to_device(
+    tensor: torch.Tensor,
+    device: torch.device,
+    non_blocking: bool = False,
+    channels_last: bool = False,
+) -> torch.Tensor:
+    out = tensor.to(device, non_blocking=non_blocking)
+    if channels_last and out.dim() == 4:
+        out = out.contiguous(memory_format=torch.channels_last)
+    return out
+
+
 def create_grad_scaler(device: torch.device, enabled: bool) -> Any:
     amp_enabled = bool(enabled and device.type == "cuda")
     if hasattr(torch, "amp") and hasattr(torch.amp, "GradScaler"):

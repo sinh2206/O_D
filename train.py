@@ -48,7 +48,15 @@ from utils.config import (
 )
 from utils.loss import DetectionLoss
 from utils.model import AnchorFreeDetector
-from utils.runtime import create_grad_scaler, resolve_num_workers, should_pin_memory
+from utils.runtime import (
+    create_grad_scaler,
+    move_tensor_to_device,
+    resolve_num_workers,
+    should_pin_memory,
+    should_use_channels_last,
+    should_use_data_parallel,
+    should_use_non_blocking,
+)
 
 VALID_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 
@@ -463,6 +471,8 @@ def train_one_epoch(
     scaler: torch.cuda.amp.GradScaler,
     amp_enabled: bool,
     grad_accum_steps: int = 1,
+    use_channels_last: bool = False,
+    non_blocking_cuda: bool = False,
 ) -> Dict[str, float]:
     model.train()
     running = {"loss": 0.0, "loss_cls": 0.0, "loss_reg": 0.0, "loss_ctr": 0.0}
@@ -471,7 +481,12 @@ def train_one_epoch(
 
     optimizer.zero_grad(set_to_none=True)
     for batch_idx, (images, targets) in enumerate(loader, start=1):
-        images = images.to(device, non_blocking=True).to(memory_format=torch.channels_last)
+        images = move_tensor_to_device(
+            images,
+            device=device,
+            non_blocking=non_blocking_cuda,
+            channels_last=use_channels_last,
+        )
         targets = move_targets_to_device(targets, device)
 
         with torch.autocast(device_type=device.type, enabled=amp_enabled):
@@ -510,13 +525,20 @@ def validate_one_epoch(
     loader: DataLoader,
     device: torch.device,
     amp_enabled: bool,
+    use_channels_last: bool = False,
+    non_blocking_cuda: bool = False,
 ) -> Dict[str, float]:
     model.eval()
     running = {"loss": 0.0, "loss_cls": 0.0, "loss_reg": 0.0, "loss_ctr": 0.0}
     steps = 0
 
     for images, targets in loader:
-        images = images.to(device, non_blocking=True).to(memory_format=torch.channels_last)
+        images = move_tensor_to_device(
+            images,
+            device=device,
+            non_blocking=non_blocking_cuda,
+            channels_last=use_channels_last,
+        )
         targets = move_targets_to_device(targets, device)
 
         with torch.autocast(device_type=device.type, enabled=amp_enabled):
@@ -603,19 +625,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no_balanced_sampling", action="store_true")
     parser.add_argument("--no_class_weights", action="store_true")
     parser.add_argument("--no_amp", action="store_true")
+    parser.add_argument("--channels_last", action="store_true", help="Opt in to NHWC/channels_last memory format on CUDA.")
+    parser.add_argument("--data_parallel", action="store_true", help="Opt in to nn.DataParallel when multiple GPUs are visible.")
+    parser.add_argument("--non_blocking_cuda", action="store_true", help="Opt in to asynchronous host-to-device copies.")
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
     seed_everything(args.seed)
-    torch.backends.cudnn.benchmark = True
+    torch.backends.cudnn.benchmark = False
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
     torch.set_float32_matmul_precision("high")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     amp_enabled = (device.type == "cuda") and (not args.no_amp)
+    use_channels_last = should_use_channels_last(device, requested=bool(args.channels_last))
+    non_blocking_cuda = should_use_non_blocking(device, requested=bool(args.non_blocking_cuda))
     resolved_workers, max_safe_workers = resolve_num_workers(int(args.num_workers))
     pin_memory = should_pin_memory(device)
 
@@ -656,9 +683,11 @@ def main() -> None:
         pin_memory=pin_memory,
     )
 
-    base_model = AnchorFreeDetector(num_classes=num_classes, pretrained=True).to(device).to(memory_format=torch.channels_last)
+    base_model = AnchorFreeDetector(num_classes=num_classes, pretrained=True).to(device)
+    if use_channels_last:
+        base_model = base_model.to(memory_format=torch.channels_last)
     num_visible_gpus = torch.cuda.device_count() if device.type == "cuda" else 0
-    multi_gpu_enabled = device.type == "cuda" and num_visible_gpus > 1
+    multi_gpu_enabled = should_use_data_parallel(device, requested=bool(args.data_parallel))
     model: nn.Module = nn.DataParallel(base_model) if multi_gpu_enabled else base_model
     criterion = DetectionLoss(
         num_classes=num_classes,
@@ -708,6 +737,7 @@ def main() -> None:
 
     print(f"Device: {device}, AMP: {amp_enabled}")
     print(f"Visible GPUs: {num_visible_gpus}, DataParallel: {multi_gpu_enabled}")
+    print(f"channels_last: {use_channels_last}, non_blocking_cuda: {non_blocking_cuda}")
     print(f"Train samples: {len(train_ds)}, Val samples: {len(val_ds)}, Classes: {classes}")
     print(f"Balanced sampling: {not args.no_balanced_sampling}")
     print(f"Class weights enabled: {not args.no_class_weights}")
@@ -727,6 +757,8 @@ def main() -> None:
             scaler=scaler,
             amp_enabled=amp_enabled,
             grad_accum_steps=max(1, int(args.grad_accum_steps)),
+            use_channels_last=use_channels_last,
+            non_blocking_cuda=non_blocking_cuda,
         )
         val_metrics = validate_one_epoch(
             model=model,
@@ -734,6 +766,8 @@ def main() -> None:
             loader=val_loader,
             device=device,
             amp_enabled=amp_enabled,
+            use_channels_last=use_channels_last,
+            non_blocking_cuda=non_blocking_cuda,
         )
         scheduler.step()
 
