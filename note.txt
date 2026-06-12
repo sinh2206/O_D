@@ -1,196 +1,270 @@
-Đánh giá nhanh từ train.py, predict.py, utils/ và results/hardcase_summary.json
+Tổng hợp các thay đổi đã có trong train.py, predict.py và thư mục utils để đi theo 3 ưu tiên:
 
-1. Hiện trạng
+- Ưu tiên A: thêm nhánh stride 4 để bắt vật thể nhỏ.
+- Ưu tiên B: tăng độ phân giải train/infer.
+- Ưu tiên C: giảm augmentation làm vật thể bị nhỏ đi quá mức.
 
-- mAP@0.5 hiện tại: 0.725082
-- Micro recall: 0.790698
-- Micro precision: 0.492906
-- Trong 50 hardcase có 23 ảnh pred_count = 0, tức là mô hình hoàn toàn không trả ra box nào ở khá nhiều ca lỗi nặng.
-- Nếu chia GT theo kích thước tương đối trên ảnh:
-- Small: recall 133 / 284 = 0.4683
-- Medium: recall 751 / 970 = 0.7742
-- Large: recall 714 / 767 = 0.9309
-- Nghĩa là điểm nghẽn lớn nhất hiện tại là small object, không phải large object.
-- Với hardcase đang miss, số GT chưa bắt được theo size là:
-- Small: 42
-- Medium: 27
-- Large: 8
-- Recall small object theo lớp đang rất yếu:
-- person: 77 / 170 = 0.4529
-- car: 54 / 88 = 0.6136
-- dog: 1 / 6 = 0.1667
-- cat: 0 / 3 = 0.0
-- chair: 1 / 17 = 0.0588
-- Large object nhìn chung không phải vấn đề chính toàn cục, nhưng vẫn có vài hardcase lớn bị miss do nhầm lớp hoặc do pipeline hậu xử lý quá chặt.
 
-2. Kết luận ngắn
+1. Tổng quan hiện trạng code
 
-- Nếu muốn tăng mAP rõ rệt, nên ưu tiên sửa cho small object trước.
-- Large object miss có tồn tại, nhưng ít hơn nhiều. Nhóm này nên xử lý bằng giảm nhầm lớp và nới hậu xử lý, không phải ưu tiên hàng đầu bằng thay backbone ngay.
+- Code hiện tại đã chuyển từ FPN 3 mức sang FPN 4 mức với STRIDES = [4, 8, 16, 32].
+- Pipeline train, loss, decode, NMS và predict đã được đồng bộ để hiểu đầu ra 4 mức.
+- Augmentation train đã được chỉnh theo hướng ưu tiên small object: tắt Downscale mặc định, tăng crop gần object, bỏ zoom-out trong Affine.
+- Một điểm cần lưu ý: utils/config.py hiện đang để IMG_SIZE = 704, chưa phải 768 như ưu tiên B ban đầu. Tức là code đã đi theo hướng tăng độ phân giải, nhưng nếu muốn bám đúng ưu tiên B thì nên đổi lại 768.
 
-3. Các thay đổi nên làm, theo thứ tự ưu tiên
 
-Ưu tiên A. Thêm nhánh stride 4 để bắt vật thể nhỏ
+2. Các thay đổi cho ưu tiên A: thêm nhánh stride 4
 
-- File liên quan: utils/model.py, utils/config.py, train.py
-- Hiện tại model chỉ có FPN các mức STRIDES = [8, 16, 32].
-- Với ảnh 640x640, object rất nhỏ dễ bị “rơi” ngay từ stride 8 vì grid quá thưa.
-- Nên sửa:
-- Trong utils/model.py, lấy thêm feature map stride 4 từ layer1 của ResNet.
-- Thêm lateral 64 -> FPN_CHANNELS cho mức stride 4.
-- Thêm head_s4 tương tự head_s8, head_s16, head_s32.
-- Trả outputs với strides [4, 8, 16, 32].
-- Trong utils/config.py, đổi STRIDES = [4, 8, 16, 32].
-- Trong train.py, nhớ cộng tham số head_s4 vào build_optimizer().
-- Đây là thay đổi có xác suất cải thiện small-object recall mạnh nhất.
+2.1. utils/config.py
 
-Ưu tiên B. Tăng độ phân giải train/infer
+- STRIDES đã đổi thành [4, 8, 16, 32].
+- Công hiệu:
+- Toàn bộ hệ thống train và infer sẽ coi stride 4 là một mức dự đoán hợp lệ.
+- Grid stride 4 dày hơn nhiều so với stride 8, nên vật thể rất nhỏ ít bị “lọt” hơn.
+- Có thể tùy chỉnh:
+- Nếu muốn quay lại baseline cũ để ablation, có thể đổi lại [8, 16, 32], nhưng lúc đó phải đồng bộ lại model, loss và checkpoint.
 
-- File liên quan: utils/config.py, train.py, predict.py
-- IMG_SIZE hiện là 640.
-- Vì small recall chỉ 46.8%, nên nên thử 768 hoặc 800 trước.
-- Gợi ý:
-- Train với 768.
-- Infer cũng dùng 768.
-- Nếu đủ VRAM thì sau khi có stride 4, combo stride 4 + img_size 768 thường đáng thử nhất.
+2.2. utils/model.py
 
-Ưu tiên C. Giảm augmentation làm nhỏ vật thể quá mức
+- Backbone/FPN đã đổi sang 4 mức:
+- Lấy thêm feature map stride 4 từ layer1 của ResNet.
+- Thêm lateral1: 64 -> FPN_CHANNELS.
+- Thêm fpn_out1 cho mức stride 4.
+- Thêm head_s4 song song với head_s8, head_s16, head_s32.
+- forward() trả ra:
+- features: stride4, stride8, stride16, stride32
+- cls_logits 4 mức
+- reg_preds 4 mức
+- center_logits 4 mức
+- strides: [4, 8, 16, 32]
+- Công hiệu:
+- Đây là thay đổi quan trọng nhất cho small-object recall.
+- Vật thể nhỏ có thêm cơ hội được match ở lưới dày hơn, đặc biệt khi object quá bé so với stride 8.
+- Có thể tùy chỉnh:
+- FPN_CHANNELS hiện là 128. Nếu đủ VRAM có thể thử tăng lên 160 hoặc 192 để tăng capacity head.
+- num_convs trong head hiện là 2; có thể thử 3 nếu muốn head mạnh hơn, nhưng sẽ tốn VRAM và thời gian train hơn.
 
-- File liên quan: train.py, hàm get_train_transforms()
-- Hiện có A.Downscale(scale_range=(0.72, 0.90), p=1.0) nằm trong OneOf với p=0.18.
-- Với bài toán đang yếu ở small object, Downscale có thể làm mất luôn chi tiết tiny object.
-- Nên sửa:
-- Giảm mạnh xác suất Downscale, hoặc tắt hẳn trong vài lần ablation đầu.
-- A.Affine hiện có scale=(0.85, 1.25), tức là có cả zoom-out. Zoom-out cũng làm vật thể nhỏ khó học hơn.
-- Nên đổi thành scale=(0.95, 1.25) hoặc scale=(1.0, 1.35) nếu muốn ưu tiên small object.
-- RandomSizedBBoxSafeCrop hiện p=0.24. Có thể tăng lên khoảng 0.30 đến 0.40 để crop gần object hơn, giúp object nhỏ phóng to tương đối trên khung hình.
+2.3. train.py
 
-Ưu tiên D. Tăng trọng số sampling cho small-object image
+- build_optimizer() đã cộng thêm tham số của head_s4.
+- save_checkpoint() lưu thêm trường strides vào checkpoint.
+- resume checkpoint có kiểm tra stride cũ và cảnh báo nếu checkpoint không khớp kiến trúc mới.
+- Công hiệu:
+- head_s4 được train đúng cách, không bị bỏ sót tham số.
+- Checkpoint mới tự mô tả rõ đang train với kiến trúc 4 mức.
+- Có thể tùy chỉnh:
+- Nếu fine-tune từ checkpoint cũ 3 mức, nhánh stride 4 sẽ khởi tạo mới và cần thêm epoch để học ổn định.
 
-- File liên quan: utils/config.py, train.py
-- Trong train.py đã có small_bonus trong build_sample_weights(), nhưng hiện:
-- SMALL_OBJECT_AREA_RATIO = 0.012
-- SMALL_OBJECT_BONUS = 0.70
-- Vì small recall còn quá thấp, nên có thể thử:
-- SMALL_OBJECT_AREA_RATIO = 0.02
-- SMALL_OBJECT_BONUS = 1.1 đến 1.4
-- Ý tưởng là làm cho ảnh có small object được lặp lại nhiều hơn trong sampler.
+2.4. utils/loss.py
 
-Ưu tiên E. Tích hợp Mosaic/MixUp đang có sẵn trong utils/process.py vào train thật
+- Loss đã đọc outputs["strides"] theo 4 mức.
+- build_targets() và compute_loss() đã chạy qua toàn bộ các mức stride 4, 8, 16, 32.
+- TINY_OBJECT_MAX_SIDE_FACTOR = 2.0 và TINY_ASSIGN_EXPAND_STRIDE = 0.75 đang được dùng để nới target assignment cho tiny object.
+- DetectionLoss nhận use_scale_ranges và tiny_assign_expand_stride làm tham số.
+- Công hiệu:
+- Không chỉ model có thêm head_s4, mà target assignment và loss cũng thật sự huấn luyện mức stride 4.
+- tiny object được nới vùng gán nhãn, giúp tăng xác suất có positive point.
+- Có thể tùy chỉnh:
+- TINY_ASSIGN_EXPAND_STRIDE có thể tăng lên 1.0 nếu vẫn bị miss nhiều tiny object.
+- Có thể thử --no_scale_ranges để ablation khi nghi scale range đang bó quá chặt.
 
-- File liên quan: utils/process.py, train.py
-- utils/process.py đã có build_mosaic() và maybe_mixup(), nhưng train.py hiện chưa dùng.
-- Đây là phần rất đáng tận dụng, nhất là cho small object và crowded scene.
-- Nên làm:
-- Tạo một nhánh augmentation trong DetectionDataset để thỉnh thoảng build mosaic trước khi qua Albumentations.
-- Không nên bật quá mạnh từ đầu. Có thể thử mosaic p khoảng 0.20 đến 0.35, mixup p khoảng 0.10 đến 0.20.
+2.5. utils/nms.py và utils/forecast.py
 
-Ưu tiên F. Nới target assignment cho tiny object
+- Các module decode đã đồng bộ sang 4 mức.
+- utils/nms.py dùng STRIDES = [4, 8, 16, 32] khi giải mã box.
+- utils/forecast.py cũng đã có head_s4 và decode 4 mức tương ứng.
+- Công hiệu:
+- Sau khi model sinh ra nhánh stride 4, phần decode/NMS không bị lệch định dạng.
+- Có thể tùy chỉnh:
+- center_combine trong decode hiện hỗ trợ cls, soft, sqrt, mul. Với bài toán recall nhỏ, soft hoặc sqrt thường đáng thử.
 
-- File liên quan: utils/config.py, utils/loss.py
-- Hiện target assignment có:
-- CENTER_RADIUS = 2.5
-- TINY_OBJECT_MAX_SIDE_FACTOR = 2.0
-- TINY_ASSIGN_EXPAND_STRIDE = 0.75
-- Với small object, positive point rất dễ quá ít.
-- Nên thử:
-- CENTER_RADIUS = 3.0 hoặc 3.5
-- TINY_OBJECT_MAX_SIDE_FACTOR = 3.0
-- TINY_ASSIGN_EXPAND_STRIDE = 1.0 hoặc 1.25
-- Ngoài ra có thể ablation thêm cờ --no_scale_ranges để xem việc bỏ scale-range cứng có giúp small object hay không.
-- Nếu không thêm stride 4, phần nới assignment này càng quan trọng.
+2.6. predict.py
 
-Ưu tiên G. Chọn best checkpoint theo mAP thay vì chỉ theo val_loss
+- load_checkpoint_model() có kiểm tra checkpoint có khớp với kiến trúc stride 4 hay không.
+- Nếu checkpoint vẫn là bản 3 mức cũ, predict sẽ báo lỗi rõ ràng thay vì chạy sai âm thầm.
+- Công hiệu:
+- Tránh trường hợp dùng nhầm checkpoint cũ rồi đánh giá sai chất lượng mô hình mới.
+- Có thể tùy chỉnh:
+- Không nên bỏ kiểm tra này, vì rất dễ nhầm checkpoint sau khi đổi kiến trúc.
 
-- File liên quan: train.py
-- Hiện train.py lưu best.pth theo val_loss nhỏ nhất.
-- Nhưng mục tiêu cuối là mAP, và val_loss không phải lúc nào cũng đồng biến với mAP.
-- Nên sửa:
-- Sau mỗi epoch hoặc mỗi vài epoch, chạy predict + evaluate trên val.
-- Lưu thêm best_map.pth theo mAP@0.5 cao nhất.
-- Đây là thay đổi rất nên làm vì có thể giúp tăng mAP mà không đổi kiến trúc.
 
-Ưu tiên H. Dùng scheduler có warmup thay vì CosineAnnealingLR thuần
+3. Các thay đổi cho ưu tiên B: tăng độ phân giải train/infer
 
-- File liên quan: train.py, utils/runtime.py
-- train.py đang dùng CosineAnnealingLR trực tiếp.
-- Trong utils/runtime.py đã có get_scheduler() với Linear warmup + Cosine.
-- Nên đổi sang scheduler có warmup, đặc biệt khi backbone pretrained và head learning rate cao hơn backbone.
-- Sau đó có thể tăng số epoch lên 45 đến 60, nhưng chỉ nên làm khi đã chọn checkpoint theo mAP.
+3.1. utils/config.py
 
-Ưu tiên I. Nới hậu xử lý để giảm số ảnh “không ra box nào”
+- IMG_SIZE hiện đang là 704.
+- Điều này có nghĩa:
+- Train mặc định dùng 704.
+- Predict mặc định cũng dùng 704.
+- Công hiệu:
+- 704 lớn hơn 640 nên vật thể nhỏ được phóng to thêm tương đối.
+- Đây là bước đệm tốt nếu VRAM chưa chắc chịu nổi 768 hoặc 800.
+- Có thể tùy chỉnh:
+- Nếu muốn bám đúng ưu tiên B ban đầu, đổi IMG_SIZE = 768.
+- Nếu GPU còn khỏe và batch đủ nhỏ, có thể thử 800.
+- Nếu lên 768 hoặc 800 thì cần theo dõi lại VRAM, batch_size và tốc độ train.
 
-- File liên quan: utils/config.py, predict.py, utils/nms.py
-- Hiện notebook đang chạy predict.py mà TTA fallback = False.
-- Trong hardcase có 23/50 ảnh pred_count = 0, nên inference đang hơi bảo thủ.
-- Các thử nghiệm inference-only nên làm trước vì rẻ:
-- Bật --tta_fallback.
-- Đổi center_combine từ "sqrt" sang "soft".
-- Giảm MIN_EXPORT_CONF từ 0.30 xuống 0.20 hoặc 0.25.
-- Tối ưu lại CLASS_CONF_THRESH theo từng lớp thay vì dùng gần như đồng đều 0.35.
-- Vì chair đang precision rất thấp, không nên hạ chair threshold quá mạnh.
-- Ngược lại person/car/dog có thể thử hạ nhẹ để cứu recall.
+3.2. train.py
 
-Gợi ý lệnh thử nhanh không cần train lại:
+- parser đang lấy mặc định --img_size từ IMG_SIZE trong config.
+- batch_size mặc định là 4.
+- grad_accum_steps mặc định là 2.
+- Công hiệu:
+- batch thật trên GPU nhỏ hơn, nhưng gradient accumulation giúp giữ effective batch lớn hơn.
+- Đây là cách thực dụng để đi kèm ảnh lớn hơn mà không vượt VRAM quá sớm.
+- Có thể tùy chỉnh:
+- Nếu đổi IMG_SIZE lên 768 mà vẫn ổn VRAM, có thể giữ batch_size = 4.
+- Nếu bị OOM, hạ batch_size = 2 và tăng grad_accum_steps = 4.
+- Nếu muốn train nhanh hơn ở 704, có thể giảm grad_accum_steps về 1.
 
-python predict.py --image_dir ./public/val/images --output val_predictions_tta.json --model_path ./models/best.pth --tta_fallback --center_combine soft --class_conf 0.30,0.30,0.30,0.30,0.40
+3.3. predict.py
 
-python public/tools/evaluate_predictions.py --ground_truth public/annotations/val.json --predictions val_predictions_tta.json --output val_score_tta.json
+- predict mặc định dùng --img_size lấy từ IMG_SIZE trong config.
+- letterbox_preprocess() resize và pad theo img_size hiện tại.
+- run_inference() và TTA fallback đều dùng đúng img_size đó.
+- Công hiệu:
+- Train và infer giữ cùng không gian scale, giảm lệch do preprocess.
+- Small object ở val cũng được nhìn ở độ phân giải lớn hơn.
+- Có thể tùy chỉnh:
+- Có thể infer với 768 dù train ở 704, nhưng tốt nhất train và infer cùng một mức trong các lượt ablation đầu.
 
-Ưu tiên J. Xem lại heuristic suppress box cùng lớp bị chứa nhau
+3.4. Điều cần lưu ý
 
-- File liên quan: predict.py, utils/nms.py
-- Hiện có _suppress_same_class_contained() và _suppress_same_class_contained_int().
-- Heuristic này có thể làm mất object nhỏ nằm trong object lớn cùng lớp, nhất là crowded small-person hoặc small-chair.
-- Đây không phải bước chuẩn của detector thông thường, nên nên ablation:
-- Tắt heuristic này một lần để đo lại mAP.
-- Nếu mAP tăng hoặc small recall tăng, nên bỏ hẳn hoặc nới điều kiện suppress.
+- Ý tưởng ưu tiên B ban đầu là 768 hoặc 800.
+- Code hiện tại mới ở mức trung gian 704.
+- Nếu mục tiêu là “bám đúng đề xuất small-object mạnh nhất”, nên đổi 704 -> 768 trước, rồi so lại mAP và recall small.
 
-Ưu tiên K. Xem lại suppress_chair_inside_person()
 
-- File liên quan: predict.py
-- Heuristic này được thêm để giảm FP của chair.
-- Tuy nhiên chair hiện vừa AP thấp vừa precision rất thấp, nên có thể heuristic này đang đúng hướng cho precision nhưng có nguy cơ làm giảm recall ở vài ca.
-- Nên giữ đây như một ablation riêng:
-- Chạy 1 lần có suppress.
-- Chạy 1 lần không suppress.
-- So mAP và riêng AP của chair.
+4. Các thay đổi cho ưu tiên C: giảm augmentation làm nhỏ vật thể quá mức
 
-4. Riêng cho large object bị miss
+4.1. utils/config.py
 
-- Large recall toàn cục đang là 93.1%, nên không phải điểm nghẽn chính.
-- Nhưng vẫn có 8 large GT bị miss trong nhóm hardcase.
-- Một phần trong số này có dấu hiệu nhầm lớp hơn là không thấy object.
-- Ví dụ có ca dog lớn bị đoán thành cat.
-- Vì vậy với large object, nên ưu tiên:
-- Nới hậu xử lý và centerness ở predict.py trước.
-- Kiểm tra heuristic suppress box.
-- Kiểm tra confusion dog/cat, person/chair.
-- Chỉ khi đã làm các bước trên mà large miss vẫn còn đáng kể mới tính tới việc tăng capacity head hoặc backbone.
+- TRAIN_RANDOM_CROP_PROB = 0.36
+- TRAIN_AFFINE_SCALE = (1.0, 1.35)
+- TRAIN_AFFINE_TRANSLATE = (-0.04, 0.04)
+- TRAIN_AFFINE_ROTATE = (-4, 4)
+- TRAIN_AFFINE_SHEAR = (-1.0, 1.0)
+- TRAIN_AFFINE_PROB = 0.20
+- TRAIN_DEGRADE_ONEOF_PROB = 0.18
+- TRAIN_ENABLE_DOWNSCALE = False
+- TRAIN_DOWNSCALE_SCALE = (0.72, 0.90)
+- Công hiệu:
+- Các tham số quan trọng đã được đưa về config để tiện ablation, thay vì hard-code trong train.py.
 
-5. Thứ tự thử thực tế mình đề xuất
+4.2. train.py, hàm get_train_transforms()
 
-Bước 1. Không train lại, chỉ thử inference:
-- bật --tta_fallback
-- center_combine = soft
-- hạ nhẹ class_conf cho person/car/dog
-- đo lại val_score.json
+- RandomSizedBBoxSafeCrop đã tăng lên p = 0.36.
+- Affine scale đã đổi từ kiểu có zoom-out sang (1.0, 1.35), tức là chỉ zoom-in hoặc giữ nguyên.
+- Downscale không còn bật mặc định nữa; chỉ được thêm vào OneOf khi TRAIN_ENABLE_DOWNSCALE = True.
+- OneOf degrade hiện chủ yếu là GaussianBlur và MotionBlur.
+- Công hiệu:
+- Crop gần object hơn giúp vật thể nhỏ chiếm tỉ lệ lớn hơn trong khung hình train.
+- Bỏ zoom-out giúp tránh làm object vốn đã nhỏ bị nhỏ thêm.
+- Tắt Downscale giúp giữ texture/chi tiết tiny object tốt hơn trong các lượt ablation đầu.
+- Có thể tùy chỉnh:
+- TRAIN_RANDOM_CROP_PROB nên thử trong khoảng 0.30 đến 0.40.
+- TRAIN_AFFINE_SCALE có thể thử (0.95, 1.25) nếu muốn bớt zoom-in mạnh.
+- TRAIN_ENABLE_DOWNSCALE nên giữ False ở giai đoạn đầu; nếu sau này muốn tăng robustness, có thể bật lại và giảm xác suất bằng cách hạ TRAIN_DEGRADE_ONEOF_PROB.
 
-Bước 2. Train lại bản nhẹ:
-- bỏ hoặc giảm Downscale
-- giảm zoom-out trong Affine
-- tăng small-object sampling bonus
-- chọn best checkpoint theo mAP
+4.3. utils/process.py
 
-Bước 3. Train lại bản mạnh:
-- thêm stride 4 branch
-- img_size = 768
-- nới tiny assignment
-- tích hợp mosaic/mixup từ utils/process.py
+- build_train_transform() đã đồng bộ với train.py:
+- dùng cùng crop probability
+- dùng cùng Affine scale/translate/rotate/shear
+- dùng cùng degrade probability
+- Công hiệu:
+- Preview augmentation trong utils/process.py sẽ phản ánh gần đúng augmentation train thật.
+- Khi bạn export ảnh augment để soi bằng mắt, kết quả không bị lệch khỏi pipeline huấn luyện.
+- Có thể tùy chỉnh:
+- Nếu muốn xem ảnh augment “gắt” hơn để debug, có thể tăng tạm các p trong utils/config.py rồi chạy lại preview.
 
-6. Kết luận cuối
 
-- Nếu chỉ chọn một thay đổi lớn nhất để tăng mAP cho bài này, mình chọn:
-- thêm nhánh stride 4 + tăng img_size + giảm augmentation làm nhỏ object.
-- Nếu chỉ chọn một thay đổi rẻ nhất để thử ngay, mình chọn:
-- predict.py với --tta_fallback và center_combine = soft, sau đó tối ưu lại class_conf theo val.
+5. Các thay đổi bổ trợ khác cũng có lợi cho small object
+
+5.1. train.py: class weights và sample weights
+
+- compute_class_weights() hiện có thể tính từ chính train_samples và val_samples.
+- build_sample_weights() có crowd_bonus và small_bonus.
+- small_bonus dựa trên SMALL_OBJECT_AREA_RATIO và SMALL_OBJECT_BONUS.
+- Công hiệu:
+- Ảnh chứa object nhỏ được sampler ưu tiên hơn một chút.
+- Các class khó như chair, cat, dog cũng được đẩy trọng số lên nhẹ.
+- Có thể tùy chỉnh:
+- SMALL_OBJECT_BONUS hiện là 0.70. Nếu small recall còn thấp, có thể thử 0.9 hoặc 1.0.
+- CLASS_LOSS_WEIGHTS và CLASS_SAMPLER_WEIGHTS có thể tinh chỉnh theo confusion thực tế trên val.
+
+5.2. utils/loss.py: tiny-object assignment
+
+- tiny object không chỉ được lợi từ stride 4, mà còn được nới assignment bằng TINY_ASSIGN_EXPAND_STRIDE.
+- Công hiệu:
+- Một GT box rất nhỏ sẽ dễ tìm được positive point hơn ở các mức feature phù hợp.
+- Có thể tùy chỉnh:
+- Nếu vẫn miss nhiều tiny object, tăng TINY_ASSIGN_EXPAND_STRIDE lên 1.0 là một ablation đáng thử.
+
+5.3. predict.py: TTA fallback và hậu xử lý
+
+- Có thêm --tta_fallback và --tta_min_votes.
+- Có center_combine với lựa chọn soft, sqrt, cls, mul.
+- Có kiểm tra class_conf theo từng lớp.
+- Có heuristic suppress chair trong person để giảm false positive bất lợi.
+- Công hiệu:
+- Với các ảnh mô hình trả ra 0 box, TTA fallback có thể cứu lại một phần recall.
+- soft hoặc sqrt thường giữ recall tốt hơn so với nhân centerness quá gắt.
+- Có thể tùy chỉnh:
+- Nếu small object còn miss, thử --tta_fallback và center_combine = soft.
+- Có thể giảm nhẹ class_conf cho class đang bị thiếu recall, ví dụ dog/cat/chair.
+
+
+6. Các thay đổi kỹ thuật hỗ trợ train/infer ổn định
+
+- utils/runtime.py, train.py và predict.py đã được chỉnh để chỉ bật channels_last, DataParallel và non_blocking khi có cờ chủ động.
+- Mặc định đang đi theo safe CUDA mode để giảm rủi ro lỗi GPU.
+- Công hiệu:
+- Hữu ích khi train trên Kaggle/T4, nhất là sau khi model nặng hơn do stride 4 và ảnh lớn hơn.
+- Có thể tùy chỉnh:
+- Nếu hệ thống chạy ổn và muốn tối ưu tốc độ, có thể thử bật lại:
+- --channels_last
+- --data_parallel
+- --non_blocking_cuda
+
+
+7. Kết luận ngắn theo đúng 3 ưu tiên
+
+- Ưu tiên A đã được áp dụng khá đầy đủ:
+- model, loss, decode, predict, checkpoint đều đã hiểu stride 4.
+
+- Ưu tiên B mới được áp dụng một phần:
+- độ phân giải đã tăng so với 640, nhưng hiện là 704 chứ chưa phải 768.
+- Nếu muốn bám sát đề xuất ban đầu, nên đổi IMG_SIZE lên 768 và đo lại mAP.
+
+- Ưu tiên C đã được áp dụng khá đúng hướng:
+- crop tăng lên
+- Affine bỏ zoom-out
+- Downscale tắt mặc định
+
+
+8. Gợi ý ablation tiếp theo
+
+- Ablation 1:
+- Giữ nguyên mọi thứ, chỉ đổi IMG_SIZE từ 704 -> 768.
+
+- Ablation 2:
+- Giữ IMG_SIZE = 768, tăng TINY_ASSIGN_EXPAND_STRIDE từ 0.75 -> 1.0.
+
+- Ablation 3:
+- Giữ stride 4 và 768, thử TRAIN_RANDOM_CROP_PROB = 0.40.
+
+- Ablation 4:
+- Infer với --tta_fallback và center_combine = soft để xem recall small có tăng không.
+
+
+9. Nếu muốn bám đúng bộ cấu hình “small-object aggressive” nhất
+
+- STRIDES = [4, 8, 16, 32]
+- IMG_SIZE = 768
+- TRAIN_ENABLE_DOWNSCALE = False
+- TRAIN_AFFINE_SCALE = (1.0, 1.35)
+- TRAIN_RANDOM_CROP_PROB = 0.36 hoặc 0.40
+- TINY_ASSIGN_EXPAND_STRIDE = 0.75 hoặc 1.0
+
+Đây là tổ hợp gần nhất với mục tiêu: tăng recall cho small object trước, rồi mới tinh chỉnh precision ở bước hậu xử lý.

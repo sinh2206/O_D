@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 """
 Anchor-Free feature extractor and detection head.
@@ -58,20 +58,17 @@ class ResNet34FPN4L(nn.Module):
 
         backbone = self._build_resnet34(pretrained=pretrained)
 
-        # Backbone stages.
         self.stem = nn.Sequential(backbone.conv1, backbone.bn1, backbone.relu, backbone.maxpool)
         self.layer1 = backbone.layer1  # C1: stride 4, 64ch
         self.layer2 = backbone.layer2  # C2: stride 8, 128ch
         self.layer3 = backbone.layer3  # C3: stride 16, 256ch
         self.layer4 = backbone.layer4  # C4: stride 32, 512ch
 
-        # Lateral connections.
         self.lateral1 = nn.Conv2d(64, fpn_channels, kernel_size=1)
         self.lateral2 = nn.Conv2d(128, fpn_channels, kernel_size=1)
         self.lateral3 = nn.Conv2d(256, fpn_channels, kernel_size=1)
         self.lateral4 = nn.Conv2d(512, fpn_channels, kernel_size=1)
 
-        # Smooth layers.
         self.fpn_out1 = ConvBNLeaky(fpn_channels, fpn_channels, k=3, s=1, p=1)
         self.fpn_out2 = ConvBNLeaky(fpn_channels, fpn_channels, k=3, s=1, p=1)
         self.fpn_out3 = ConvBNLeaky(fpn_channels, fpn_channels, k=3, s=1, p=1)
@@ -104,7 +101,6 @@ class ResNet34FPN4L(nn.Module):
         p3 = self.lateral3(c3)
         p4 = self.lateral4(c4)
 
-        # Top-down fusion: upsample higher-stride maps and add.
         p4_up = F.interpolate(p4, size=p3.shape[-2:], mode="nearest")
         p3 = p3 + p4_up
         p3_up = F.interpolate(p3, size=p2.shape[-2:], mode="nearest")
@@ -112,7 +108,6 @@ class ResNet34FPN4L(nn.Module):
         p2_up = F.interpolate(p2, size=p1.shape[-2:], mode="nearest")
         p1 = p1 + p2_up
 
-        # Smooth.
         p1_out = self.fpn_out1(p1)
         p2_out = self.fpn_out2(p2)
         p3_out = self.fpn_out3(p3)
@@ -121,7 +116,6 @@ class ResNet34FPN4L(nn.Module):
         return p1_out, p2_out, p3_out, p4_out
 
 
-# Backward-compatible alias for older imports.
 ResNet34FPN3L = ResNet34FPN4L
 
 
@@ -156,7 +150,6 @@ class AnchorFreeHead(nn.Module):
         self._init_params()
 
     def _init_params(self) -> None:
-        # Low prior for positives at init.
         nn.init.normal_(self.cls_out.weight, mean=0.0, std=0.01)
         nn.init.constant_(self.cls_out.bias, -1.2)
 
@@ -236,7 +229,6 @@ class AnchorFreeDetector(nn.Module):
         }
 
         if self.legacy_single_output:
-            # Compatibility path: merge higher-stride predictions to stride4 resolution.
             size4 = out4["cls_logits"].shape[-2:]
             cls8_up = F.interpolate(out8["cls_logits"], size=size4, mode="nearest")
             cls16_up = F.interpolate(out16["cls_logits"], size=size4, mode="nearest")
@@ -255,5 +247,4 @@ class AnchorFreeDetector(nn.Module):
         return outputs
 
 
-# Backward-compatible alias for older imports.
 ResNet18FPN2L = ResNet34FPN4L

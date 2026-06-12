@@ -4,7 +4,7 @@ from __future__ import annotations
 Shared configuration for the anchor-free object detection project.
 """
 
-IMG_SIZE = 704
+IMG_SIZE = 768
 
 CLASS_NAMES = ["person", "car", "dog", "cat", "chair"]
 NUM_CLASSES = len(CLASS_NAMES)
@@ -38,7 +38,7 @@ CHAIR_SUPPRESS_MAX_AREA_RATIO = 0.25
 MIN_BOX_SIZE = 1.0
 NEGATIVE_FOCAL_WEIGHT = 0.35
 CENTER_RADIUS = 2.5
-INFER_CENTER_COMBINE = "sqrt"
+INFER_CENTER_COMBINE = "soft"
 
 SMALL_OBJECT_AREA_RATIO = 0.012
 SMALL_OBJECT_BONUS = 0.70

@@ -27,7 +27,6 @@ from utils.config import (
     MEAN,
     NMS_IOU_THRESH,
     NUM_CLASSES,
-    STRIDES,
     STD,
 )
 from utils.model import AnchorFreeDetector
@@ -963,7 +962,7 @@ def parse_args() -> argparse.Namespace:
         help="Path to trained model checkpoint (.pth). '--model_path' is kept as a backward-compatible alias.",
     )
     parser.add_argument("--img_size", type=int, default=IMG_SIZE)
-    parser.add_argument("--batch_size", type=int, default=8)
+    parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--conf_thresh", type=float, default=CONF_THRESH)
     parser.add_argument("--nms_thresh", type=float, default=NMS_IOU_THRESH)
     parser.add_argument(
@@ -982,12 +981,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--chair_suppress_iou", type=float, default=CHAIR_SUPPRESS_WITH_PERSON_IOU)
     parser.add_argument("--hardcase_topk", type=int, default=50)
     parser.add_argument("--hardcase_iou", type=float, default=0.5)
-    parser.add_argument("--tta_fallback", action="store_true", help="Enable TTA fallback on images with zero detections.")
+    parser.add_argument("--tta_fallback", dest="tta_fallback", action="store_true", help="Enable TTA fallback on images with zero detections.")
+    parser.add_argument("--no_tta_fallback", dest="tta_fallback", action="store_false", help="Disable TTA fallback on images with zero detections.")
     parser.add_argument("--tta_min_votes", type=int, default=2, help="Minimum TTA consensus votes to keep a fallback box.")
     parser.add_argument("--device", type=str, default="auto", choices=["auto", "cuda", "cpu"])
     parser.add_argument("--channels_last", action="store_true", help="Opt in to NHWC/channels_last memory format on CUDA.")
     parser.add_argument("--data_parallel", action="store_true", help="Opt in to nn.DataParallel when multiple GPUs are visible.")
     parser.add_argument("--non_blocking_cuda", action="store_true", help="Opt in to asynchronous host-to-device copies.")
+    parser.set_defaults(tta_fallback=True)
     return parser.parse_args()
 
 
