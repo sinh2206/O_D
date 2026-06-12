@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import os
+import random
 from pathlib import Path
 from typing import Any, Optional, Tuple
 
+import numpy as np
 import torch
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
@@ -42,10 +44,13 @@ def _cpu_limit_from_affinity() -> int:
     return max(1, int(cpu_count))
 
 
-def resolve_num_workers(requested: int) -> Tuple[int, int]:
+def resolve_num_workers(requested: int, deterministic: bool = False) -> Tuple[int, int]:
     max_safe = _cpu_limit_from_affinity()
     if "COLAB_GPU" in os.environ:
         max_safe = min(max_safe, 2)
+
+    if bool(deterministic):
+        return 0, max_safe
 
     if requested < 0:
         if max_safe <= 2:
@@ -58,6 +63,49 @@ def resolve_num_workers(requested: int) -> Tuple[int, int]:
 
 def should_pin_memory(device: torch.device) -> bool:
     return device.type == "cuda" and torch.cuda.is_available()
+
+
+def configure_reproducibility(seed: int, deterministic: bool = True) -> None:
+    seed = int(seed)
+    os.environ["PYTHONHASHSEED"] = str(seed)
+    if bool(deterministic):
+        os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+    if bool(deterministic):
+        torch.backends.cudnn.benchmark = False
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cuda.matmul.allow_tf32 = False
+        torch.backends.cudnn.allow_tf32 = False
+        torch.set_float32_matmul_precision("highest")
+        if hasattr(torch, "use_deterministic_algorithms"):
+            try:
+                torch.use_deterministic_algorithms(True, warn_only=True)
+            except TypeError:
+                torch.use_deterministic_algorithms(True)
+        return
+
+    torch.backends.cudnn.benchmark = True
+    torch.backends.cudnn.deterministic = False
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    torch.set_float32_matmul_precision("high")
+    if hasattr(torch, "use_deterministic_algorithms"):
+        try:
+            torch.use_deterministic_algorithms(False)
+        except Exception:
+            pass
+
+
+def seed_worker(worker_id: int) -> None:
+    del worker_id
+    worker_seed = torch.initial_seed() % (2**32)
+    random.seed(worker_seed)
+    np.random.seed(worker_seed)
 
 
 def create_grad_scaler(device: torch.device, enabled: bool) -> Any:
@@ -149,7 +197,14 @@ def get_scheduler(
     epochs: int,
     warmup_epochs: int = 3,
     min_lr_ratio: float = 0.05,
-) -> torch.optim.lr_scheduler.LRScheduler:
+    schedule: str = "cosine",
+) -> Optional[torch.optim.lr_scheduler.LRScheduler]:
+    schedule = str(schedule).strip().lower()
+    if schedule == "constant":
+        return None
+    if schedule != "cosine":
+        raise ValueError(f"Unsupported scheduler: {schedule}")
+
     total_epochs = max(1, int(epochs))
     warm = max(0, min(int(warmup_epochs), total_epochs - 1))
 

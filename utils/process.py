@@ -1,9 +1,8 @@
 ﻿from __future__ import annotations
 
 import argparse
-import json
 import inspect
-import random
+import json
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -181,13 +180,25 @@ def load_resized_record(record: Record, image_dir: Path, target_size: int) -> Tu
     return img_r, boxes, labels
 
 
-def build_mosaic(records: List[Record], image_dir: Path, img_size: int, primary_idx: int, rng: random.Random):
+def _rotate_indices(length: int, offset: int) -> List[int]:
+    if length <= 0:
+        return []
+    start = int(offset) % length
+    indices = list(range(length))
+    return indices[start:] + indices[:start]
+
+
+def build_mosaic(records: List[Record], image_dir: Path, img_size: int, primary_idx: int, seed: int = 42):
     s = img_size
     mosaic = np.full((2 * s, 2 * s, 3), 114, dtype=np.uint8)
 
-    indices = [primary_idx] + [rng.randrange(len(records)) for _ in range(3)]
-    xc = rng.randint(s // 2, (3 * s) // 2)
-    yc = rng.randint(s // 2, (3 * s) // 2)
+    if not records:
+        return mosaic, np.zeros((0, 4), dtype=np.float32), []
+
+    rotated = _rotate_indices(len(records), offset=primary_idx + int(seed))
+    indices = rotated[:4] if len(rotated) >= 4 else (rotated * 4)[:4]
+    xc = s
+    yc = s
 
     all_boxes: List[np.ndarray] = []
     all_labels: List[str] = []
@@ -236,22 +247,23 @@ def maybe_mixup(
     records: List[Record],
     image_dir: Path,
     img_size: int,
-    rng: random.Random,
+    primary_idx: int,
+    seed: int,
     p: float = 0.5,
 ):
-    if rng.random() >= p:
+    if float(p) <= 0.0 or len(records) == 0:
         return image, boxes, labels
 
-    mix_idx = rng.randrange(len(records))
+    mix_idx = (int(primary_idx) + int(seed) + 1) % len(records)
     mix_image, mix_boxes, mix_labels = build_mosaic(
         records=records,
         image_dir=image_dir,
         img_size=img_size,
         primary_idx=mix_idx,
-        rng=rng,
+        seed=seed,
     )
 
-    lam = float(np.random.beta(1.5, 1.5))
+    lam = 0.5
     blended = (lam * image.astype(np.float32) + (1.0 - lam) * mix_image.astype(np.float32)).clip(0, 255).astype(np.uint8)
 
     if boxes.size == 0:
@@ -269,42 +281,10 @@ def maybe_mixup(
 
 
 def build_train_transform(img_size: int) -> A.Compose:
-    try:
-        affine = A.Affine(
-            scale=(0.85, 1.25),
-            translate_percent=(-0.04, 0.04),
-            rotate=(-4, 4),
-            shear=(-1.0, 1.0),
-            border_mode=cv2.BORDER_CONSTANT,
-            fill=114,
-            p=0.25,
-        )
-    except TypeError:
-        affine = A.Affine(
-            scale=(0.85, 1.25),
-            translate_percent=(-0.04, 0.04),
-            rotate=(-4, 4),
-            shear=(-1.0, 1.0),
-            mode=cv2.BORDER_CONSTANT,
-            cval=114,
-            p=0.25,
-        )
-
     return A.Compose(
         [
             A.LongestMaxSize(max_size=img_size, interpolation=cv2.INTER_LINEAR),
             make_pad_if_needed(img_size),
-            A.HorizontalFlip(p=0.5),
-            affine,
-            A.OneOf(
-                [
-                    A.GaussianBlur(blur_limit=(3, 7), p=1.0),
-                    A.MotionBlur(blur_limit=5, p=1.0),
-                ],
-                p=0.2,
-            ),
-            A.CLAHE(clip_limit=2.0, tile_grid_size=(8, 8), p=0.2),
-            A.HueSaturationValue(hue_shift_limit=20, sat_shift_limit=30, val_shift_limit=20, p=0.5),
             A.Normalize(mean=MEAN, std=STD),
             ToTensorV2(),
         ],
@@ -336,9 +316,6 @@ def export_augmented_samples(
     mixup_prob: float,
     seed: int,
 ) -> int:
-    rng = random.Random(seed)
-    np.random.seed(seed)
-
     tfm = build_train_transform(img_size=img_size)
 
     out_ori = output_dir / "original"
@@ -348,8 +325,7 @@ def export_augmented_samples(
     out_aug.mkdir(parents=True, exist_ok=True)
     out_cmp.mkdir(parents=True, exist_ok=True)
 
-    idx_order = list(range(len(records)))
-    rng.shuffle(idx_order)
+    idx_order = _rotate_indices(len(records), offset=int(seed))
 
     selected: List[int] = []
     if include_image:
@@ -371,7 +347,13 @@ def export_augmented_samples(
         ori_img, ori_boxes, ori_labels = load_resized_record(rec, image_dir=image_dir, target_size=img_size)
         ori_vis = draw_boxes(ori_img, ori_boxes, ori_labels, classes)
 
-        mosaic_img, boxes, labels = build_mosaic(records, image_dir=image_dir, img_size=img_size, primary_idx=idx, rng=rng)
+        mosaic_img, boxes, labels = build_mosaic(
+            records,
+            image_dir=image_dir,
+            img_size=img_size,
+            primary_idx=idx,
+            seed=seed,
+        )
         mosaic_img, boxes, labels = maybe_mixup(
             image=mosaic_img,
             boxes=boxes,
@@ -379,7 +361,8 @@ def export_augmented_samples(
             records=records,
             image_dir=image_dir,
             img_size=img_size,
-            rng=rng,
+            primary_idx=idx,
+            seed=seed,
             p=mixup_prob,
         )
 

@@ -268,3 +268,211 @@ Tổng hợp các thay đổi đã có trong train.py, predict.py và thư mục
 - TINY_ASSIGN_EXPAND_STRIDE = 0.75 hoặc 1.0
 
 Đây là tổ hợp gần nhất với mục tiêu: tăng recall cho small object trước, rồi mới tinh chỉnh precision ở bước hậu xử lý.
+
+
+10. Vì sao chỉ đổi epochs mà kết quả có thể thấp hơn trước
+
+Có 2 nhóm nguyên nhân khác nhau:
+
+- Nhóm 1: thành phần ngẫu nhiên trong train làm mỗi lần chạy có thể đi ra nghiệm khác nhau.
+- Nhóm 2: có những thành phần không ngẫu nhiên, nhưng chỉ cần đổi epochs là toàn bộ đường đi tối ưu đã đổi, nên kết quả cuối khác đi dù code và tài nguyên giữ nguyên.
+
+
+11. Các thành phần ngẫu nhiên đang có trong train.py và utils
+
+11.1. Seed có được đặt, nhưng chưa đủ để đảm bảo deterministic hoàn toàn
+
+- Trong train.py có hàm seed_everything():
+- random.seed(seed)
+- np.random.seed(seed)
+- torch.manual_seed(seed)
+- torch.cuda.manual_seed_all(seed)
+- Công hiệu:
+- Giúp giảm dao động giữa các lần chạy.
+- Nhưng:
+- Đây chưa phải deterministic tuyệt đối trên GPU.
+- Vì code chưa bật các cờ deterministic của PyTorch/CUDA.
+
+11.2. Augmentation ngẫu nhiên trong train.py
+
+Trong get_train_transforms() có rất nhiều phép biến đổi ngẫu nhiên:
+
+- A.RandomSizedBBoxSafeCrop(...)
+- A.HorizontalFlip(...)
+- A.VerticalFlip(...)
+- A.RandomRotate90(...)
+- A.CLAHE(...)
+- A.OneOf([...GaussianBlur..., ...MotionBlur..., ...Downscale...], p=...)
+- A.Sharpen(...)
+- A.RandomGamma(...)
+- A.ColorJitter(...)
+- A.Affine(...)
+
+- Ý nghĩa:
+- Mỗi epoch, cùng một ảnh có thể bị crop, flip, rotate, blur, jitter theo cách khác nhau.
+- Vì vậy dù chỉ đổi epochs, số lần mô hình nhìn thấy từng biến thể augment cũng đổi theo.
+- Kết quả:
+- Mô hình có thể hội tụ sang nghiệm khác, đôi khi tốt hơn, đôi khi xấu hơn.
+
+11.3. WeightedRandomSampler có tính ngẫu nhiên
+
+- train.py dùng WeightedRandomSampler(..., replacement=True)
+- Ý nghĩa:
+- Mỗi epoch, tập sample được rút lại có thể khác.
+- Không chỉ thứ tự ảnh thay đổi, mà tần suất xuất hiện của từng ảnh trong một epoch cũng thay đổi.
+- Kết quả:
+- Hai lần train cùng seed nhưng khác cấu hình epochs hoặc resume có thể đi theo đường học khác nhau.
+
+11.4. shuffle ở DataLoader
+
+- Trong make_dataloader(), nếu không dùng sampler thì train loader có shuffle=True.
+- Với code hiện tại, train thường đi qua sampler, nhưng về bản chất thứ tự batch vẫn không cố định nếu sampler khác nhau.
+
+11.5. AMP/autocast làm số học không hoàn toàn giống nhau từng lần
+
+- train.py dùng torch.autocast(...)
+- scaler = create_grad_scaler(...)
+- Ý nghĩa:
+- Tính toán mixed precision trên GPU có thể gây sai khác rất nhỏ về số học.
+- Những sai khác rất nhỏ này qua nhiều nghìn step có thể dẫn tới checkpoint tốt nhất khác nhau.
+
+11.6. cuDNN benchmark đang bật
+
+- Trong train.py có:
+- torch.backends.cudnn.benchmark = True
+- Ý nghĩa:
+- CUDA có thể tự chọn kernel nhanh nhất theo shape input.
+- Điều này tốt cho tốc độ, nhưng thường làm kết quả kém deterministic hơn.
+- Đây là một nguồn rất đáng chú ý khi bạn thấy “cùng code mà lệch kết quả”.
+
+11.7. GPU kernel không hoàn toàn deterministic
+
+- Dù đã set seed, nhiều phép toán CUDA vẫn có thể không deterministic tuyệt đối.
+- Điều này đặc biệt dễ thấy khi train CNN với AMP trên GPU.
+
+11.8. utils/process.py cũng có randomness, nhưng chủ yếu để preview augment
+
+- random.Random(seed)
+- np.random.seed(seed)
+- np.random.beta(...)
+- mosaic/mixup trong utils/process.py có tính ngẫu nhiên.
+- Tuy nhiên:
+- Đây chủ yếu là pipeline preview/export augment.
+- Nó chỉ ảnh hưởng train thật nếu bạn tích hợp các hàm đó vào train loop.
+
+
+12. predict.py có ngẫu nhiên không
+
+- predict.py gần như không có randomness thực sự.
+- TTA fallback trong predict.py chỉ dùng các biến đổi cố định:
+- ảnh gốc
+- hflip
+- rot180
+- Việc merge box cũng là deterministic theo score và IoU.
+
+Kết luận:
+
+- Sai khác lớn giữa các lần chạy chủ yếu đến từ train.py, không phải predict.py.
+
+
+13. Những thành phần không ngẫu nhiên nhưng đổi epochs sẽ làm kết quả đổi mạnh
+
+Đây là phần rất quan trọng. Ngay cả khi bỏ hết randomness, chỉ đổi epochs vẫn có thể cho kết quả khác vì các lý do sau.
+
+13.1. Learning rate schedule đổi theo epochs
+
+- Trong train.py:
+- scheduler = CosineAnnealingLR(optimizer, T_max=max(args.epochs, 1))
+
+Điều này có nghĩa:
+
+- Nếu epochs = 30 thì cosine schedule co về 30 epoch.
+- Nếu epochs = 45 thì cả đường learning rate khác hẳn.
+- Tức là:
+- Không phải bạn chỉ “train thêm 15 epoch”.
+- Mà là ngay từ epoch 1, learning rate mỗi bước đã khác rồi.
+
+Đây là nguyên nhân rất lớn khiến:
+
+- cùng code
+- cùng seed
+- cùng dữ liệu
+- chỉ đổi epochs
+- nhưng kết quả cuối vẫn khác đáng kể.
+
+13.2. Checkpoint tốt nhất đang chọn theo val_loss, không phải mAP
+
+- Trong train.py, best checkpoint được lưu khi:
+- if val_metrics["loss"] < best_val_loss:
+
+Điều này có nghĩa:
+
+- Mô hình tốt nhất theo loss chưa chắc là mô hình tốt nhất theo mAP.
+- Có thể val_loss giảm nhưng mAP lại không tăng, thậm chí giảm.
+
+Vì vậy:
+
+- Khi đổi epochs, “best.pth” có thể là một epoch khác.
+- Epoch đó có loss đẹp hơn nhưng dự đoán box kém hơn.
+
+13.3. Overfitting hoặc lệch mục tiêu
+
+- Train lâu hơn chưa chắc tốt hơn.
+- Sau một mốc nào đó, model có thể:
+- fit mạnh vào loss
+- nhưng precision/recall ở val không tăng nữa
+- hoặc mAP giảm
+
+13.4. Resume training cũng làm đường đi khác
+
+- Nếu resume từ checkpoint giữa chừng rồi đổi epochs, optimizer state và scheduler state cũng tiếp tục từ trạng thái cũ.
+- Điều đó có thể dẫn tới quỹ đạo tối ưu khác so với train một mạch từ đầu.
+
+
+14. Tóm tắt các chỗ đang gây sai khác kết quả
+
+Trong train.py:
+
+- seed_everything() có set seed nhưng chưa khóa deterministic hoàn toàn.
+- get_train_transforms() có nhiều augment ngẫu nhiên.
+- WeightedRandomSampler(..., replacement=True) là ngẫu nhiên.
+- torch.autocast + GradScaler gây sai khác số học nhỏ.
+- torch.backends.cudnn.benchmark = True làm GPU kernel kém deterministic hơn.
+- CosineAnnealingLR(T_max=args.epochs) khiến chỉ đổi epochs là đường learning rate đổi ngay từ đầu.
+- best checkpoint đang chọn theo val_loss, không theo mAP.
+
+Trong predict.py:
+
+- hầu như deterministic.
+- TTA fallback không phải randomness thật.
+
+Trong utils:
+
+- utils/process.py có randomness ở mosaic/mixup/beta, nhưng chủ yếu là preview augment.
+- utils/runtime.py không trực tiếp tạo randomness, nhưng cấu hình GPU/worker có thể ảnh hưởng tốc độ và gián tiếp ảnh hưởng thứ tự thực thi.
+
+
+15. Muốn giảm dao động kết quả thì nên làm gì
+
+- Cố định seed và luôn truyền cùng --seed.
+- Tắt hoặc giảm các augment ngẫu nhiên mạnh khi cần so sánh công bằng.
+- Tạm bỏ WeightedRandomSampler nếu đang làm ablation rất chặt.
+- Tắt AMP để test độ ổn định khi cần so sánh.
+- Tắt cudnn benchmark và bật deterministic mode nếu ưu tiên tái lập hơn tốc độ.
+- Quan trọng nhất:
+- Không so sánh các lần chạy chỉ bằng việc đổi epochs nếu vẫn dùng CosineAnnealingLR(T_max=args.epochs).
+- Nếu muốn so sánh công bằng hơn, nên cố định lịch learning rate trước, hoặc chọn best checkpoint theo mAP thay vì val_loss.
+
+
+16. Kết luận ngắn cho câu hỏi của bạn
+
+- Có, trong train.py và utils đang có nhiều thành phần ngẫu nhiên.
+- Nhưng nguyên nhân lớn nhất khiến “chỉ đổi epochs mà kết quả thấp hơn trước” không chỉ là randomness.
+- Nguyên nhân lớn nhất là:
+- learning rate schedule hiện phụ thuộc trực tiếp vào epochs
+- checkpoint tốt nhất lại đang chọn theo val_loss chứ không phải mAP
+
+Nói ngắn gọn:
+
+- đổi epochs = đổi cả quỹ đạo huấn luyện
+- không phải chỉ là “chạy lâu hơn cùng một quá trình”

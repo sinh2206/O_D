@@ -1023,6 +1023,7 @@ def main() -> None:
         "Checkpoint meta: "
         f"epoch={ckpt_meta.get('epoch', 'NA')}, "
         f"best_val_loss={ckpt_meta.get('best_val_loss', 'NA')}, "
+        f"best_map50={ckpt_meta.get('best_map50', 'NA')}, "
         f"img_size={ckpt_meta.get('img_size', 'NA')}"
     )
     print(f"Predicted images: {len(predictions)}")
