@@ -31,7 +31,6 @@ from utils.config import (
 )
 from utils.model import AnchorFreeDetector
 from utils.nms import LetterboxMeta, postprocess_batch
-from utils.runtime import move_tensor_to_device, should_use_channels_last, should_use_data_parallel, should_use_non_blocking
 
 VALID_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 DEFAULT_VAL_IMAGE_DIR = Path("public/val/images")
@@ -451,8 +450,6 @@ def _run_tta_fallback_single(
     class_names: Sequence[str],
     center_combine: str,
     tta_min_votes: int,
-    use_channels_last: bool = False,
-    non_blocking_cuda: bool = False,
 ) -> List[dict]:
     h, w = image_bgr.shape[:2]
     fallback_conf = max(0.20, min(float(conf_thresh) * 0.75, 0.28))
@@ -468,12 +465,7 @@ def _run_tta_fallback_single(
 
     for _, variant_img, inv_fn in variants:
         tensor, meta = letterbox_preprocess(variant_img, img_size=img_size)
-        images = move_tensor_to_device(
-            torch.stack([tensor], dim=0),
-            device=device,
-            non_blocking=non_blocking_cuda,
-            channels_last=use_channels_last,
-        )
+        images = torch.stack([tensor], dim=0).to(device, non_blocking=True).to(memory_format=torch.channels_last)
         with torch.autocast(device_type=device.type, enabled=amp_enabled):
             outputs = model(images)
         pred = postprocess_batch(
@@ -803,8 +795,6 @@ def run_inference(
     center_combine: str = INFER_CENTER_COMBINE,
     enable_tta_fallback: bool = False,
     tta_min_votes: int = 2,
-    use_channels_last: bool = False,
-    non_blocking_cuda: bool = False,
 ) -> List[dict]:
     results: List[dict] = []
     amp_enabled = device.type == "cuda"
@@ -829,12 +819,7 @@ def run_inference(
         if not tensors:
             continue
 
-        images = move_tensor_to_device(
-            torch.stack(tensors, dim=0),
-            device=device,
-            non_blocking=non_blocking_cuda,
-            channels_last=use_channels_last,
-        )
+        images = torch.stack(tensors, dim=0).to(device, non_blocking=True).to(memory_format=torch.channels_last)
         with torch.autocast(device_type=device.type, enabled=amp_enabled):
             outputs = model(images)
 
@@ -871,8 +856,6 @@ def run_inference(
                     class_names=class_names,
                     center_combine=center_combine,
                     tta_min_votes=tta_min_votes,
-                    use_channels_last=use_channels_last,
-                    non_blocking_cuda=non_blocking_cuda,
                 )
                 if tta_boxes:
                     item["boxes"] = tta_boxes
@@ -906,35 +889,8 @@ def load_checkpoint_model(checkpoint_path: Path, device: torch.device) -> Tuple[
     img_size = int(ckpt.get("img_size", IMG_SIZE))
     num_classes = len(classes)
 
-    ckpt_strides = ckpt.get("strides", None)
-    if ckpt_strides is not None:
-        try:
-            ckpt_strides = [int(x) for x in ckpt_strides]
-        except Exception:
-            ckpt_strides = None
-
     model = AnchorFreeDetector(num_classes=num_classes, pretrained=False).to(device)
     state = ckpt.get("model_state_dict", ckpt)
-    stride4_keys = (
-        "backbone_fpn.lateral1.weight",
-        "backbone_fpn.fpn_out1.block.0.weight",
-        "head_s4.cls_out.weight",
-        "head_s4.reg_out.weight",
-        "head_s4.center_out.weight",
-    )
-    has_stride4_weights = all(key in state for key in stride4_keys)
-
-    if ckpt_strides is not None and ckpt_strides != list(STRIDES):
-        raise RuntimeError(
-            f"Checkpoint strides {ckpt_strides} do not match current model strides {list(STRIDES)}. "
-            "Please retrain or fine-tune the new stride-4 model before inference."
-        )
-    if ckpt_strides is None and not has_stride4_weights:
-        raise RuntimeError(
-            "Checkpoint does not contain the new stride-4 branch weights. "
-            "Please retrain or fine-tune the updated model before inference."
-        )
-
     try:
         model.load_state_dict(state, strict=True)
     except RuntimeError as exc:
@@ -962,7 +918,7 @@ def parse_args() -> argparse.Namespace:
         help="Path to trained model checkpoint (.pth). '--model_path' is kept as a backward-compatible alias.",
     )
     parser.add_argument("--img_size", type=int, default=IMG_SIZE)
-    parser.add_argument("--batch_size", type=int, default=4)
+    parser.add_argument("--batch_size", type=int, default=8)
     parser.add_argument("--conf_thresh", type=float, default=CONF_THRESH)
     parser.add_argument("--nms_thresh", type=float, default=NMS_IOU_THRESH)
     parser.add_argument(
@@ -981,14 +937,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--chair_suppress_iou", type=float, default=CHAIR_SUPPRESS_WITH_PERSON_IOU)
     parser.add_argument("--hardcase_topk", type=int, default=50)
     parser.add_argument("--hardcase_iou", type=float, default=0.5)
-    parser.add_argument("--tta_fallback", dest="tta_fallback", action="store_true", help="Enable TTA fallback on images with zero detections.")
-    parser.add_argument("--no_tta_fallback", dest="tta_fallback", action="store_false", help="Disable TTA fallback on images with zero detections.")
+    parser.add_argument("--tta_fallback", action="store_true", help="Enable TTA fallback on images with zero detections.")
     parser.add_argument("--tta_min_votes", type=int, default=2, help="Minimum TTA consensus votes to keep a fallback box.")
     parser.add_argument("--device", type=str, default="auto", choices=["auto", "cuda", "cpu"])
-    parser.add_argument("--channels_last", action="store_true", help="Opt in to NHWC/channels_last memory format on CUDA.")
-    parser.add_argument("--data_parallel", action="store_true", help="Opt in to nn.DataParallel when multiple GPUs are visible.")
-    parser.add_argument("--non_blocking_cuda", action="store_true", help="Opt in to asynchronous host-to-device copies.")
-    parser.set_defaults(tta_fallback=True)
     return parser.parse_args()
 
 
@@ -1012,20 +963,12 @@ def main() -> None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     else:
         device = torch.device(args.device)
-    use_channels_last = should_use_channels_last(device, requested=bool(args.channels_last))
-    non_blocking_cuda = should_use_non_blocking(device, requested=bool(args.non_blocking_cuda))
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
-    torch.backends.cudnn.benchmark = False
     torch.set_float32_matmul_precision("high")
 
     model, ckpt_classes, ckpt_img_size = load_checkpoint_model(args.checkpoint, device=device)
-    if use_channels_last:
-        model = model.to(memory_format=torch.channels_last)
-    num_visible_gpus = torch.cuda.device_count() if device.type == "cuda" else 0
-    multi_gpu_enabled = should_use_data_parallel(device, requested=bool(args.data_parallel))
-    if multi_gpu_enabled:
-        model = torch.nn.DataParallel(model)
+    model = model.to(memory_format=torch.channels_last)
     class_names = ckpt_classes if ckpt_classes else CLASS_NAMES
     img_size = args.img_size if args.img_size > 0 else ckpt_img_size
 
@@ -1049,8 +992,6 @@ def main() -> None:
         center_combine=str(args.center_combine),
         enable_tta_fallback=bool(args.tta_fallback),
         tta_min_votes=max(1, int(args.tta_min_votes)),
-        use_channels_last=use_channels_last,
-        non_blocking_cuda=non_blocking_cuda,
     )
     predictions = apply_class_thresholds(predictions, class_names=class_names, class_conf_thresh=class_conf)
     predictions = suppress_chair_inside_person(predictions, iou_thresh=float(args.chair_suppress_iou))
@@ -1077,8 +1018,6 @@ def main() -> None:
     )
 
     print(f"Device: {device}")
-    print(f"Visible GPUs: {num_visible_gpus}, DataParallel: {multi_gpu_enabled}")
-    print(f"channels_last: {use_channels_last}, non_blocking_cuda: {non_blocking_cuda}")
     ckpt_meta = torch.load(str(args.checkpoint), map_location="cpu")
     print(
         "Checkpoint meta: "

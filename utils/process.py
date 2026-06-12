@@ -13,18 +13,8 @@ import cv2
 import numpy as np
 from albumentations.pytorch import ToTensorV2
 
-from utils.config import (
-    MEAN,
-    STD,
-    TRAIN_AFFINE_PROB,
-    TRAIN_AFFINE_ROTATE,
-    TRAIN_AFFINE_SCALE,
-    TRAIN_AFFINE_SHEAR,
-    TRAIN_AFFINE_TRANSLATE,
-    TRAIN_DEGRADE_ONEOF_PROB,
-    TRAIN_RANDOM_CROP_PROB,
-)
-
+MEAN = [0.485, 0.456, 0.406]
+STD = [0.229, 0.224, 0.225]
 VALID_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 
 
@@ -280,39 +270,28 @@ def maybe_mixup(
 
 def build_train_transform(img_size: int) -> A.Compose:
     try:
-        crop_aug = A.RandomSizedBBoxSafeCrop(
-            height=img_size,
-            width=img_size,
-            erosion_rate=0.0,
-            p=TRAIN_RANDOM_CROP_PROB,
-        )
-    except TypeError:
-        crop_aug = A.NoOp(p=1.0)
-
-    try:
         affine = A.Affine(
-            scale=TRAIN_AFFINE_SCALE,
-            translate_percent=TRAIN_AFFINE_TRANSLATE,
-            rotate=TRAIN_AFFINE_ROTATE,
-            shear=TRAIN_AFFINE_SHEAR,
+            scale=(0.85, 1.25),
+            translate_percent=(-0.04, 0.04),
+            rotate=(-4, 4),
+            shear=(-1.0, 1.0),
             border_mode=cv2.BORDER_CONSTANT,
             fill=114,
-            p=TRAIN_AFFINE_PROB,
+            p=0.25,
         )
     except TypeError:
         affine = A.Affine(
-            scale=TRAIN_AFFINE_SCALE,
-            translate_percent=TRAIN_AFFINE_TRANSLATE,
-            rotate=TRAIN_AFFINE_ROTATE,
-            shear=TRAIN_AFFINE_SHEAR,
+            scale=(0.85, 1.25),
+            translate_percent=(-0.04, 0.04),
+            rotate=(-4, 4),
+            shear=(-1.0, 1.0),
             mode=cv2.BORDER_CONSTANT,
             cval=114,
-            p=TRAIN_AFFINE_PROB,
+            p=0.25,
         )
 
     return A.Compose(
         [
-            crop_aug,
             A.LongestMaxSize(max_size=img_size, interpolation=cv2.INTER_LINEAR),
             make_pad_if_needed(img_size),
             A.HorizontalFlip(p=0.5),
@@ -322,10 +301,10 @@ def build_train_transform(img_size: int) -> A.Compose:
                     A.GaussianBlur(blur_limit=(3, 7), p=1.0),
                     A.MotionBlur(blur_limit=5, p=1.0),
                 ],
-                p=TRAIN_DEGRADE_ONEOF_PROB,
+                p=0.2,
             ),
-            A.CLAHE(clip_limit=2.0, tile_grid_size=(8, 8), p=0.10),
-            A.HueSaturationValue(hue_shift_limit=16, sat_shift_limit=24, val_shift_limit=16, p=0.25),
+            A.CLAHE(clip_limit=2.0, tile_grid_size=(8, 8), p=0.2),
+            A.HueSaturationValue(hue_shift_limit=20, sat_shift_limit=30, val_shift_limit=20, p=0.5),
             A.Normalize(mean=MEAN, std=STD),
             ToTensorV2(),
         ],

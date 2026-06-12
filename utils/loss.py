@@ -43,7 +43,7 @@ try:
 except Exception:
     # Safe fallbacks so this module still works if config.py is not available.
     NUM_CLASSES = 5
-    STRIDES = [4, 8, 16, 32]
+    STRIDES = [8, 16, 32]
     CENTER_RADIUS = 2.0
     FOCAL_GAMMA = 2.0
     FOCAL_ALPHA = 0.25

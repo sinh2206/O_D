@@ -5,10 +5,10 @@ Post-processing (decode + confidence filtering + class-wise NMS) for anchor-free
 
 This module is synchronized with `utils/model.py` output format:
 {
-  "cls_logits": [Tensor(B,C,H,W), ...],
-  "reg_preds": [Tensor(B,4,H,W), ...],   # (t,l,b,r)
-  "center_logits": [Tensor(B,1,H,W), ...] optional,
-  "strides": [4, 8, 16, 32]
+  "cls_logits": [Tensor(B,C,H,W), Tensor(B,C,H,W)],
+  "reg_preds": [Tensor(B,4,H,W), Tensor(B,4,H,W)],   # (t,l,b,r)
+  "center_logits": [Tensor(B,1,H,W), Tensor(B,1,H,W)] optional,
+  "strides": [8, 16, 32]
 }
 
 Pipeline:
@@ -36,7 +36,7 @@ except Exception:
     NMS_IOU_THRESH = 0.50
     IMG_SIZE = 320
     NUM_CLASSES = 5
-    STRIDES = [4, 8, 16, 32]
+    STRIDES = [8, 16, 32]
     MAX_OBJECTS_PER_IMAGE = 15
     MIN_BOX_SIZE = 1.0
 

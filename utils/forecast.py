@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 """
 Forecast head and decoding utilities for anchor-free detection.
@@ -60,6 +60,7 @@ class AnchorFreeForecastHead(nn.Module):
         self._init_params()
 
     def _init_params(self) -> None:
+        # Initialize low class confidence at start.
         nn.init.normal_(self.cls_pred.weight, mean=0.0, std=0.01)
         nn.init.constant_(self.cls_pred.bias, -1.2)
 
@@ -77,40 +78,29 @@ class AnchorFreeForecastHead(nn.Module):
 
 
 class MultiScaleForecast(nn.Module):
-    """Four independent heads for stride4, stride8, stride16 and stride32 feature maps."""
+    """Three independent heads for stride8, stride16 and stride32 feature maps."""
 
     def __init__(self, in_ch: int = FPN_CHANNELS, num_classes: int = NUM_CLASSES):
         super().__init__()
-        self.head_s4 = AnchorFreeForecastHead(in_ch=in_ch, num_classes=num_classes)
         self.head_s8 = AnchorFreeForecastHead(in_ch=in_ch, num_classes=num_classes)
         self.head_s16 = AnchorFreeForecastHead(in_ch=in_ch, num_classes=num_classes)
         self.head_s32 = AnchorFreeForecastHead(in_ch=in_ch, num_classes=num_classes)
 
-    def forward(
-        self,
-        p1_out: torch.Tensor,
-        p2_out: torch.Tensor,
-        p3_out: torch.Tensor,
-        p4_out: torch.Tensor,
-    ) -> Dict[str, Any]:
-        out4 = self.head_s4(p1_out)
+    def forward(self, p2_out: torch.Tensor, p3_out: torch.Tensor, p4_out: torch.Tensor) -> Dict[str, Any]:
         out8 = self.head_s8(p2_out)
         out16 = self.head_s16(p3_out)
         out32 = self.head_s32(p4_out)
         return {
-            "cls_logits": [out4["cls_logits"], out8["cls_logits"], out16["cls_logits"], out32["cls_logits"]],
-            "reg_preds": [out4["reg_preds"], out8["reg_preds"], out16["reg_preds"], out32["reg_preds"]],
-            "strides": [4, 8, 16, 32],
+            "cls_logits": [out8["cls_logits"], out16["cls_logits"], out32["cls_logits"]],
+            "reg_preds": [out8["reg_preds"], out16["reg_preds"], out32["reg_preds"]],
+            "strides": [8, 16, 32],
         }
 
 
 def _build_grid(h: int, w: int, stride: float, device: torch.device) -> Tuple[torch.Tensor, torch.Tensor]:
     ys = (torch.arange(h, device=device, dtype=torch.float32) + 0.5) * stride
     xs = (torch.arange(w, device=device, dtype=torch.float32) + 0.5) * stride
-    try:
-        gy, gx = torch.meshgrid(ys, xs, indexing="ij")
-    except TypeError:
-        gy, gx = torch.meshgrid(ys, xs)
+    gy, gx = torch.meshgrid(ys, xs, indexing="ij")
     return gx, gy
 
 
@@ -121,14 +111,22 @@ def decode_level(
     conf_thresh: float = CONF_THRESH,
     img_size: Optional[int] = IMG_SIZE,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Decode one level output to boxes + scores + class ids for a single image.
+
+    Inputs:
+    - cls_logits: (C, H, W)
+    - reg_preds:  (4, H, W), order (t, l, b, r)
+    """
     if cls_logits.dim() != 3 or reg_preds.dim() != 3:
         raise ValueError("decode_level expects cls_logits (C,H,W) and reg_preds (4,H,W).")
 
+    c, h, w = cls_logits.shape
     if reg_preds.shape[0] != 4:
         raise ValueError("reg_preds first dim must be 4 for (t,l,b,r).")
 
     cls_prob = torch.sigmoid(cls_logits)
-    best_score, best_cls = cls_prob.max(dim=0)
+    best_score, best_cls = cls_prob.max(dim=0)  # (H, W)
 
     mask = best_score >= conf_thresh
     if not mask.any():
@@ -142,7 +140,7 @@ def decode_level(
     scores = best_score[ys, xs]
     cls_ids = best_cls[ys, xs]
 
-    gx, gy = _build_grid(cls_logits.shape[1], cls_logits.shape[2], stride=float(stride), device=cls_logits.device)
+    gx, gy = _build_grid(h, w, stride=float(stride), device=cls_logits.device)
     cx = gx[ys, xs]
     cy = gy[ys, xs]
 
@@ -175,9 +173,19 @@ def decode_multilevel(
     conf_thresh: float = CONF_THRESH,
     img_size: Optional[int] = IMG_SIZE,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Decode model outputs from `utils/model.py` or `MultiScaleForecast`.
+
+    Expected keys:
+    - outputs['cls_logits']: List[(B,C,H,W)] or List[(C,H,W)]
+    - outputs['reg_preds']:  List[(B,4,H,W)] or List[(4,H,W)]
+    - outputs['strides']:    List[int]
+
+    Returns concatenated (boxes, scores, cls_ids) for batch index 0.
+    """
     cls_levels = outputs["cls_logits"]
     reg_levels = outputs["reg_preds"]
-    strides = outputs.get("strides", [4, 8, 16, 32])
+    strides = outputs.get("strides", [8, 16, 32])
 
     all_boxes: List[np.ndarray] = []
     all_scores: List[np.ndarray] = []
@@ -185,22 +193,28 @@ def decode_multilevel(
 
     for cls_t, reg_t, stride in zip(cls_levels, reg_levels, strides):
         if cls_t.dim() == 4:
-            if cls_t.shape[0] != 1 or reg_t.shape[0] != 1:
-                raise ValueError("decode_multilevel expects batch size 1 when given 4D tensors.")
-            cls_t = cls_t[0]
-            reg_t = reg_t[0]
+            cls_i = cls_t[0]
+        else:
+            cls_i = cls_t
+
+        if reg_t.dim() == 4:
+            reg_i = reg_t[0]
+        else:
+            reg_i = reg_t
 
         boxes, scores, cls_ids = decode_level(
-            cls_logits=cls_t,
-            reg_preds=reg_t,
+            cls_logits=cls_i,
+            reg_preds=reg_i,
             stride=float(stride),
             conf_thresh=conf_thresh,
             img_size=img_size,
         )
-        if boxes.shape[0] > 0:
-            all_boxes.append(boxes)
-            all_scores.append(scores)
-            all_cls.append(cls_ids)
+        if boxes.shape[0] == 0:
+            continue
+
+        all_boxes.append(boxes)
+        all_scores.append(scores)
+        all_cls.append(cls_ids)
 
     if not all_boxes:
         return (
@@ -209,42 +223,45 @@ def decode_multilevel(
             np.zeros((0,), dtype=np.int64),
         )
 
-    boxes = np.concatenate(all_boxes, axis=0)
-    scores = np.concatenate(all_scores, axis=0)
-    cls_ids = np.concatenate(all_cls, axis=0)
-    return boxes, scores, cls_ids
+    return (
+        np.concatenate(all_boxes, axis=0),
+        np.concatenate(all_scores, axis=0),
+        np.concatenate(all_cls, axis=0),
+    )
 
 
-def nms_numpy(boxes: np.ndarray, scores: np.ndarray, iou_thresh: float = NMS_IOU_THRESH) -> np.ndarray:
-    if boxes.shape[0] == 0:
+def nms_per_class_numpy(boxes: np.ndarray, scores: np.ndarray, cls_ids: np.ndarray, iou_thresh: float = NMS_IOU_THRESH):
+    """Simple per-class NMS (numpy) to keep high-confidence boxes (e.g. 0.95)."""
+    if len(boxes) == 0:
         return np.zeros((0,), dtype=np.int64)
 
-    x1 = boxes[:, 0]
-    y1 = boxes[:, 1]
-    x2 = boxes[:, 2]
-    y2 = boxes[:, 3]
-    areas = np.maximum(0.0, x2 - x1) * np.maximum(0.0, y2 - y1)
-    order = scores.argsort()[::-1]
+    keep_global: List[int] = []
+    for c in np.unique(cls_ids):
+        idx = np.where(cls_ids == c)[0]
+        if idx.size == 0:
+            continue
+        b = boxes[idx]
+        s = scores[idx]
 
-    keep = []
-    while order.size > 0:
-        i = int(order[0])
-        keep.append(i)
-        if order.size == 1:
-            break
+        x1, y1, x2, y2 = b[:, 0], b[:, 1], b[:, 2], b[:, 3]
+        areas = np.maximum(0.0, x2 - x1) * np.maximum(0.0, y2 - y1)
+        order = s.argsort()[::-1]
 
-        xx1 = np.maximum(x1[i], x1[order[1:]])
-        yy1 = np.maximum(y1[i], y1[order[1:]])
-        xx2 = np.minimum(x2[i], x2[order[1:]])
-        yy2 = np.minimum(y2[i], y2[order[1:]])
+        while order.size > 0:
+            i = order[0]
+            keep_global.append(int(idx[i]))
 
-        w = np.maximum(0.0, xx2 - xx1)
-        h = np.maximum(0.0, yy2 - yy1)
-        inter = w * h
-        union = areas[i] + areas[order[1:]] - inter + 1e-9
-        iou = inter / union
+            xx1 = np.maximum(x1[i], x1[order[1:]])
+            yy1 = np.maximum(y1[i], y1[order[1:]])
+            xx2 = np.minimum(x2[i], x2[order[1:]])
+            yy2 = np.minimum(y2[i], y2[order[1:]])
 
-        inds = np.where(iou <= float(iou_thresh))[0]
-        order = order[inds + 1]
+            w = np.maximum(0.0, xx2 - xx1)
+            h = np.maximum(0.0, yy2 - yy1)
+            inter = w * h
+            iou = inter / (areas[i] + areas[order[1:]] - inter + 1e-6)
+            order = order[1:][iou < float(iou_thresh)]
 
-    return np.asarray(keep, dtype=np.int64)
+    if not keep_global:
+        return np.zeros((0,), dtype=np.int64)
+    return np.asarray(sorted(set(keep_global)), dtype=np.int64)
