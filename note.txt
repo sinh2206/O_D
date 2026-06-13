@@ -1,478 +1,865 @@
-Tổng hợp các thay đổi đã có trong train.py, predict.py và thư mục utils để đi theo 3 ưu tiên:
-
-- Ưu tiên A: thêm nhánh stride 4 để bắt vật thể nhỏ.
-- Ưu tiên B: tăng độ phân giải train/infer.
-- Ưu tiên C: giảm augmentation làm vật thể bị nhỏ đi quá mức.
-
-
-1. Tổng quan hiện trạng code
-
-- Code hiện tại đã chuyển từ FPN 3 mức sang FPN 4 mức với STRIDES = [4, 8, 16, 32].
-- Pipeline train, loss, decode, NMS và predict đã được đồng bộ để hiểu đầu ra 4 mức.
-- Augmentation train đã được chỉnh theo hướng ưu tiên small object: tắt Downscale mặc định, tăng crop gần object, bỏ zoom-out trong Affine.
-- Một điểm cần lưu ý: utils/config.py hiện đang để IMG_SIZE = 704, chưa phải 768 như ưu tiên B ban đầu. Tức là code đã đi theo hướng tăng độ phân giải, nhưng nếu muốn bám đúng ưu tiên B thì nên đổi lại 768.
-
-
-2. Các thay đổi cho ưu tiên A: thêm nhánh stride 4
-
-2.1. utils/config.py
-
-- STRIDES đã đổi thành [4, 8, 16, 32].
-- Công hiệu:
-- Toàn bộ hệ thống train và infer sẽ coi stride 4 là một mức dự đoán hợp lệ.
-- Grid stride 4 dày hơn nhiều so với stride 8, nên vật thể rất nhỏ ít bị “lọt” hơn.
-- Có thể tùy chỉnh:
-- Nếu muốn quay lại baseline cũ để ablation, có thể đổi lại [8, 16, 32], nhưng lúc đó phải đồng bộ lại model, loss và checkpoint.
-
-2.2. utils/model.py
-
-- Backbone/FPN đã đổi sang 4 mức:
-- Lấy thêm feature map stride 4 từ layer1 của ResNet.
-- Thêm lateral1: 64 -> FPN_CHANNELS.
-- Thêm fpn_out1 cho mức stride 4.
-- Thêm head_s4 song song với head_s8, head_s16, head_s32.
-- forward() trả ra:
-- features: stride4, stride8, stride16, stride32
-- cls_logits 4 mức
-- reg_preds 4 mức
-- center_logits 4 mức
-- strides: [4, 8, 16, 32]
-- Công hiệu:
-- Đây là thay đổi quan trọng nhất cho small-object recall.
-- Vật thể nhỏ có thêm cơ hội được match ở lưới dày hơn, đặc biệt khi object quá bé so với stride 8.
-- Có thể tùy chỉnh:
-- FPN_CHANNELS hiện là 128. Nếu đủ VRAM có thể thử tăng lên 160 hoặc 192 để tăng capacity head.
-- num_convs trong head hiện là 2; có thể thử 3 nếu muốn head mạnh hơn, nhưng sẽ tốn VRAM và thời gian train hơn.
-
-2.3. train.py
-
-- build_optimizer() đã cộng thêm tham số của head_s4.
-- save_checkpoint() lưu thêm trường strides vào checkpoint.
-- resume checkpoint có kiểm tra stride cũ và cảnh báo nếu checkpoint không khớp kiến trúc mới.
-- Công hiệu:
-- head_s4 được train đúng cách, không bị bỏ sót tham số.
-- Checkpoint mới tự mô tả rõ đang train với kiến trúc 4 mức.
-- Có thể tùy chỉnh:
-- Nếu fine-tune từ checkpoint cũ 3 mức, nhánh stride 4 sẽ khởi tạo mới và cần thêm epoch để học ổn định.
-
-2.4. utils/loss.py
-
-- Loss đã đọc outputs["strides"] theo 4 mức.
-- build_targets() và compute_loss() đã chạy qua toàn bộ các mức stride 4, 8, 16, 32.
-- TINY_OBJECT_MAX_SIDE_FACTOR = 2.0 và TINY_ASSIGN_EXPAND_STRIDE = 0.75 đang được dùng để nới target assignment cho tiny object.
-- DetectionLoss nhận use_scale_ranges và tiny_assign_expand_stride làm tham số.
-- Công hiệu:
-- Không chỉ model có thêm head_s4, mà target assignment và loss cũng thật sự huấn luyện mức stride 4.
-- tiny object được nới vùng gán nhãn, giúp tăng xác suất có positive point.
-- Có thể tùy chỉnh:
-- TINY_ASSIGN_EXPAND_STRIDE có thể tăng lên 1.0 nếu vẫn bị miss nhiều tiny object.
-- Có thể thử --no_scale_ranges để ablation khi nghi scale range đang bó quá chặt.
-
-2.5. utils/nms.py và utils/forecast.py
-
-- Các module decode đã đồng bộ sang 4 mức.
-- utils/nms.py dùng STRIDES = [4, 8, 16, 32] khi giải mã box.
-- utils/forecast.py cũng đã có head_s4 và decode 4 mức tương ứng.
-- Công hiệu:
-- Sau khi model sinh ra nhánh stride 4, phần decode/NMS không bị lệch định dạng.
-- Có thể tùy chỉnh:
-- center_combine trong decode hiện hỗ trợ cls, soft, sqrt, mul. Với bài toán recall nhỏ, soft hoặc sqrt thường đáng thử.
-
-2.6. predict.py
-
-- load_checkpoint_model() có kiểm tra checkpoint có khớp với kiến trúc stride 4 hay không.
-- Nếu checkpoint vẫn là bản 3 mức cũ, predict sẽ báo lỗi rõ ràng thay vì chạy sai âm thầm.
-- Công hiệu:
-- Tránh trường hợp dùng nhầm checkpoint cũ rồi đánh giá sai chất lượng mô hình mới.
-- Có thể tùy chỉnh:
-- Không nên bỏ kiểm tra này, vì rất dễ nhầm checkpoint sau khi đổi kiến trúc.
-
-
-3. Các thay đổi cho ưu tiên B: tăng độ phân giải train/infer
-
-3.1. utils/config.py
-
-- IMG_SIZE hiện đang là 704.
-- Điều này có nghĩa:
-- Train mặc định dùng 704.
-- Predict mặc định cũng dùng 704.
-- Công hiệu:
-- 704 lớn hơn 640 nên vật thể nhỏ được phóng to thêm tương đối.
-- Đây là bước đệm tốt nếu VRAM chưa chắc chịu nổi 768 hoặc 800.
-- Có thể tùy chỉnh:
-- Nếu muốn bám đúng ưu tiên B ban đầu, đổi IMG_SIZE = 768.
-- Nếu GPU còn khỏe và batch đủ nhỏ, có thể thử 800.
-- Nếu lên 768 hoặc 800 thì cần theo dõi lại VRAM, batch_size và tốc độ train.
-
-3.2. train.py
-
-- parser đang lấy mặc định --img_size từ IMG_SIZE trong config.
-- batch_size mặc định là 4.
-- grad_accum_steps mặc định là 2.
-- Công hiệu:
-- batch thật trên GPU nhỏ hơn, nhưng gradient accumulation giúp giữ effective batch lớn hơn.
-- Đây là cách thực dụng để đi kèm ảnh lớn hơn mà không vượt VRAM quá sớm.
-- Có thể tùy chỉnh:
-- Nếu đổi IMG_SIZE lên 768 mà vẫn ổn VRAM, có thể giữ batch_size = 4.
-- Nếu bị OOM, hạ batch_size = 2 và tăng grad_accum_steps = 4.
-- Nếu muốn train nhanh hơn ở 704, có thể giảm grad_accum_steps về 1.
-
-3.3. predict.py
-
-- predict mặc định dùng --img_size lấy từ IMG_SIZE trong config.
-- letterbox_preprocess() resize và pad theo img_size hiện tại.
-- run_inference() và TTA fallback đều dùng đúng img_size đó.
-- Công hiệu:
-- Train và infer giữ cùng không gian scale, giảm lệch do preprocess.
-- Small object ở val cũng được nhìn ở độ phân giải lớn hơn.
-- Có thể tùy chỉnh:
-- Có thể infer với 768 dù train ở 704, nhưng tốt nhất train và infer cùng một mức trong các lượt ablation đầu.
-
-3.4. Điều cần lưu ý
-
-- Ý tưởng ưu tiên B ban đầu là 768 hoặc 800.
-- Code hiện tại mới ở mức trung gian 704.
-- Nếu mục tiêu là “bám đúng đề xuất small-object mạnh nhất”, nên đổi 704 -> 768 trước, rồi so lại mAP và recall small.
-
-
-4. Các thay đổi cho ưu tiên C: giảm augmentation làm nhỏ vật thể quá mức
-
-4.1. utils/config.py
-
-- TRAIN_RANDOM_CROP_PROB = 0.36
-- TRAIN_AFFINE_SCALE = (1.0, 1.35)
-- TRAIN_AFFINE_TRANSLATE = (-0.04, 0.04)
-- TRAIN_AFFINE_ROTATE = (-4, 4)
-- TRAIN_AFFINE_SHEAR = (-1.0, 1.0)
-- TRAIN_AFFINE_PROB = 0.20
-- TRAIN_DEGRADE_ONEOF_PROB = 0.18
-- TRAIN_ENABLE_DOWNSCALE = False
-- TRAIN_DOWNSCALE_SCALE = (0.72, 0.90)
-- Công hiệu:
-- Các tham số quan trọng đã được đưa về config để tiện ablation, thay vì hard-code trong train.py.
-
-4.2. train.py, hàm get_train_transforms()
-
-- RandomSizedBBoxSafeCrop đã tăng lên p = 0.36.
-- Affine scale đã đổi từ kiểu có zoom-out sang (1.0, 1.35), tức là chỉ zoom-in hoặc giữ nguyên.
-- Downscale không còn bật mặc định nữa; chỉ được thêm vào OneOf khi TRAIN_ENABLE_DOWNSCALE = True.
-- OneOf degrade hiện chủ yếu là GaussianBlur và MotionBlur.
-- Công hiệu:
-- Crop gần object hơn giúp vật thể nhỏ chiếm tỉ lệ lớn hơn trong khung hình train.
-- Bỏ zoom-out giúp tránh làm object vốn đã nhỏ bị nhỏ thêm.
-- Tắt Downscale giúp giữ texture/chi tiết tiny object tốt hơn trong các lượt ablation đầu.
-- Có thể tùy chỉnh:
-- TRAIN_RANDOM_CROP_PROB nên thử trong khoảng 0.30 đến 0.40.
-- TRAIN_AFFINE_SCALE có thể thử (0.95, 1.25) nếu muốn bớt zoom-in mạnh.
-- TRAIN_ENABLE_DOWNSCALE nên giữ False ở giai đoạn đầu; nếu sau này muốn tăng robustness, có thể bật lại và giảm xác suất bằng cách hạ TRAIN_DEGRADE_ONEOF_PROB.
-
-4.3. utils/process.py
-
-- build_train_transform() đã đồng bộ với train.py:
-- dùng cùng crop probability
-- dùng cùng Affine scale/translate/rotate/shear
-- dùng cùng degrade probability
-- Công hiệu:
-- Preview augmentation trong utils/process.py sẽ phản ánh gần đúng augmentation train thật.
-- Khi bạn export ảnh augment để soi bằng mắt, kết quả không bị lệch khỏi pipeline huấn luyện.
-- Có thể tùy chỉnh:
-- Nếu muốn xem ảnh augment “gắt” hơn để debug, có thể tăng tạm các p trong utils/config.py rồi chạy lại preview.
+Diễn giải dự án theo kiểu một học sinh đang học tập
+==================================================
 
+1. Nhìn tổng thể: dự án này giống một học sinh học môn nhận diện đồ vật
+-----------------------------------------------------------------------
 
-5. Các thay đổi bổ trợ khác cũng có lợi cho small object
+Nếu nói dự án này như một con người đang học tập, thì có thể hình dung như sau:
 
-5.1. train.py: class weights và sample weights
+- `public/annotations/train.json` là bộ sách bài tập có đáp án để học sinh luyện hàng ngày.
+- `public/annotations/val.json` là một đề kiểm tra thử có đáp án, dùng để xem học sinh đang làm tốt đến đâu.
+- `public/train/images` và `public/val/images` là những tờ hình mà học sinh phải nhìn vào để nhận ra vật thể.
+- `train.py` là quá trình ngồi học, làm bài luyện, sửa tư duy dần dần.
+- `models/best.pth` là cuốn sổ ghi nhớ kiến thức tốt nhất mà học sinh đã học được ở một thời điểm.
+- `predict.py` là lúc học sinh cầm cuốn sổ kiến thức đó đi làm bài kiểm tra mới.
+- `val_predictions.json` là bài làm của học sinh sau khi nộp.
+- `public/tools/evaluate_predictions.py` là giáo viên chấm điểm.
+- `results/` là chỗ lưu lại những bài sai nặng nhất để xem học sinh đã vấp ở đâu.
+- `utils/` là toàn bộ lý thuyết, luật chơi, công thức, mẹo học, và trợ giúp kỹ thuật đứng phía sau.
+- `obj-detec.ipynb` giống như tờ giấy thi hoặc quy trình làm bài thi trên Kaggle: mở đề, cài dụng cụ, học, làm bài, chấm điểm, soi lỗi.
 
-- compute_class_weights() hiện có thể tính từ chính train_samples và val_samples.
-- build_sample_weights() có crowd_bonus và small_bonus.
-- small_bonus dựa trên SMALL_OBJECT_AREA_RATIO và SMALL_OBJECT_BONUS.
-- Công hiệu:
-- Ảnh chứa object nhỏ được sampler ưu tiên hơn một chút.
-- Các class khó như chair, cat, dog cũng được đẩy trọng số lên nhẹ.
-- Có thể tùy chỉnh:
-- SMALL_OBJECT_BONUS hiện là 0.70. Nếu small recall còn thấp, có thể thử 0.9 hoặc 1.0.
-- CLASS_LOSS_WEIGHTS và CLASS_SAMPLER_WEIGHTS có thể tinh chỉnh theo confusion thực tế trên val.
-
-5.2. utils/loss.py: tiny-object assignment
 
-- tiny object không chỉ được lợi từ stride 4, mà còn được nới assignment bằng TINY_ASSIGN_EXPAND_STRIDE.
-- Công hiệu:
-- Một GT box rất nhỏ sẽ dễ tìm được positive point hơn ở các mức feature phù hợp.
-- Có thể tùy chỉnh:
-- Nếu vẫn miss nhiều tiny object, tăng TINY_ASSIGN_EXPAND_STRIDE lên 1.0 là một ablation đáng thử.
+2. Dữ liệu mà học sinh đang học
+-------------------------------
 
-5.3. predict.py: TTA fallback và hậu xử lý
+Hiện tại mình đọc được:
 
-- Có thêm --tta_fallback và --tta_min_votes.
-- Có center_combine với lựa chọn soft, sqrt, cls, mul.
-- Có kiểm tra class_conf theo từng lớp.
-- Có heuristic suppress chair trong person để giảm false positive bất lợi.
-- Công hiệu:
-- Với các ảnh mô hình trả ra 0 box, TTA fallback có thể cứu lại một phần recall.
-- soft hoặc sqrt thường giữ recall tốt hơn so với nhân centerness quá gắt.
-- Có thể tùy chỉnh:
-- Nếu small object còn miss, thử --tta_fallback và center_combine = soft.
-- Có thể giảm nhẹ class_conf cho class đang bị thiếu recall, ví dụ dog/cat/chair.
-
-
-6. Các thay đổi kỹ thuật hỗ trợ train/infer ổn định
-
-- utils/runtime.py, train.py và predict.py đã được chỉnh để chỉ bật channels_last, DataParallel và non_blocking khi có cờ chủ động.
-- Mặc định đang đi theo safe CUDA mode để giảm rủi ro lỗi GPU.
-- Công hiệu:
-- Hữu ích khi train trên Kaggle/T4, nhất là sau khi model nặng hơn do stride 4 và ảnh lớn hơn.
-- Có thể tùy chỉnh:
-- Nếu hệ thống chạy ổn và muốn tối ưu tốc độ, có thể thử bật lại:
-- --channels_last
-- --data_parallel
-- --non_blocking_cuda
-
-
-7. Kết luận ngắn theo đúng 3 ưu tiên
-
-- Ưu tiên A đã được áp dụng khá đầy đủ:
-- model, loss, decode, predict, checkpoint đều đã hiểu stride 4.
-
-- Ưu tiên B mới được áp dụng một phần:
-- độ phân giải đã tăng so với 640, nhưng hiện là 704 chứ chưa phải 768.
-- Nếu muốn bám sát đề xuất ban đầu, nên đổi IMG_SIZE lên 768 và đo lại mAP.
-
-- Ưu tiên C đã được áp dụng khá đúng hướng:
-- crop tăng lên
-- Affine bỏ zoom-out
-- Downscale tắt mặc định
-
-
-8. Gợi ý ablation tiếp theo
-
-- Ablation 1:
-- Giữ nguyên mọi thứ, chỉ đổi IMG_SIZE từ 704 -> 768.
-
-- Ablation 2:
-- Giữ IMG_SIZE = 768, tăng TINY_ASSIGN_EXPAND_STRIDE từ 0.75 -> 1.0.
+- Tập train có 7500 ảnh và 10642 annotation.
+- Tập val có 1500 ảnh và 2021 annotation.
+- Các lớp cần học là:
+  - `person`
+  - `car`
+  - `dog`
+  - `cat`
+  - `chair`
 
-- Ablation 3:
-- Giữ stride 4 và 768, thử TRAIN_RANDOM_CROP_PROB = 0.40.
+Nói như con người:
 
-- Ablation 4:
-- Infer với --tta_fallback và center_combine = soft để xem recall small có tăng không.
-
-
-9. Nếu muốn bám đúng bộ cấu hình “small-object aggressive” nhất
-
-- STRIDES = [4, 8, 16, 32]
-- IMG_SIZE = 768
-- TRAIN_ENABLE_DOWNSCALE = False
-- TRAIN_AFFINE_SCALE = (1.0, 1.35)
-- TRAIN_RANDOM_CROP_PROB = 0.36 hoặc 0.40
-- TINY_ASSIGN_EXPAND_STRIDE = 0.75 hoặc 1.0
+- Học sinh này không học tiếng Anh hay toán, mà học cách nhìn ảnh rồi nói:
+  - đây là người,
+  - đây là xe,
+  - đây là chó,
+  - đây là mèo,
+  - đây là ghế.
 
-Đây là tổ hợp gần nhất với mục tiêu: tăng recall cho small object trước, rồi mới tinh chỉnh precision ở bước hậu xử lý.
-
-
-10. Vì sao chỉ đổi epochs mà kết quả có thể thấp hơn trước
-
-Có 2 nhóm nguyên nhân khác nhau:
+Nhưng bài toán còn khó hơn gọi tên thông thường, vì em không chỉ phải nói “có con mèo”.
+Em còn phải khoanh đúng vị trí của con mèo bằng một hình chữ nhật `bbox = [x1, y1, x2, y2]`.
 
-- Nhóm 1: thành phần ngẫu nhiên trong train làm mỗi lần chạy có thể đi ra nghiệm khác nhau.
-- Nhóm 2: có những thành phần không ngẫu nhiên, nhưng chỉ cần đổi epochs là toàn bộ đường đi tối ưu đã đổi, nên kết quả cuối khác đi dù code và tài nguyên giữ nguyên.
+Tức là học sinh phải làm đồng thời 2 việc:
 
+- Nhận ra vật đó là lớp gì.
+- Chỉ ra vật đó nằm ở đâu trong ảnh.
 
-11. Các thành phần ngẫu nhiên đang có trong train.py và utils
 
-11.1. Seed có được đặt, nhưng chưa đủ để đảm bảo deterministic hoàn toàn
+3. `train.py` là quá trình học ra sao
+-------------------------------------
 
-- Trong train.py có hàm seed_everything():
-- random.seed(seed)
-- np.random.seed(seed)
-- torch.manual_seed(seed)
-- torch.cuda.manual_seed_all(seed)
-- Công hiệu:
-- Giúp giảm dao động giữa các lần chạy.
-- Nhưng:
-- Đây chưa phải deterministic tuyệt đối trên GPU.
-- Vì code chưa bật các cờ deterministic của PyTorch/CUDA.
+3.1. Bước đầu: học sinh đọc đề, ảnh và đáp án
 
-11.2. Augmentation ngẫu nhiên trong train.py
+`train.py` làm những việc đầu tiên như sau:
 
-Trong get_train_transforms() có rất nhiều phép biến đổi ngẫu nhiên:
+- Đọc file annotation train và val.
+- Ghép từng ảnh với danh sách vật thể đúng trong ảnh đó.
+- Mỗi vật thể có:
+  - tên lớp,
+  - vị trí hộp giới hạn.
 
-- A.RandomSizedBBoxSafeCrop(...)
-- A.HorizontalFlip(...)
-- A.VerticalFlip(...)
-- A.RandomRotate90(...)
-- A.CLAHE(...)
-- A.OneOf([...GaussianBlur..., ...MotionBlur..., ...Downscale...], p=...)
-- A.Sharpen(...)
-- A.RandomGamma(...)
-- A.ColorJitter(...)
-- A.Affine(...)
+Nói như một học sinh:
 
-- Ý nghĩa:
-- Mỗi epoch, cùng một ảnh có thể bị crop, flip, rotate, blur, jitter theo cách khác nhau.
-- Vì vậy dù chỉ đổi epochs, số lần mô hình nhìn thấy từng biến thể augment cũng đổi theo.
-- Kết quả:
-- Mô hình có thể hội tụ sang nghiệm khác, đôi khi tốt hơn, đôi khi xấu hơn.
+- Em mở sách bài tập.
+- Mỗi trang là một bức ảnh.
+- Trên ảnh giáo viên đã chỉ sẵn:
+  - “đây là car”
+  - “đây là dog”
+  - “đây là cat”
+  - và khoanh vùng vị trí của chúng.
 
-11.3. WeightedRandomSampler có tính ngẫu nhiên
+Nhờ vậy, em không học mù.
+Em học có thầy chỉ đáp án.
 
-- train.py dùng WeightedRandomSampler(..., replacement=True)
-- Ý nghĩa:
-- Mỗi epoch, tập sample được rút lại có thể khác.
-- Không chỉ thứ tự ảnh thay đổi, mà tần suất xuất hiện của từng ảnh trong một epoch cũng thay đổi.
-- Kết quả:
-- Hai lần train cùng seed nhưng khác cấu hình epochs hoặc resume có thể đi theo đường học khác nhau.
 
-11.4. shuffle ở DataLoader
+3.2. Bước thứ hai: học sinh được luyện với nhiều biến thể của cùng một vật
 
-- Trong make_dataloader(), nếu không dùng sampler thì train loader có shuffle=True.
-- Với code hiện tại, train thường đi qua sampler, nhưng về bản chất thứ tự batch vẫn không cố định nếu sampler khác nhau.
+`train.py` không đưa ảnh gốc y nguyên cho mô hình mãi mãi.
+Nó dùng augmentation để tạo ra nhiều tình huống khác nhau:
 
-11.5. AMP/autocast làm số học không hoàn toàn giống nhau từng lần
+- lật ngang,
+- xoay nhẹ,
+- đổi sáng tối,
+- đổi màu chút ít,
+- làm mờ,
+- tăng tương phản,
+- crop gần vật thể,
+- che bớt một phần vật thể.
 
-- train.py dùng torch.autocast(...)
-- scaler = create_grad_scaler(...)
-- Ý nghĩa:
-- Tính toán mixed precision trên GPU có thể gây sai khác rất nhỏ về số học.
-- Những sai khác rất nhỏ này qua nhiều nghìn step có thể dẫn tới checkpoint tốt nhất khác nhau.
+Nói như học sinh:
 
-11.6. cuDNN benchmark đang bật
+- Thầy không cho em chỉ nhìn một con mèo trong tư thế hoàn hảo.
+- Thầy sẽ cho em nhìn:
+  - mèo hơi tối,
+  - mèo nằm nghiêng,
+  - mèo bị cỏ che,
+  - mèo chỉ lộ mặt và tai,
+  - chó quay lưng,
+  - xe bị lật và chỉ thấy bánh xe cùng gầm xe.
 
-- Trong train.py có:
-- torch.backends.cudnn.benchmark = True
-- Ý nghĩa:
-- CUDA có thể tự chọn kernel nhanh nhất theo shape input.
-- Điều này tốt cho tốc độ, nhưng thường làm kết quả kém deterministic hơn.
-- Đây là một nguồn rất đáng chú ý khi bạn thấy “cùng code mà lệch kết quả”.
+Mục đích là:
 
-11.7. GPU kernel không hoàn toàn deterministic
+- Để em không học vẹt theo một hình dáng duy nhất.
+- Để em học “đặc trưng bản chất” của vật thể.
 
-- Dù đã set seed, nhiều phép toán CUDA vẫn có thể không deterministic tuyệt đối.
-- Điều này đặc biệt dễ thấy khi train CNN với AMP trên GPU.
+Đây là điểm rất quan trọng với các hardcase bạn nêu:
 
-11.8. utils/process.py cũng có randomness, nhưng chủ yếu để preview augment
+- `car` có thể nhận ra qua 4 bánh xe và cấu trúc khung xe.
+- `cat` có thể nhận ra qua tai nhọn, màu lông, dáng đầu.
+- `dog` có thể bị nhầm nếu mặt không rõ, nên phải học thêm dáng tai, cổ, lưng, dây dắt, tỷ lệ cơ thể.
+- `cat` trong cỏ có thể chỉ lộ một phần cơ thể, nên phải học nhận dạng từ phần thấy được chứ không chờ thấy toàn thân.
 
-- random.Random(seed)
-- np.random.seed(seed)
-- np.random.beta(...)
-- mosaic/mixup trong utils/process.py có tính ngẫu nhiên.
-- Tuy nhiên:
-- Đây chủ yếu là pipeline preview/export augment.
-- Nó chỉ ảnh hưởng train thật nếu bạn tích hợp các hàm đó vào train loop.
 
+3.3. Bước thứ ba: học sinh nhìn ảnh ở nhiều độ chi tiết
 
-12. predict.py có ngẫu nhiên không
+Kiến trúc hiện tại của code đã được mở rộng theo hướng học nhiều mức chi tiết.
 
-- predict.py gần như không có randomness thực sự.
-- TTA fallback trong predict.py chỉ dùng các biến đổi cố định:
-- ảnh gốc
-- hflip
-- rot180
-- Việc merge box cũng là deterministic theo score và IoU.
+Các mức `stride` có thể hiểu là các mức nhìn:
 
-Kết luận:
+- nhìn rất sát, rất chi tiết,
+- nhìn vừa vừa,
+- nhìn rộng hơn,
+- nhìn rất rộng.
 
-- Sai khác lớn giữa các lần chạy chủ yếu đến từ train.py, không phải predict.py.
+Hiện code mới đang hướng tới `STRIDES = [4, 8, 16, 32]`.
+Điều đó giống như:
 
+- mức 4: em dí sát mắt vào các chi tiết nhỏ,
+- mức 8: em nhìn tương đối gần,
+- mức 16: em nhìn vừa,
+- mức 32: em nhìn toàn cảnh hơn.
 
-13. Những thành phần không ngẫu nhiên nhưng đổi epochs sẽ làm kết quả đổi mạnh
+Lý do cần nhiều mức nhìn:
 
-Đây là phần rất quan trọng. Ngay cả khi bỏ hết randomness, chỉ đổi epochs vẫn có thể cho kết quả khác vì các lý do sau.
+- vật nhỏ cần nhìn gần,
+- vật lớn cần nhìn rộng,
+- vật bị che một phần thường cần cả cái nhìn gần và cái nhìn tổng thể.
 
-13.1. Learning rate schedule đổi theo epochs
+Ví dụ:
 
-- Trong train.py:
-- scheduler = CosineAnnealingLR(optimizer, T_max=max(args.epochs, 1))
+- bánh xe của `car` rất cần mức nhìn chi tiết,
+- tai mèo trong cỏ cũng cần mức nhìn chi tiết,
+- còn toàn bộ dáng của người hay chiếc xe lớn thì mức nhìn rộng cũng có ích.
 
-Điều này có nghĩa:
 
-- Nếu epochs = 30 thì cosine schedule co về 30 epoch.
-- Nếu epochs = 45 thì cả đường learning rate khác hẳn.
-- Tức là:
-- Không phải bạn chỉ “train thêm 15 epoch”.
-- Mà là ngay từ epoch 1, learning rate mỗi bước đã khác rồi.
+3.4. Bước thứ tư: học sinh bị trừ điểm khi đoán sai
 
-Đây là nguyên nhân rất lớn khiến:
+Trong `train.py`, sau khi mô hình đoán, hệ thống loss sẽ chấm sai ở nhiều mặt:
 
-- cùng code
-- cùng seed
-- cùng dữ liệu
-- chỉ đổi epochs
-- nhưng kết quả cuối vẫn khác đáng kể.
+- đoán sai lớp,
+- khoanh sai vị trí,
+- khoanh lệch tâm vật,
+- khoanh quá nhỏ hoặc quá to.
 
-13.2. Checkpoint tốt nhất đang chọn theo val_loss, không phải mAP
+Nói như học sinh:
 
-- Trong train.py, best checkpoint được lưu khi:
-- if val_metrics["loss"] < best_val_loss:
+- Nếu em nhìn con chó mà bảo là mèo, em bị trừ điểm vì sai kiến thức.
+- Nếu em bảo đúng là chó nhưng khoanh sai vị trí, em vẫn bị trừ điểm.
+- Nếu em chỉ khoanh cái đầu, trong khi đáp án là cả con chó, em vẫn bị trừ điểm.
 
-Điều này có nghĩa:
+Nghĩa là học sinh không chỉ cần “đoán đúng tên”.
+Em còn phải “khoanh đúng toàn bộ vùng hợp lý”.
 
-- Mô hình tốt nhất theo loss chưa chắc là mô hình tốt nhất theo mAP.
-- Có thể val_loss giảm nhưng mAP lại không tăng, thậm chí giảm.
+
+3.5. Bước thứ năm: học sinh học dần qua nhiều epoch
+
+Mỗi `epoch` là:
+
+- em đi hết một vòng qua gần như toàn bộ bài luyện.
+
+Sau mỗi epoch:
+
+- hệ thống xem em làm bài train thế nào,
+- rồi kiểm tra em trên `val` xem em có tiến bộ thật không.
+
+Nếu một phiên bản kiến thức của em làm bài `val` tốt hơn trước:
+
+- nó được lưu lại thành `best.pth`.
+
+Điều đó giống như:
+
+- sau mỗi đợt ôn thi,
+- thầy giữ lại bản “trình độ tốt nhất” của em để sau này đem đi thi.
+
+
+4. Học sinh này học những đặc điểm chính nào của vật thể
+--------------------------------------------------------
+
+Điều cực kỳ quan trọng là:
+
+Mô hình không học theo câu chữ kiểu:
+
+- “mèo là động vật có tai nhọn”
+- “xe có 4 bánh”
+
+Nó học bằng trọng số số học trong mạng thần kinh.
+Nhưng nếu diễn giải ra như con người, thì ta có thể hiểu nó đang cố học các nhóm đặc trưng sau.
+
+
+4.1. Với `car`
+
+Các đặc trưng mà học sinh nên học:
+
+- hình tròn hoặc gần tròn của bánh xe,
+- cặp bánh trước sau tạo cấu trúc hợp lý,
+- khung thân xe,
+- gầm xe,
+- các cạnh kim loại, kính, đèn, mui.
+
+Với hardcase `hardcase_012_img_38aa91aa2b7b.jpg`:
+
+- chiếc xe bị lật,
+- góc nhìn không phải kiểu xe đứng bình thường,
+- em không thể chỉ học “thân xe như ảnh quảng cáo”.
+
+Muốn đúng, học sinh phải linh hoạt hiểu rằng:
+
+- dù chiếc xe lật,
+- dù chỉ thấy rõ bánh, trục, gầm,
+- đó vẫn là `car`.
+
+Nói như học sinh giỏi:
+
+- “Em không chỉ nhận xe khi nó đứng đẹp.
+  Em nhận xe cả khi nó bị lật, vì em nhận ra bộ phận đặc trưng của nó.”
+
+
+4.2. Với `cat`
+
+Các đặc trưng mà học sinh nên học:
+
+- tai nhọn,
+- đầu nhỏ,
+- lông,
+- mắt, mũi, dáng ngồi, tỷ lệ thân,
+- sự mềm mại của tư thế nằm hoặc cuộn người.
+
+Với hardcase `hardcase_014_img_3ebfd325ccc4.jpg`:
+
+- mèo hiện lên khá rõ qua màu lông và tai,
+- nên nếu bỏ sót thì nghĩa là học sinh chưa đủ nhạy với chi tiết đặc trưng.
+
+Mô hình tốt phải hiểu:
+
+- không cần thấy mèo ở tư thế đối diện camera mới nhận ra,
+- chỉ cần tai, lông, đầu, dáng cuộn người cũng đủ là bằng chứng mạnh.
+
+
+4.3. Với `dog`
+
+Các đặc trưng mà học sinh nên học:
+
+- tỷ lệ đầu, cổ, lưng,
+- tai,
+- mõm,
+- tư thế đứng hoặc quay đầu,
+- lông,
+- dây dắt, vòng cổ,
+- khối cơ thể thường khác mèo.
+
+Với hardcase `hardcase_025_img_0d6d2588c38c.jpg`:
+
+- chó có thể bị quay lưng,
+- mặt không rõ,
+- nếu chỉ học bằng khuôn mặt, học sinh sẽ dễ nhầm sang `cat`.
+
+Nói như con người:
+
+- học sinh yếu thường dựa quá nhiều vào mặt.
+- học sinh khá hơn sẽ nói:
+  - “Dù không thấy rõ mặt, em vẫn nhìn ra đây là chó qua tai, gáy, lưng, cổ và dáng cơ thể.”
+
+
+4.4. Với `cat` bị che khuất
+
+Với hardcase `hardcase_033_img_046d0d26cad5.jpg`:
+
+- con mèo bị cỏ che,
+- mô hình cũ có xu hướng chỉ khoanh phần mặt hoặc khoanh quá hẹp,
+- IoU thấp vì đáp án muốn hộp lớn hơn bao trùm phần cơ thể hợp lý.
+
+Điều này cho thấy một học sinh có thể:
+
+- nhận ra “có mèo”,
+- nhưng lại chưa hiểu “toàn bộ con mèo nằm ở đâu”.
+
+Nói dễ hiểu:
+
+- em nhận ra mặt mèo,
+- nhưng khi khoanh, em chỉ khoanh phần dễ thấy nhất,
+- thay vì suy luận hợp lý rằng cơ thể còn kéo xuống dưới và sang bên.
+
+Đó là lý do training cần:
+
+- học từ crop gần vật thể,
+- học từ trường hợp bị che một phần,
+- học cách khoanh full-object box chứ không chỉ khoanh phần rõ nhất.
+
+
+5. `best.pth` chứa được thông tin gì
+------------------------------------
+
+`best.pth` không phải là ảnh, không phải là câu văn, và cũng không phải là “bí kíp viết bằng tiếng người”.
+
+Nó là một gói kiến thức số học.
+
+Khi mình đọc metadata hiện tại của `models/best.pth`, file này đang chứa:
+
+- `epoch = 30`
+- `best_val_loss = 0.8082473823364745`
+- `img_size = 640`
+- `classes = ['person', 'car', 'dog', 'cat', 'chair']`
+- `strides = [8, 16, 32]`
+
+Ngoài ra còn có các phần:
+
+- `model_state_dict`
+- `optimizer_state_dict`
+- `scheduler_state_dict`
+
+
+5.1. `model_state_dict` là gì
+
+Đây là phần quan trọng nhất.
+Nó chứa toàn bộ trọng số của mô hình.
+
+Nói như học sinh:
+
+- đây là toàn bộ kết quả sau khi em đã luyện rất nhiều bài,
+- tức là:
+  - em nhạy thế nào với bánh xe,
+  - em nhạy thế nào với tai mèo,
+  - em nhạy thế nào với thân chó,
+  - em biết kết hợp các dấu hiệu đó ra sao,
+  - em khoanh vật thể rộng hay hẹp tới mức nào.
+
+Nhưng tất cả những cái đó không được viết thành câu chữ.
+Chúng được nén thành những con số trong các lớp CNN.
+
+
+5.2. `optimizer_state_dict` là gì
+
+Phần này giống như trạng thái học tập hiện thời của học sinh:
+
+- tốc độ sửa sai đang nhanh hay chậm,
+- quán tính cập nhật trọng số đang ở mức nào.
+
+Nếu resume train:
+
+- học sinh không phải học lại từ đầu,
+- mà học tiếp từ đúng nhịp học cũ.
+
+
+5.3. `scheduler_state_dict` là gì
+
+Đây giống như kế hoạch học:
+
+- lúc đầu học mạnh,
+- sau đó giảm dần tốc độ điều chỉnh.
+
+Tức là:
+
+- khi mới học, sai đâu sửa mạnh đó,
+- về sau tinh chỉnh nhẹ hơn để ổn định.
+
+
+5.4. Điều cực kỳ đáng chú ý về `best.pth` hiện tại
+
+Checkpoint hiện có đang mang:
+
+- `img_size = 640`
+- `strides = [8, 16, 32]`
+
+Trong khi code hiện tại đã được chỉnh mạnh theo hướng mới hơn.
+
+Nói như học sinh:
+
+- cuốn sổ `best.pth` hiện tại là kiến thức của “phiên bản học sinh cũ”.
+- Em ấy đã học theo cách nhìn 3 mức `8/16/32`, chưa phải bản mới có mức nhìn sát hơn `stride 4`.
 
 Vì vậy:
 
-- Khi đổi epochs, “best.pth” có thể là một epoch khác.
-- Epoch đó có loss đẹp hơn nhưng dự đoán box kém hơn.
+- nếu code hiện tại đã đổi kiến trúc,
+- mà bạn vẫn cố dùng `best.pth` cũ,
+- thì giống như đem trí nhớ của học sinh lớp cũ gắn vào bộ não mới có cấu trúc khác.
 
-13.3. Overfitting hoặc lệch mục tiêu
+Kết quả là dễ không khớp.
 
-- Train lâu hơn chưa chắc tốt hơn.
-- Sau một mốc nào đó, model có thể:
-- fit mạnh vào loss
-- nhưng precision/recall ở val không tăng nữa
-- hoặc mAP giảm
+Nói thật và rõ:
 
-13.4. Resume training cũng làm đường đi khác
+- `best.pth` hiện tại là trí nhớ tốt nhất của bản mô hình cũ,
+- chưa phải trí nhớ tốt nhất của bản code mới sau khi bạn chỉnh để bắt hardcase tốt hơn.
 
-- Nếu resume từ checkpoint giữa chừng rồi đổi epochs, optimizer state và scheduler state cũng tiếp tục từ trạng thái cũ.
-- Điều đó có thể dẫn tới quỹ đạo tối ưu khác so với train một mạch từ đầu.
+Tức là:
 
-
-14. Tóm tắt các chỗ đang gây sai khác kết quả
-
-Trong train.py:
-
-- seed_everything() có set seed nhưng chưa khóa deterministic hoàn toàn.
-- get_train_transforms() có nhiều augment ngẫu nhiên.
-- WeightedRandomSampler(..., replacement=True) là ngẫu nhiên.
-- torch.autocast + GradScaler gây sai khác số học nhỏ.
-- torch.backends.cudnn.benchmark = True làm GPU kernel kém deterministic hơn.
-- CosineAnnealingLR(T_max=args.epochs) khiến chỉ đổi epochs là đường learning rate đổi ngay từ đầu.
-- best checkpoint đang chọn theo val_loss, không theo mAP.
-
-Trong predict.py:
-
-- hầu như deterministic.
-- TTA fallback không phải randomness thật.
-
-Trong utils:
-
-- utils/process.py có randomness ở mosaic/mixup/beta, nhưng chủ yếu là preview augment.
-- utils/runtime.py không trực tiếp tạo randomness, nhưng cấu hình GPU/worker có thể ảnh hưởng tốc độ và gián tiếp ảnh hưởng thứ tự thực thi.
+- muốn kiểm tra đúng “đứa học sinh mới”,
+- bạn phải train lại để sinh ra một `best.pth` mới phù hợp với kiến trúc mới.
 
 
-15. Muốn giảm dao động kết quả thì nên làm gì
+6. `predict.py` áp dụng kiến thức từ `best.pth` để làm bài ra sao
+-----------------------------------------------------------------
 
-- Cố định seed và luôn truyền cùng --seed.
-- Tắt hoặc giảm các augment ngẫu nhiên mạnh khi cần so sánh công bằng.
-- Tạm bỏ WeightedRandomSampler nếu đang làm ablation rất chặt.
-- Tắt AMP để test độ ổn định khi cần so sánh.
-- Tắt cudnn benchmark và bật deterministic mode nếu ưu tiên tái lập hơn tốc độ.
-- Quan trọng nhất:
-- Không so sánh các lần chạy chỉ bằng việc đổi epochs nếu vẫn dùng CosineAnnealingLR(T_max=args.epochs).
-- Nếu muốn so sánh công bằng hơn, nên cố định lịch learning rate trước, hoặc chọn best checkpoint theo mAP thay vì val_loss.
+Khi đã có `best.pth`, `predict.py` sẽ làm giống một học sinh đem kiến thức đi thi.
 
 
-16. Kết luận ngắn cho câu hỏi của bạn
+6.1. Mở cuốn sổ kiến thức
 
-- Có, trong train.py và utils đang có nhiều thành phần ngẫu nhiên.
-- Nhưng nguyên nhân lớn nhất khiến “chỉ đổi epochs mà kết quả thấp hơn trước” không chỉ là randomness.
-- Nguyên nhân lớn nhất là:
-- learning rate schedule hiện phụ thuộc trực tiếp vào epochs
-- checkpoint tốt nhất lại đang chọn theo val_loss chứ không phải mAP
+Đầu tiên `predict.py`:
 
-Nói ngắn gọn:
+- nạp checkpoint,
+- dựng lại mô hình đúng theo số lớp,
+- đổ các trọng số vào mô hình.
 
-- đổi epochs = đổi cả quỹ đạo huấn luyện
-- không phải chỉ là “chạy lâu hơn cùng một quá trình”
+Nói như học sinh:
+
+- em mở cuốn sổ ôn thi,
+- nhớ lại mình từng học gì,
+- rồi mang kiến thức đó vào phòng thi.
+
+
+6.2. Nhìn ảnh kiểm tra theo cùng quy tắc đã học
+
+`predict.py` sẽ:
+
+- đọc từng ảnh,
+- resize + letterbox để đưa về kích thước phù hợp,
+- normalize theo đúng chuẩn đã dùng khi train.
+
+Giống như:
+
+- trong phòng thi, mọi đề đều được trình bày theo cùng quy cách,
+- để học sinh không bị rối do format khác nhau.
+
+
+6.3. Mô hình phát hiện ứng viên ở nhiều vị trí
+
+Khi nhìn vào một ảnh, mô hình không nói ngay:
+
+- “đây chắc chắn là mèo”.
+
+Nó sẽ sinh ra rất nhiều ứng viên:
+
+- ở điểm này có thể là `cat`,
+- ở điểm kia có thể là `dog`,
+- ở vùng nọ có thể là `car`,
+- kèm mức tin tưởng và hộp giới hạn.
+
+Nói như học sinh:
+
+- em nhìn quanh ảnh,
+- ghi nháp ra rất nhiều khả năng,
+- chứ chưa kết luận ngay.
+
+
+6.4. Kết hợp kiến thức lớp và độ “đúng tâm”
+
+Trong `predict.py` + `utils/nms.py`, mô hình không chỉ dùng điểm lớp.
+Nó còn dùng tín hiệu centerness.
+
+Hiểu đơn giản:
+
+- một dự đoán đẹp thường không chỉ đúng lớp,
+- mà còn nằm ở vùng trung tâm hợp lý của vật thể.
+
+Giống như học sinh:
+
+- không chỉ nhận ra “có vẻ giống mèo”,
+- mà còn phải cảm thấy:
+  - “vùng em khoanh nằm đúng vào phần cốt lõi của con mèo”.
+
+
+6.5. Loại bớt các đáp án trùng nhau
+
+Sau khi mô hình sinh nhiều hộp, `predict.py` dùng NMS.
+
+NMS giống như:
+
+- nếu em khoanh 5 ô gần như trùng nhau cho cùng một con mèo,
+- giáo viên sẽ bảo:
+  - “không, đây thực chất chỉ là một con mèo thôi”.
+
+Vậy NMS giúp:
+
+- giữ hộp tốt nhất,
+- bỏ các hộp dư thừa.
+
+
+6.6. Nếu bài quá khó, học sinh nhìn lại theo vài góc đơn giản
+
+`predict.py` còn có TTA fallback/refinement.
+Nó giống như:
+
+- em nhìn ảnh gốc,
+- nếu vẫn chưa chắc,
+- em thử tưởng tượng ảnh bị lật ngang,
+- hoặc xoay lại,
+- rồi xem có nhận ra vật thể rõ hơn không.
+
+Điều này hữu ích với các ca:
+
+- vật bị xoay,
+- vật bị lật,
+- chó mèo ở tư thế lạ,
+- xe nằm ngược.
+
+
+6.7. Nộp bài
+
+Cuối cùng `predict.py` xuất ra kết quả kiểu:
+
+- ảnh nào có vật gì,
+- mỗi vật là lớp gì,
+- độ tin tưởng bao nhiêu,
+- hộp ở đâu.
+
+Đó chính là bài làm của học sinh.
+
+
+7. `results/` giống gì trong câu chuyện học tập
+-----------------------------------------------
+
+`results/` giống như chồng bài kiểm tra đã được giáo viên đánh dấu lỗi đỏ.
+
+Trong đó:
+
+- `hardcase_summary.json` là danh sách các ảnh sai nặng.
+- Các file `hardcase_0xx_...jpg` là ảnh đã được vẽ:
+  - đáp án thật,
+  - dự đoán sai,
+  - điểm lỗi.
+
+Đây chính là nơi “học từ lỗi sai” diễn ra.
+
+
+7.1. Học sinh nên học từ lỗi sai thế nào
+
+Một học sinh tốt không chỉ nhìn điểm số tổng.
+Em phải soi bài sai cụ thể:
+
+- sai vì không nhận ra vật thể,
+- sai vì nhận ra nhưng gọi nhầm lớp,
+- sai vì gọi đúng lớp nhưng khoanh quá nhỏ,
+- sai vì khoanh lệch vị trí,
+- sai vì bỏ sót vật nhỏ.
+
+Tương ứng trong bài toán này:
+
+- miss hoàn toàn `car` bị lật:
+  - nghĩa là chưa học đủ về bộ phận xe trong tư thế bất thường.
+
+- miss `cat` nằm trên cỏ:
+  - nghĩa là chưa đủ nhạy với tai, màu lông, dáng nằm.
+
+- nhầm `dog` thành `cat`:
+  - nghĩa là đang phụ thuộc quá nhiều vào vài đặc trưng giống nhau,
+  - chưa tách rõ đặc trưng phân biệt chó và mèo trong tư thế khó.
+
+- nhận ra `cat` trong cỏ nhưng box quá hẹp:
+  - nghĩa là học sinh mới “thấy khuôn mặt”,
+  - chưa “suy luận toàn thân”.
+
+
+7.2. Cách biến lỗi sai thành bài học mới
+
+Nói như một giáo viên đang kèm học sinh:
+
+- Nếu em bỏ sót xe bị lật:
+  - ta phải cho em luyện thêm ảnh xe ở góc khó, xe lật, xe bị che, xe chỉ lộ bánh.
+
+- Nếu em bỏ sót mèo trong cỏ:
+  - ta phải cho em luyện thêm ảnh bị che khuất một phần,
+  - và tăng khả năng nhìn chi tiết nhỏ.
+
+- Nếu em nhầm chó thành mèo:
+  - ta phải cho em chú ý các dấu hiệu phân biệt:
+    - cổ,
+    - lưng,
+    - tai,
+    - tỷ lệ đầu-thân,
+    - dáng cơ thể,
+    - phụ kiện như dây dắt, vòng cổ.
+
+- Nếu em khoanh mặt mèo thay vì cả con mèo:
+  - ta phải dạy em rằng:
+    - “em thấy mặt mèo là tốt,
+      nhưng box đúng là vùng bao trùm vật thể hợp lý, không chỉ phần rõ nhất.”
+
+Đó chính là logic của việc:
+
+- chỉnh augmentation,
+- chỉnh target assignment,
+- chỉnh loss,
+- chỉnh decode và NMS,
+- rồi train lại.
+
+
+8. `utils/` là cơ sở lý thuyết, luật học và trợ giúp như nào
+------------------------------------------------------------
+
+Có thể coi `utils/` là phần “hậu trường sư phạm”.
+
+
+8.1. `utils/config.py`
+
+Đây là nội quy lớp học và cấu hình chung:
+
+- tên lớp,
+- kích thước ảnh,
+- stride,
+- ngưỡng confidence,
+- trọng số loss,
+- các tham số tiny object,
+- các tham số tăng cường dữ liệu,
+- các ngưỡng hậu xử lý.
+
+Nói như đời thường:
+
+- đây là bảng nội quy và kế hoạch học.
+
+
+8.2. `utils/model.py`
+
+Đây là bộ não và đôi mắt của học sinh.
+
+Phần này quy định:
+
+- em nhìn ảnh qua backbone,
+- em tổng hợp đặc trưng nhiều mức,
+- em có các đầu dự đoán lớp, hộp, centerness.
+
+Nếu `config.py` là nội quy,
+thì `model.py` là cấu trúc não bộ.
+
+
+8.3. `utils/loss.py`
+
+Đây là hệ thống chấm sai trong lúc luyện.
+
+Nó quyết định:
+
+- sai lớp bị phạt thế nào,
+- sai hộp bị phạt thế nào,
+- sai tâm bị phạt thế nào,
+- vật nhỏ được gán điểm học ra sao.
+
+Nói như giáo viên:
+
+- “Em sai kiểu nào thì thầy trừ điểm kiểu đó.”
+
+Không có phần này, học sinh không biết nên sửa cái gì.
+
+
+8.4. `utils/nms.py`
+
+Đây là phần dọn bài làm trước khi nộp:
+
+- gộp các dự đoán trùng nhau,
+- loại bớt hộp dư,
+- remap hộp về ảnh gốc,
+- giữ kết quả hợp lý nhất.
+
+Giống như học sinh:
+
+- xoá bớt các đáp án nháp lặp lại,
+- chỉ giữ kết luận cuối.
+
+
+8.5. `utils/runtime.py`
+
+Đây là trợ giảng kỹ thuật:
+
+- chọn device,
+- chọn số worker,
+- bật/tắt AMP,
+- tối ưu chuyện chạy nhanh hay chậm.
+
+Nó không dạy kiến thức nhận diện trực tiếp,
+nhưng giúp buổi học diễn ra ổn định.
+
+
+8.6. `utils/process.py`
+
+Đây giống như chỗ mô phỏng, minh hoạ, hoặc chuẩn bị dữ liệu xem trước.
+
+Bạn có thể nghĩ nó là:
+
+- khu vực thử bài,
+- xem trước ảnh augment,
+- phân tích cách ảnh bị biến đổi.
+
+
+8.7. `utils/forecast.py`
+
+Đây là một nhánh helper liên quan đến dự đoán / decode.
+
+Hiểu đơn giản:
+
+- nó giống một bộ công cụ phụ để chuyển đặc trưng thành dự đoán hữu hình.
+
+
+8.8. `utils/image_ops.py`
+
+Đây là phần xử lý ảnh phụ trợ.
+
+Ví dụ:
+
+- tăng sáng ảnh tối,
+- chỉnh CLAHE,
+- hỗ trợ nhìn ảnh trong điều kiện khó.
+
+Nói như con người:
+
+- nếu học sinh đang làm bài trong ảnh quá tối,
+- trợ lý sẽ bật thêm đèn cho em nhìn rõ hơn một chút.
+
+
+9. `obj-detec.ipynb` giống một tờ giấy thi như nào
+--------------------------------------------------
+
+Notebook hiện tại có 8 cell và làm việc rất tuần tự.
+
+Nó giống một quy trình đi thi hoặc làm bài thực hành:
+
+1. Mở phòng thi, tải đề về
+   - clone repo.
+
+2. Kiểm tra mình đang ở đâu
+   - `pwd`, `ls`.
+
+3. Chuẩn bị dụng cụ
+   - cài `requirements.txt`.
+
+4. Học bài
+   - chạy `train.py`.
+
+5. Làm bài kiểm tra
+   - chạy `predict.py` trên tập val.
+
+6. Nhờ giáo viên chấm điểm
+   - chạy `evaluate_predictions.py`.
+
+7. Soi bài sai
+   - chạy `img_error.py`.
+
+8. Gom bài nộp
+   - zip project.
+
+Vậy nếu ví `obj-detec.ipynb` là một tờ giấy thi, thì chính xác hơn:
+
+- nó là toàn bộ quy trình của một buổi thi thực hành.
+
+Nó không phải “bộ não học”.
+Nó là “nơi tổ chức buổi học và buổi kiểm tra”.
+
+
+10. Bức tranh đầy đủ: đứa học sinh này học tập ra sao
+-----------------------------------------------------
+
+Nếu kể mạch học tập của dự án này như một câu chuyện con người:
+
+- Ban đầu học sinh được phát rất nhiều ảnh có đáp án.
+- Em nhìn ảnh, nhìn hộp khoanh đúng, học xem vật nào là người, xe, chó, mèo, ghế.
+- Nhưng thầy không cho em học thuộc lòng ảnh đẹp.
+- Thầy cố tình làm khó:
+  - đổi sáng tối,
+  - đổi màu,
+  - lật,
+  - crop,
+  - che bớt,
+  - để em học bản chất.
+
+- Em có nhiều mức quan sát:
+  - nhìn rất gần để thấy tai mèo, bánh xe,
+  - nhìn rộng để hiểu toàn thân và bối cảnh.
+
+- Mỗi lần em đoán sai:
+  - sai tên lớp,
+  - sai vị trí,
+  - sai độ rộng hộp,
+  - đều bị trừ điểm theo loss.
+
+- Em học đi học lại rất nhiều vòng.
+- Sau mỗi vòng, thầy đem em đi kiểm tra thử trên `val`.
+- Phiên bản nào làm bài thử tốt nhất thì được lưu thành `best.pth`.
+
+- Khi đi làm bài thật bằng `predict.py`,
+  em mở lại kiến thức trong `best.pth`,
+  nhìn ảnh mới,
+  khoanh các vật thể,
+  loại bớt đáp án trùng,
+  rồi nộp bài.
+
+- Giáo viên chấm bài xong,
+  những bài sai nặng được đưa vào `results/`.
+- Em không chỉ nhìn điểm tổng,
+  mà còn phải xem từng ảnh sai để hiểu:
+  - em đang mù với vật nhỏ,
+  - hay em bị nhầm chó với mèo,
+  - hay em chỉ thấy mặt mèo mà không suy ra toàn thân.
+
+- Sau đó thầy chỉnh lại cách dạy:
+  - tăng khả năng nhìn chi tiết,
+  - cho luyện vật bị che,
+  - nới cách gán điểm cho vật nhỏ,
+  - sửa cách gộp dự đoán,
+  - rồi cho em học lại.
+
+Đó chính là tinh thần thật của toàn bộ dự án này.
+
+
+11. Kết luận rất quan trọng về trạng thái hiện tại
+--------------------------------------------------
+
+Hiện tại có một sự thật bạn nên nắm rất rõ:
+
+- code đã được chỉnh theo hướng học sinh mới mạnh hơn với hardcase,
+- nhưng `models/best.pth` hiện có lại là kiến thức của mô hình cũ:
+  - `img_size = 640`
+  - `strides = [8, 16, 32]`
+
+Điều này nghĩa là:
+
+- phần lý thuyết và cách dạy mới đã tốt hơn,
+- nhưng cuốn sổ trí nhớ hiện thời chưa chắc đã phản ánh các cải tiến đó.
+
+Nói như người thật:
+
+- giáo án đã được nâng cấp,
+- nhưng em học sinh trong `best.pth` vẫn là em của khóa cũ.
+
+Muốn xem đúng “đứa học sinh mới học ra sao”,
+bạn cần:
+
+- train lại bằng code mới,
+- sinh ra `best.pth` mới,
+- rồi dùng `predict.py` với checkpoint mới đó,
+- sau đó nhìn `results/` mới để xem em ấy đã tiến bộ ra sao trên các lỗi cũ.
+
+
+12. Một câu ngắn gọn để nhớ
+---------------------------
+
+Toàn bộ dự án này có thể tóm lại như sau:
+
+- `train.py` là quá trình học.
+- `best.pth` là trí nhớ đã chắt lọc.
+- `predict.py` là lúc đem trí nhớ đi làm bài.
+- `results/` là chỗ xem lại lỗi sai để học tiếp.
+- `utils/` là lý thuyết, luật học và trợ giúp hậu trường.
+- `obj-detec.ipynb` là quy trình thi và chấm bài.
+
+Nếu nhìn đúng theo góc đó, bạn sẽ thấy đây không chỉ là một đống file code.
+Nó thật sự là câu chuyện của một học sinh đang:
+
+- học,
+- nhớ,
+- làm bài,
+- sai,
+- sửa,
+- rồi học tốt hơn ở vòng sau.
