@@ -22,6 +22,7 @@ from utils.config import (
     IMG_SIZE,
     INFER_CENTER_COMBINE,
     MAX_OBJECTS_PER_IMAGE,
+    MIN_BOX_AREA,
     MIN_BOX_SIZE,
     MIN_EXPORT_CONF,
     MEAN,
@@ -139,6 +140,10 @@ def _normalize_bbox_for_draw(bbox: Sequence[float], image_shape: Tuple[int, int,
             return None
 
     return [int(ix1), int(iy1), int(ix2), int(iy2)]
+
+
+def _bbox_area_xyxy(x1: float, y1: float, x2: float, y2: float) -> float:
+    return max(0.0, float(x2) - float(x1)) * max(0.0, float(y2) - float(y1))
 
 
 def _is_fully_inside(inner: Sequence[int], outer: Sequence[int]) -> bool:
@@ -309,6 +314,8 @@ def sanitize_predictions_for_export(
                     iy2 = iy1 + 1
                 else:
                     continue
+            if _bbox_area_xyxy(ix1, iy1, ix2, iy2) < float(MIN_BOX_AREA):
+                continue
 
             cleaned.append(
                 {
@@ -480,6 +487,7 @@ def _run_tta_fallback_single(
             reg_decode="auto",
             center_combine=str(center_combine),
             min_box_size=MIN_BOX_SIZE,
+            min_box_area=MIN_BOX_AREA,
         )[0]["boxes"]
         all_boxes.extend(inv_fn(pred))
 
@@ -512,6 +520,8 @@ def load_ground_truth(annotation_path: Path, class_names: Sequence[str]) -> Dict
         except (TypeError, ValueError):
             continue
         if x2 <= x1 or y2 <= y1:
+            continue
+        if _bbox_area_xyxy(x1, y1, x2, y2) < float(MIN_BOX_AREA):
             continue
         gt[image_id].append({"class": cls_name, "bbox": [x1, y1, x2, y2]})
 
@@ -835,6 +845,7 @@ def run_inference(
             reg_decode="auto",
             center_combine=str(center_combine),
             min_box_size=MIN_BOX_SIZE,
+            min_box_area=MIN_BOX_AREA,
         )
 
         if enable_tta_fallback:
@@ -918,7 +929,7 @@ def parse_args() -> argparse.Namespace:
         help="Path to trained model checkpoint (.pth). '--model_path' is kept as a backward-compatible alias.",
     )
     parser.add_argument("--img_size", type=int, default=IMG_SIZE)
-    parser.add_argument("--batch_size", type=int, default=4)
+    parser.add_argument("--batch_size", type=int, default=8)
     parser.add_argument("--conf_thresh", type=float, default=CONF_THRESH)
     parser.add_argument("--nms_thresh", type=float, default=NMS_IOU_THRESH)
     parser.add_argument(

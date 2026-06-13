@@ -31,6 +31,7 @@ from utils.config import (
     LOW_LIGHT_GAMMA,
     LOW_LIGHT_MEAN_THRESH,
     MEAN,
+    MIN_BOX_AREA,
     NUM_CLASSES,
     SMALL_OBJECT_AREA_RATIO,
     SMALL_OBJECT_BONUS,
@@ -52,6 +53,10 @@ class Sample:
     height: int
     boxes: List[List[float]]
     labels: List[int]
+
+
+def box_area_xyxy(box: List[float]) -> float:
+    return max(0.0, float(box[2]) - float(box[0])) * max(0.0, float(box[3]) - float(box[1]))
 
 
 def compute_class_weights(
@@ -127,10 +132,7 @@ def build_sample_weights(samples: List[Sample], class_weights: torch.Tensor) -> 
         if s.width > 0 and s.height > 0 and len(s.boxes) > 0:
             img_area = float(max(s.width * s.height, 1))
             box_areas = np.asarray(
-                [
-                    max(0.0, float(box[2]) - float(box[0])) * max(0.0, float(box[3]) - float(box[1]))
-                    for box in s.boxes
-                ],
+                [box_area_xyxy(box) for box in s.boxes],
                 dtype=np.float64,
             )
             if box_areas.size > 0:
@@ -227,6 +229,8 @@ def parse_samples(annotation_path: Path, image_dir: Path, class_names: Optional[
                 continue
             x1, y1, x2, y2 = [float(v) for v in ann.get("bbox", [0, 0, 0, 0])]
             if x2 <= x1 or y2 <= y1:
+                continue
+            if box_area_xyxy([x1, y1, x2, y2]) < float(MIN_BOX_AREA):
                 continue
             boxes.append([x1, y1, x2, y2])
             labels.append(class_to_idx[cls_name])
@@ -561,8 +565,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--val_image_dir", type=Path, required=True)
     parser.add_argument("--checkpoint_dir", type=Path, default=Path("./models"))
     parser.add_argument("--img_size", type=int, default=IMG_SIZE)
-    parser.add_argument("--batch_size", type=int, default=4)
-    parser.add_argument("--epochs", type=int, default=40)
+    parser.add_argument("--batch_size", type=int, default=8)
+    parser.add_argument("--epochs", type=int, default=30)
     parser.add_argument("--lr_backbone", type=float, default=2e-4)
     parser.add_argument("--lr_head", type=float, default=2e-3)
     parser.add_argument("--weight_decay", type=float, default=1e-4)

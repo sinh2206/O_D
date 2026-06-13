@@ -1,9 +1,11 @@
 import argparse
 import json
-import shutil
 from collections import defaultdict
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
+
+import cv2
+import numpy as np
 
 
 DEFAULT_ANNOTATION = Path("public/annotations/val.json")
@@ -12,10 +14,54 @@ DEFAULT_HARDCASE = Path("results/hardcase_summary.json")
 DEFAULT_PREDICTIONS = Path("val_predictions.json")
 DEFAULT_OUTPUT_DIR = Path("small_obj")
 DEFAULT_OUTPUT_JSON = DEFAULT_OUTPUT_DIR / "small_obj.json"
+DEFAULT_MIN_AREA = 5000.0
+DEFAULT_MAX_AREA = 10000.0
 
 
 def load_json(path: Path):
     return json.loads(path.read_text(encoding="utf-8"))
+
+
+def imread_unicode(path: Path) -> Optional[np.ndarray]:
+    if not path.exists():
+        return None
+    arr = np.fromfile(str(path), dtype=np.uint8)
+    if arr.size == 0:
+        return None
+    return cv2.imdecode(arr, cv2.IMREAD_COLOR)
+
+
+def imwrite_unicode(path: Path, image_bgr: np.ndarray) -> bool:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    ext = path.suffix.lower() if path.suffix else ".jpg"
+    ok, enc = cv2.imencode(ext, image_bgr)
+    if not ok:
+        return False
+    enc.tofile(str(path))
+    return True
+
+
+def draw_small_boxes(image_bgr: np.ndarray, small_annotations: Sequence[dict]) -> np.ndarray:
+    out = image_bgr.copy()
+    for ann in small_annotations:
+        bbox = ann.get("bbox", [0, 0, 0, 0])
+        if len(bbox) != 4:
+            continue
+        x1, y1, x2, y2 = [int(round(float(v))) for v in bbox]
+        label = f"{ann.get('class', '')}:{int(round(float(ann.get('area', 0.0))))}"
+        color = (0, 0, 255)
+        cv2.rectangle(out, (x1, y1), (x2, y2), color, 2, cv2.LINE_AA)
+        cv2.putText(
+            out,
+            label,
+            (x1, max(16, y1 - 6)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.5,
+            color,
+            1,
+            cv2.LINE_AA,
+        )
+    return out
 
 
 def bbox_area_xyxy(bbox: Sequence[float]) -> float:
@@ -91,9 +137,10 @@ def match_predictions_to_ground_truth(
 def build_small_object_report(
     annotation_path: Path,
     image_dir: Path,
-    hardcase_path: Path,
+    hardcase_path: Optional[Path],
     output_dir: Path,
-    area_threshold: float,
+    min_area_threshold: float,
+    max_area_threshold: float,
     predictions_path: Optional[Path],
     iou_thresh: float,
 ) -> dict:
@@ -106,8 +153,11 @@ def build_small_object_report(
     for ann in annotations:
         ann_map[str(ann.get("image_id", ""))].append(ann)
 
-    hardcase_items = load_json(hardcase_path)
-    hardcase_map = {str(item.get("image_id", "")): item for item in hardcase_items}
+    hardcase_items: List[dict] = []
+    hardcase_map: Dict[str, dict] = {}
+    if hardcase_path is not None and hardcase_path.exists():
+        hardcase_items = load_json(hardcase_path)
+        hardcase_map = {str(item.get("image_id", "")): item for item in hardcase_items}
 
     prediction_map: Dict[str, List[dict]] = {}
     if predictions_path and predictions_path.exists():
@@ -133,7 +183,7 @@ def build_small_object_report(
         for ann_idx, ann in enumerate(image_annotations):
             bbox = ann.get("bbox", [0, 0, 0, 0])
             area = bbox_area_xyxy(bbox)
-            if area < float(area_threshold):
+            if float(min_area_threshold) <= area <= float(max_area_threshold):
                 small_annotations.append(
                     {
                         "ann_index": ann_idx,
@@ -153,8 +203,10 @@ def build_small_object_report(
         dst_image = output_dir / file_name
         copied = False
         if src_image.exists():
-            shutil.copy2(src_image, dst_image)
-            copied = True
+            image = imread_unicode(src_image)
+            if image is not None:
+                vis_image = draw_small_boxes(image, small_annotations)
+                copied = imwrite_unicode(dst_image, vis_image)
 
         hardcase_entry = hardcase_map.get(image_id)
         in_hardcase = hardcase_entry is not None
@@ -200,6 +252,7 @@ def build_small_object_report(
                 "missed_small_object_count": missed_small_object_count,
                 "in_hardcase_summary": in_hardcase,
                 "hardcase": hardcase_entry,
+                "visualized_image": str(dst_image.as_posix()) if copied else None,
                 "small_objects": small_annotations,
             }
         )
@@ -214,11 +267,12 @@ def build_small_object_report(
     )
 
     return {
-        "area_threshold": float(area_threshold),
+        "min_area_threshold": float(min_area_threshold),
+        "max_area_threshold": float(max_area_threshold),
         "iou_threshold": float(iou_thresh),
         "source_annotation": str(annotation_path.as_posix()),
         "source_image_dir": str(image_dir.as_posix()),
-        "source_hardcase_summary": str(hardcase_path.as_posix()),
+        "source_hardcase_summary": str(hardcase_path.as_posix()) if hardcase_path is not None and hardcase_path.exists() else None,
         "source_predictions": str(predictions_path.as_posix()) if prediction_map else None,
         "summary": {
             "total_images_in_annotation": len(images),
@@ -238,7 +292,7 @@ def build_small_object_report(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Extract images that contain small objects and compare them with hardcase results."
+        description="Extract objects within an area range from val.json and draw their bounding boxes."
     )
     parser.add_argument("--annotation", type=Path, default=DEFAULT_ANNOTATION)
     parser.add_argument("--image-dir", type=Path, default=DEFAULT_IMAGE_DIR)
@@ -246,7 +300,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--predictions", type=Path, default=DEFAULT_PREDICTIONS)
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
     parser.add_argument("--output-json", type=Path, default=DEFAULT_OUTPUT_JSON)
-    parser.add_argument("--area-threshold", type=float, default=1000.0)
+    parser.add_argument("--min-area", type=float, default=DEFAULT_MIN_AREA)
+    parser.add_argument("--max-area", type=float, default=DEFAULT_MAX_AREA)
     parser.add_argument("--iou-thresh", type=float, default=0.5)
     return parser.parse_args()
 
@@ -256,10 +311,11 @@ def main() -> None:
     report = build_small_object_report(
         annotation_path=args.annotation,
         image_dir=args.image_dir,
-        hardcase_path=args.hardcase,
+        hardcase_path=args.hardcase if args.hardcase.exists() else None,
         output_dir=args.output_dir,
-        area_threshold=args.area_threshold,
-        predictions_path=args.predictions,
+        min_area_threshold=args.min_area,
+        max_area_threshold=args.max_area,
+        predictions_path=args.predictions if args.predictions.exists() else None,
         iou_thresh=args.iou_thresh,
     )
 

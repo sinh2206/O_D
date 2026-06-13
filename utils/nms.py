@@ -26,7 +26,19 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 import torch
 
 try:
-    from .config import CLASS_NAMES, CLASS_SCORE_SCALES, CONF_THRESH, IMG_SIZE, INFER_CENTER_COMBINE, MAX_OBJECTS_PER_IMAGE, MIN_BOX_SIZE, NMS_IOU_THRESH, NUM_CLASSES, STRIDES
+    from .config import (
+        CLASS_NAMES,
+        CLASS_SCORE_SCALES,
+        CONF_THRESH,
+        IMG_SIZE,
+        INFER_CENTER_COMBINE,
+        MAX_OBJECTS_PER_IMAGE,
+        MIN_BOX_AREA,
+        MIN_BOX_SIZE,
+        NMS_IOU_THRESH,
+        NUM_CLASSES,
+        STRIDES,
+    )
 except Exception:
     # Safe fallbacks when config.py is not present.
     CLASS_NAMES = ["person", "car", "dog", "cat", "chair"]
@@ -38,6 +50,7 @@ except Exception:
     NUM_CLASSES = 5
     STRIDES = [8, 16, 32]
     MAX_OBJECTS_PER_IMAGE = 15
+    MIN_BOX_AREA = 5000.0
     MIN_BOX_SIZE = 1.0
 
 
@@ -496,14 +509,21 @@ def remap_boxes_to_original(boxes: torch.Tensor, meta: LetterboxMeta) -> torch.T
     return out
 
 
-def filter_small_boxes(boxes: torch.Tensor, min_size: float = MIN_BOX_SIZE) -> torch.Tensor:
-    """Return boolean mask keeping boxes with width/height >= min_size."""
+def filter_small_boxes(
+    boxes: torch.Tensor,
+    min_size: float = MIN_BOX_SIZE,
+    min_area: float = MIN_BOX_AREA,
+) -> torch.Tensor:
+    """Return boolean mask keeping boxes with width/height >= min_size and area >= min_area."""
     if boxes.numel() == 0:
         return torch.zeros((0,), dtype=torch.bool, device=boxes.device)
 
     w = boxes[:, 2] - boxes[:, 0]
     h = boxes[:, 3] - boxes[:, 1]
-    return (w >= float(min_size)) & (h >= float(min_size))
+    valid = (w >= float(min_size)) & (h >= float(min_size))
+    if float(min_area) > 0.0:
+        valid = valid & ((w * h) >= float(min_area))
+    return valid
 
 
 def postprocess_single_image(
@@ -520,6 +540,7 @@ def postprocess_single_image(
     center_combine: str = INFER_CENTER_COMBINE,
     background_index: Optional[int] = None,
     min_box_size: float = MIN_BOX_SIZE,
+    min_box_area: float = MIN_BOX_AREA,
 ) -> Dict[str, Any]:
     """
     Full decode + NMS + remap pipeline for one image.
@@ -565,7 +586,7 @@ def postprocess_single_image(
     if letterbox_meta is not None:
         boxes = remap_boxes_to_original(boxes, letterbox_meta)
 
-    valid = filter_small_boxes(boxes, min_size=min_box_size)
+    valid = filter_small_boxes(boxes, min_size=min_box_size, min_area=min_box_area)
     boxes = boxes[valid]
     scores = scores[valid]
     cls_ids = cls_ids[valid]
@@ -610,6 +631,7 @@ def postprocess_batch(
     center_combine: str = INFER_CENTER_COMBINE,
     background_index: Optional[int] = None,
     min_box_size: float = MIN_BOX_SIZE,
+    min_box_area: float = MIN_BOX_AREA,
 ) -> List[Dict[str, Any]]:
     """Batch wrapper for JSON-ready predictions."""
     bsz = outputs["cls_logits"][0].shape[0]
@@ -638,6 +660,7 @@ def postprocess_batch(
                 center_combine=center_combine,
                 background_index=background_index,
                 min_box_size=min_box_size,
+                min_box_area=min_box_area,
             )
         )
     return results
