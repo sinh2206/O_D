@@ -25,14 +25,19 @@ from utils.config import (
     CLASS_LOSS_WEIGHTS,
     CLASS_NAMES,
     CLASS_SAMPLER_WEIGHTS,
+    DETAIL_FOCUS_AREA_RATIO,
+    DETAIL_FOCUS_CONTEXT_RANGE,
+    DETAIL_FOCUS_JITTER,
+    DETAIL_FOCUS_MIN_VISIBLE,
+    DETAIL_FOCUS_PROB,
     IMG_SIZE,
     LABEL_SMOOTHING,
     LOW_LIGHT_CLAHE_CLIP,
     LOW_LIGHT_GAMMA,
     LOW_LIGHT_MEAN_THRESH,
     MEAN,
-    MIN_BOX_AREA,
     NUM_CLASSES,
+    PARTIAL_OCCLUSION_PROB,
     SMALL_OBJECT_AREA_RATIO,
     SMALL_OBJECT_BONUS,
     STD,
@@ -53,10 +58,6 @@ class Sample:
     height: int
     boxes: List[List[float]]
     labels: List[int]
-
-
-def box_area_xyxy(box: List[float]) -> float:
-    return max(0.0, float(box[2]) - float(box[0])) * max(0.0, float(box[3]) - float(box[1]))
 
 
 def compute_class_weights(
@@ -132,7 +133,10 @@ def build_sample_weights(samples: List[Sample], class_weights: torch.Tensor) -> 
         if s.width > 0 and s.height > 0 and len(s.boxes) > 0:
             img_area = float(max(s.width * s.height, 1))
             box_areas = np.asarray(
-                [box_area_xyxy(box) for box in s.boxes],
+                [
+                    max(0.0, float(box[2]) - float(box[0])) * max(0.0, float(box[3]) - float(box[1]))
+                    for box in s.boxes
+                ],
                 dtype=np.float64,
             )
             if box_areas.size > 0:
@@ -230,8 +234,6 @@ def parse_samples(annotation_path: Path, image_dir: Path, class_names: Optional[
             x1, y1, x2, y2 = [float(v) for v in ann.get("bbox", [0, 0, 0, 0])]
             if x2 <= x1 or y2 <= y1:
                 continue
-            if box_area_xyxy([x1, y1, x2, y2]) < float(MIN_BOX_AREA):
-                continue
             boxes.append([x1, y1, x2, y2])
             labels.append(class_to_idx[cls_name])
 
@@ -270,6 +272,137 @@ def make_pad_if_needed(img_size: int):
     return A.PadIfNeeded(**kwargs)
 
 
+def make_partial_occlusion(img_size: int):
+    params = inspect.signature(A.CoarseDropout.__init__).parameters
+    if "num_holes_range" in params:
+        kwargs = {
+            "num_holes_range": (1, 4),
+            "hole_height_range": (0.06, 0.18),
+            "hole_width_range": (0.06, 0.18),
+            "p": float(PARTIAL_OCCLUSION_PROB),
+        }
+        if "fill" in params:
+            kwargs["fill"] = (114, 114, 114)
+        return A.CoarseDropout(**kwargs)
+
+    kwargs = {
+        "min_holes": 1,
+        "max_holes": 4,
+        "min_height": max(8, int(round(img_size * 0.06))),
+        "max_height": max(12, int(round(img_size * 0.18))),
+        "min_width": max(8, int(round(img_size * 0.06))),
+        "max_width": max(12, int(round(img_size * 0.18))),
+        "p": float(PARTIAL_OCCLUSION_PROB),
+    }
+    if "fill_value" in params:
+        kwargs["fill_value"] = (114, 114, 114)
+        if "mask_fill_value" in params:
+            kwargs["mask_fill_value"] = 0
+    return A.CoarseDropout(**kwargs)
+
+
+def maybe_focus_crop(
+    image_rgb: np.ndarray,
+    boxes: List[List[float]],
+    labels: List[int],
+    focus_prob: float,
+) -> Tuple[np.ndarray, List[List[float]], List[int]]:
+    if image_rgb is None or image_rgb.size == 0 or len(boxes) == 0 or random.random() >= float(focus_prob):
+        return image_rgb, boxes, labels
+
+    h, w = image_rgb.shape[:2]
+    if h <= 1 or w <= 1:
+        return image_rgb, boxes, labels
+
+    boxes_arr = np.asarray(boxes, dtype=np.float32)
+    labels_arr = np.asarray(labels, dtype=np.int64)
+    if boxes_arr.ndim != 2 or boxes_arr.shape[0] == 0:
+        return image_rgb, boxes, labels
+
+    img_area = float(max(h * w, 1))
+    box_w = np.clip(boxes_arr[:, 2] - boxes_arr[:, 0], 1.0, None)
+    box_h = np.clip(boxes_arr[:, 3] - boxes_arr[:, 1], 1.0, None)
+    box_area = box_w * box_h
+    area_ratio = box_area / img_area
+
+    label_weights = np.ones((boxes_arr.shape[0],), dtype=np.float32)
+    class_sampler = np.asarray(CLASS_SAMPLER_WEIGHTS, dtype=np.float32)
+    valid_label_mask = (labels_arr >= 0) & (labels_arr < class_sampler.size)
+    label_weights[valid_label_mask] = class_sampler[labels_arr[valid_label_mask]]
+
+    smallness = np.clip(
+        (float(DETAIL_FOCUS_AREA_RATIO) - area_ratio) / max(float(DETAIL_FOCUS_AREA_RATIO), 1e-6),
+        0.0,
+        1.0,
+    )
+    aspect = np.maximum(box_w / box_h, box_h / box_w)
+    weights = label_weights * (1.0 + 1.4 * smallness) * (1.0 + 0.18 * np.clip(aspect - 1.0, 0.0, 3.0))
+    if not np.isfinite(weights).all() or float(weights.sum()) <= 0.0:
+        weights = np.ones_like(weights, dtype=np.float32)
+    weights = weights / max(float(weights.sum()), 1e-6)
+
+    focus_idx = int(np.random.choice(np.arange(boxes_arr.shape[0]), p=weights))
+    fx1, fy1, fx2, fy2 = boxes_arr[focus_idx].tolist()
+    bw = max(1.0, fx2 - fx1)
+    bh = max(1.0, fy2 - fy1)
+
+    ctx_lo, ctx_hi = DETAIL_FOCUS_CONTEXT_RANGE
+    crop_w = min(float(w), max(bw * random.uniform(float(ctx_lo), float(ctx_hi)), bw + 24.0))
+    crop_h = min(float(h), max(bh * random.uniform(float(ctx_lo), float(ctx_hi)), bh + 24.0))
+
+    cx = 0.5 * (fx1 + fx2) + random.uniform(-float(DETAIL_FOCUS_JITTER), float(DETAIL_FOCUS_JITTER)) * bw
+    cy = 0.5 * (fy1 + fy2) + random.uniform(-float(DETAIL_FOCUS_JITTER), float(DETAIL_FOCUS_JITTER)) * bh
+
+    crop_x1 = int(round(cx - 0.5 * crop_w))
+    crop_y1 = int(round(cy - 0.5 * crop_h))
+    crop_x2 = crop_x1 + int(round(crop_w))
+    crop_y2 = crop_y1 + int(round(crop_h))
+
+    if crop_x1 < 0:
+        crop_x2 -= crop_x1
+        crop_x1 = 0
+    if crop_y1 < 0:
+        crop_y2 -= crop_y1
+        crop_y1 = 0
+    if crop_x2 > w:
+        shift = crop_x2 - w
+        crop_x1 = max(0, crop_x1 - shift)
+        crop_x2 = w
+    if crop_y2 > h:
+        shift = crop_y2 - h
+        crop_y1 = max(0, crop_y1 - shift)
+        crop_y2 = h
+
+    crop_x1 = max(0, min(crop_x1, w - 1))
+    crop_y1 = max(0, min(crop_y1, h - 1))
+    crop_x2 = max(crop_x1 + 1, min(crop_x2, w))
+    crop_y2 = max(crop_y1 + 1, min(crop_y2, h))
+
+    if (crop_x2 - crop_x1) * (crop_y2 - crop_y1) >= 0.95 * img_area:
+        return image_rgb, boxes, labels
+
+    cropped_image = image_rgb[crop_y1:crop_y2, crop_x1:crop_x2]
+    cropped_boxes = boxes_arr.copy()
+    cropped_boxes[:, [0, 2]] -= float(crop_x1)
+    cropped_boxes[:, [1, 3]] -= float(crop_y1)
+    cropped_boxes[:, [0, 2]] = np.clip(cropped_boxes[:, [0, 2]], 0.0, float(crop_x2 - crop_x1))
+    cropped_boxes[:, [1, 3]] = np.clip(cropped_boxes[:, [1, 3]], 0.0, float(crop_y2 - crop_y1))
+
+    new_w = np.clip(cropped_boxes[:, 2] - cropped_boxes[:, 0], 0.0, None)
+    new_h = np.clip(cropped_boxes[:, 3] - cropped_boxes[:, 1], 0.0, None)
+    new_area = new_w * new_h
+    visible = new_area / np.maximum(box_area, 1e-6)
+    keep = (new_w > 1.0) & (new_h > 1.0) & (visible >= float(DETAIL_FOCUS_MIN_VISIBLE))
+    if not bool(keep[focus_idx]):
+        return image_rgb, boxes, labels
+
+    kept_boxes = cropped_boxes[keep].astype(np.float32).tolist()
+    kept_labels = labels_arr[keep].astype(np.int64).tolist()
+    if len(kept_boxes) == 0:
+        return image_rgb, boxes, labels
+    return cropped_image, kept_boxes, kept_labels
+
+
 def get_train_transforms(img_size: int) -> A.Compose:
     affine_params = inspect.signature(A.Affine.__init__).parameters
     affine_kwargs = dict(
@@ -306,9 +439,11 @@ def get_train_transforms(img_size: int) -> A.Compose:
         downscale_aug = A.Downscale(scale_min=0.72, scale_max=0.90, p=1.0)
 
     try:
-        crop_aug = A.RandomSizedBBoxSafeCrop(height=img_size, width=img_size, erosion_rate=0.0, p=0.24)
+        crop_aug = A.RandomSizedBBoxSafeCrop(height=img_size, width=img_size, erosion_rate=0.0, p=0.16)
     except TypeError:
         crop_aug = A.NoOp(p=1.0)
+
+    coarse_dropout = make_partial_occlusion(img_size=img_size)
 
     return A.Compose(
         [
@@ -327,6 +462,7 @@ def get_train_transforms(img_size: int) -> A.Compose:
                 ],
                 p=0.18,
             ),
+            coarse_dropout,
             A.Sharpen(alpha=(0.15, 0.35), lightness=(0.85, 1.15), p=0.16),
             A.RandomGamma(gamma_limit=(88, 122), p=0.25),
             A.ColorJitter(brightness=0.12, contrast=0.12, saturation=0.1, hue=0.05, p=0.45),
@@ -363,9 +499,10 @@ def get_val_transforms(img_size: int) -> A.Compose:
 
 
 class DetectionDataset(Dataset):
-    def __init__(self, samples: List[Sample], transforms: A.Compose):
+    def __init__(self, samples: List[Sample], transforms: A.Compose, detail_focus_prob: float = 0.0):
         self.samples = samples
         self.transforms = transforms
+        self.detail_focus_prob = float(detail_focus_prob)
 
     def __len__(self) -> int:
         return len(self.samples)
@@ -380,6 +517,12 @@ class DetectionDataset(Dataset):
 
         bboxes = [list(b) for b in sample.boxes]
         class_labels = list(sample.labels)
+        image, bboxes, class_labels = maybe_focus_crop(
+            image_rgb=image,
+            boxes=bboxes,
+            labels=class_labels,
+            focus_prob=self.detail_focus_prob,
+        )
 
         transformed = self.transforms(image=image, bboxes=bboxes, class_labels=class_labels)
         img_t = transformed["image"].float()
@@ -517,7 +660,8 @@ def validate_one_epoch(
 def build_optimizer(model: AnchorFreeDetector, lr_backbone: float, lr_head: float, weight_decay: float) -> torch.optim.Optimizer:
     backbone_params = list(model.backbone_fpn.parameters())
     head_params = (
-        list(model.head_s8.parameters())
+        list(model.head_s4.parameters())
+        + list(model.head_s8.parameters())
         + list(model.head_s16.parameters())
         + list(model.head_s32.parameters())
     )
@@ -599,8 +743,12 @@ def main() -> None:
     val_samples, _ = parse_samples(args.val_data, args.val_image_dir, class_names=classes)
     num_classes = len(classes)
 
-    train_ds = DetectionDataset(train_samples, transforms=get_train_transforms(args.img_size))
-    val_ds = DetectionDataset(val_samples, transforms=get_val_transforms(args.img_size))
+    train_ds = DetectionDataset(
+        train_samples,
+        transforms=get_train_transforms(args.img_size),
+        detail_focus_prob=float(DETAIL_FOCUS_PROB),
+    )
+    val_ds = DetectionDataset(val_samples, transforms=get_val_transforms(args.img_size), detail_focus_prob=0.0)
 
     class_weights = None if args.no_class_weights else compute_class_weights(
         num_classes=num_classes,
@@ -657,9 +805,15 @@ def main() -> None:
             print(f"Missing keys: {missing}")
             print(f"Unexpected keys: {unexpected}")
         if "optimizer_state_dict" in ckpt:
-            optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+            try:
+                optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+            except ValueError as exc:
+                print(f"Skipped optimizer state restore due to parameter mismatch: {exc}")
         if "scheduler_state_dict" in ckpt:
-            scheduler.load_state_dict(ckpt["scheduler_state_dict"])
+            try:
+                scheduler.load_state_dict(ckpt["scheduler_state_dict"])
+            except ValueError as exc:
+                print(f"Skipped scheduler state restore due to parameter mismatch: {exc}")
         start_epoch = int(ckpt.get("epoch", 0)) + 1
         best_val_loss = float(ckpt.get("best_val_loss", float("inf")))
 

@@ -16,13 +16,13 @@ from utils.config import (
     CLASS_CONF_THRESH,
     CLASS_NAMES,
     CONF_THRESH,
+    CONTAINED_BOX_REPLACE_MARGIN,
     LOW_LIGHT_CLAHE_CLIP,
     LOW_LIGHT_GAMMA,
     LOW_LIGHT_MEAN_THRESH,
     IMG_SIZE,
     INFER_CENTER_COMBINE,
     MAX_OBJECTS_PER_IMAGE,
-    MIN_BOX_AREA,
     MIN_BOX_SIZE,
     MIN_EXPORT_CONF,
     MEAN,
@@ -142,10 +142,6 @@ def _normalize_bbox_for_draw(bbox: Sequence[float], image_shape: Tuple[int, int,
     return [int(ix1), int(iy1), int(ix2), int(iy2)]
 
 
-def _bbox_area_xyxy(x1: float, y1: float, x2: float, y2: float) -> float:
-    return max(0.0, float(x2) - float(x1)) * max(0.0, float(y2) - float(y1))
-
-
 def _is_fully_inside(inner: Sequence[int], outer: Sequence[int]) -> bool:
     return bool(
         inner[0] >= outer[0]
@@ -183,7 +179,11 @@ def _suppress_same_class_contained_int(boxes: List[dict]) -> List[dict]:
             if not (cand_inside_kept or kept_inside_cand):
                 continue
 
-            if kept_inside_cand and area > kept_area and score + 0.03 >= kept_score:
+            if (
+                kept_inside_cand
+                and area > kept_area
+                and score + float(CONTAINED_BOX_REPLACE_MARGIN) >= kept_score
+            ):
                 replace_idx = k_idx
                 break
 
@@ -314,8 +314,6 @@ def sanitize_predictions_for_export(
                     iy2 = iy1 + 1
                 else:
                     continue
-            if _bbox_area_xyxy(ix1, iy1, ix2, iy2) < float(MIN_BOX_AREA):
-                continue
 
             cleaned.append(
                 {
@@ -357,6 +355,36 @@ def box_iou(a: Sequence[float], b: Sequence[float]) -> float:
     area_a = max(0.0, ax2 - ax1) * max(0.0, ay2 - ay1)
     area_b = max(0.0, bx2 - bx1) * max(0.0, by2 - by1)
     return inter / (area_a + area_b - inter + 1e-9)
+
+
+def _box_area_ratio(box: Sequence[float], width: int, height: int) -> float:
+    if width <= 0 or height <= 0:
+        return 0.0
+    x1, y1, x2, y2 = [float(v) for v in box]
+    area = max(0.0, x2 - x1) * max(0.0, y2 - y1)
+    return area / max(float(width * height), 1.0)
+
+
+def _needs_tta_refine(boxes: Sequence[dict], width: int, height: int) -> bool:
+    if len(boxes) == 0:
+        return True
+    if len(boxes) > 2:
+        return False
+
+    for box in boxes:
+        cls_name = str(box.get("class", ""))
+        score = float(box.get("confidence", 0.0))
+        bbox = box.get("bbox", [0.0, 0.0, 0.0, 0.0])
+        if not isinstance(bbox, list) or len(bbox) != 4:
+            continue
+        area_ratio = _box_area_ratio(bbox, width=width, height=height)
+        if cls_name in {"dog", "cat"} and area_ratio <= 0.08:
+            return True
+        if cls_name == "car" and area_ratio <= 0.12 and score <= 0.72:
+            return True
+        if score <= 0.42:
+            return True
+    return False
 
 
 def _inverse_hflip_boxes(boxes: Sequence[dict], width: int) -> List[dict]:
@@ -487,7 +515,6 @@ def _run_tta_fallback_single(
             reg_decode="auto",
             center_combine=str(center_combine),
             min_box_size=MIN_BOX_SIZE,
-            min_box_area=MIN_BOX_AREA,
         )[0]["boxes"]
         all_boxes.extend(inv_fn(pred))
 
@@ -520,8 +547,6 @@ def load_ground_truth(annotation_path: Path, class_names: Sequence[str]) -> Dict
         except (TypeError, ValueError):
             continue
         if x2 <= x1 or y2 <= y1:
-            continue
-        if _bbox_area_xyxy(x1, y1, x2, y2) < float(MIN_BOX_AREA):
             continue
         gt[image_id].append({"class": cls_name, "bbox": [x1, y1, x2, y2]})
 
@@ -845,16 +870,17 @@ def run_inference(
             reg_decode="auto",
             center_combine=str(center_combine),
             min_box_size=MIN_BOX_SIZE,
-            min_box_area=MIN_BOX_AREA,
         )
 
         if enable_tta_fallback:
             for item in batch_results:
-                if len(item.get("boxes", [])) > 0:
-                    continue
                 image_id = str(item.get("image_id", ""))
                 image_bgr = originals.get(image_id)
                 if image_bgr is None:
+                    continue
+                h, w = image_bgr.shape[:2]
+                existing_boxes = list(item.get("boxes", []))
+                if not _needs_tta_refine(existing_boxes, width=w, height=h):
                     continue
                 tta_boxes = _run_tta_fallback_single(
                     model=model,
@@ -869,7 +895,14 @@ def run_inference(
                     tta_min_votes=tta_min_votes,
                 )
                 if tta_boxes:
-                    item["boxes"] = tta_boxes
+                    merged_boxes = _merge_tta_boxes(
+                        list(existing_boxes) + list(tta_boxes),
+                        iou_thresh=0.45,
+                        min_votes=1 if existing_boxes else max(1, int(tta_min_votes)),
+                    )
+                    merged_boxes = _suppress_same_class_contained_int(merged_boxes)
+                    merged_boxes = sorted(merged_boxes, key=lambda b: float(b.get("confidence", 0.0)), reverse=True)
+                    item["boxes"] = merged_boxes[: int(MAX_OBJECTS_PER_IMAGE)]
 
         results.extend(batch_results)
 
@@ -948,7 +981,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--chair_suppress_iou", type=float, default=CHAIR_SUPPRESS_WITH_PERSON_IOU)
     parser.add_argument("--hardcase_topk", type=int, default=50)
     parser.add_argument("--hardcase_iou", type=float, default=0.5)
-    parser.add_argument("--tta_fallback", action="store_true", help="Enable TTA fallback on images with zero detections.")
+    parser.set_defaults(tta_fallback=True)
+    parser.add_argument("--tta_fallback", dest="tta_fallback", action="store_true", help="Enable TTA fallback/refinement.")
+    parser.add_argument("--no_tta_fallback", dest="tta_fallback", action="store_false", help="Disable TTA fallback/refinement.")
     parser.add_argument("--tta_min_votes", type=int, default=2, help="Minimum TTA consensus votes to keep a fallback box.")
     parser.add_argument("--device", type=str, default="auto", choices=["auto", "cuda", "cpu"])
     return parser.parse_args()
@@ -1038,7 +1073,7 @@ def main() -> None:
     )
     print(f"Predicted images: {len(predictions)}")
     print(f"Saved JSON: {args.output}")
-    print(f"TTA fallback: {bool(args.tta_fallback)} (min_votes={max(1, int(args.tta_min_votes))})")
+    print(f"TTA fallback/refine: {bool(args.tta_fallback)} (min_votes={max(1, int(args.tta_min_votes))})")
     print(f"Hardcase items: {hardcase_count}")
     print(f"Hardcase summary: {summary_path}")
 

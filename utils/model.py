@@ -5,14 +5,17 @@ Anchor-Free feature extractor and detection head.
 
 Architecture summary (input IMG_SIZE x IMG_SIZE):
 - Backbone: ResNet-34 pretrained (no avgpool/fc)
-  stem -> layer1 -> layer2(C2, stride 8, 128ch) -> layer3(C3, stride 16, 256ch) -> layer4(C4, stride 32, 512ch)
-- Neck: 3-level FPN
+  stem(stride 4) -> layer1(C1, stride 4, 64ch) -> layer2(C2, stride 8, 128ch)
+  -> layer3(C3, stride 16, 256ch) -> layer4(C4, stride 32, 512ch)
+- Neck: 4-level FPN
+  lateral1: 1x1 conv (64  -> 128)
   lateral2: 1x1 conv (128 -> 128)
   lateral3: 1x1 conv (256 -> 128)
   lateral4: 1x1 conv (512 -> 128)
-  top-down: upsample(P4) + P3, then upsample(P3) + P2
+  top-down: upsample(P4) + P3, upsample(P3) + P2, upsample(P2) + P1
   smooth: conv3x3 + BN + LeakyReLU(0.1) on all levels
 - Outputs:
+  P1_out: (B, 128, H/4,  W/4),  stride 4
   P2_out: (B, 128, H/8,  W/8),  stride 8
   P3_out: (B, 128, H/16, W/16), stride 16
   P4_out: (B, 128, H/32, W/32), stride 32
@@ -48,7 +51,7 @@ class ConvBNLeaky(nn.Module):
 
 
 class ResNet34FPN3L(nn.Module):
-    """Backbone + 3-level FPN feature extractor (stride 8/16/32)."""
+    """Backbone + 4-level FPN feature extractor (stride 4/8/16/32)."""
 
     def __init__(self, fpn_channels: int = FPN_CHANNELS, pretrained: bool = True):
         super().__init__()
@@ -57,17 +60,19 @@ class ResNet34FPN3L(nn.Module):
 
         # Backbone stages.
         self.stem = nn.Sequential(backbone.conv1, backbone.bn1, backbone.relu, backbone.maxpool)
-        self.layer1 = backbone.layer1
+        self.layer1 = backbone.layer1  # C1: stride 4, 64ch
         self.layer2 = backbone.layer2  # C2: stride 8, 128ch
         self.layer3 = backbone.layer3  # C3: stride 16, 256ch
         self.layer4 = backbone.layer4  # C4: stride 32, 512ch
 
         # Lateral connections.
+        self.lateral1 = nn.Conv2d(64, fpn_channels, kernel_size=1)
         self.lateral2 = nn.Conv2d(128, fpn_channels, kernel_size=1)
         self.lateral3 = nn.Conv2d(256, fpn_channels, kernel_size=1)
         self.lateral4 = nn.Conv2d(512, fpn_channels, kernel_size=1)
 
         # Smooth layers.
+        self.fpn_out1 = ConvBNLeaky(fpn_channels, fpn_channels, k=3, s=1, p=1)
         self.fpn_out2 = ConvBNLeaky(fpn_channels, fpn_channels, k=3, s=1, p=1)
         self.fpn_out3 = ConvBNLeaky(fpn_channels, fpn_channels, k=3, s=1, p=1)
         self.fpn_out4 = ConvBNLeaky(fpn_channels, fpn_channels, k=3, s=1, p=1)
@@ -87,13 +92,14 @@ class ResNet34FPN3L(nn.Module):
             except Exception:
                 return models.resnet34(weights=None)
 
-    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         x = self.stem(x)
-        x = self.layer1(x)
-        c2 = self.layer2(x)
+        c1 = self.layer1(x)
+        c2 = self.layer2(c1)
         c3 = self.layer3(c2)
         c4 = self.layer4(c3)
 
+        p1 = self.lateral1(c1)
         p2 = self.lateral2(c2)
         p3 = self.lateral3(c3)
         p4 = self.lateral4(c4)
@@ -103,13 +109,16 @@ class ResNet34FPN3L(nn.Module):
         p3 = p3 + p4_up
         p3_up = F.interpolate(p3, size=p2.shape[-2:], mode="nearest")
         p2 = p2 + p3_up
+        p2_up = F.interpolate(p2, size=p1.shape[-2:], mode="nearest")
+        p1 = p1 + p2_up
 
         # Smooth.
+        p1_out = self.fpn_out1(p1)
         p2_out = self.fpn_out2(p2)
         p3_out = self.fpn_out3(p3)
         p4_out = self.fpn_out4(p4)
 
-        return p2_out, p3_out, p4_out
+        return p1_out, p2_out, p3_out, p4_out
 
 
 class AnchorFreeHead(nn.Module):
@@ -170,19 +179,19 @@ class AnchorFreeHead(nn.Module):
 
 class AnchorFreeDetector(nn.Module):
     """
-    Full detector: ResNet34 + FPN(3 levels) + per-level anchor-free heads.
+    Full detector: ResNet34 + FPN(4 levels) + per-level anchor-free heads.
 
     Multi-scale forward output:
     {
-      "features": {"stride8": P2_out, "stride16": P3_out, "stride32": P4_out},
-      "cls_logits": [cls_s8, cls_s16, cls_s32],
-      "reg_preds": [reg_s8, reg_s16, reg_s32],
-      "center_logits": [ctr_s8, ctr_s16, ctr_s32],
-      "strides": [8, 16, 32]
+      "features": {"stride4": P1_out, "stride8": P2_out, "stride16": P3_out, "stride32": P4_out},
+      "cls_logits": [cls_s4, cls_s8, cls_s16, cls_s32],
+      "reg_preds": [reg_s4, reg_s8, reg_s16, reg_s32],
+      "center_logits": [ctr_s4, ctr_s8, ctr_s16, ctr_s32],
+      "strides": [4, 8, 16, 32]
     }
 
     If `legacy_single_output=True`, additionally returns merged single-scale tensors in
-    keys: cls_logits_legacy, reg_preds_legacy, center_logits_legacy (stride8 space).
+    keys: cls_logits_legacy, reg_preds_legacy, center_logits_legacy (stride4 space).
     """
 
     def __init__(
@@ -198,41 +207,46 @@ class AnchorFreeDetector(nn.Module):
         self.legacy_single_output = legacy_single_output
 
         self.backbone_fpn = ResNet34FPN3L(fpn_channels=feat_channels, pretrained=pretrained)
+        self.head_s4 = AnchorFreeHead(in_ch=feat_channels, num_classes=num_classes, num_convs=2)
         self.head_s8 = AnchorFreeHead(in_ch=feat_channels, num_classes=num_classes, num_convs=2)
         self.head_s16 = AnchorFreeHead(in_ch=feat_channels, num_classes=num_classes, num_convs=2)
         self.head_s32 = AnchorFreeHead(in_ch=feat_channels, num_classes=num_classes, num_convs=2)
 
-    def extract_features(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def extract_features(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         return self.backbone_fpn(x)
 
     def forward(self, x: torch.Tensor) -> Dict[str, object]:
-        p2_out, p3_out, p4_out = self.extract_features(x)
+        p1_out, p2_out, p3_out, p4_out = self.extract_features(x)
 
+        out4 = self.head_s4(p1_out)
         out8 = self.head_s8(p2_out)
         out16 = self.head_s16(p3_out)
         out32 = self.head_s32(p4_out)
 
         outputs: Dict[str, object] = {
-            "features": {"stride8": p2_out, "stride16": p3_out, "stride32": p4_out},
-            "cls_logits": [out8["cls_logits"], out16["cls_logits"], out32["cls_logits"]],
-            "reg_preds": [out8["reg_preds"], out16["reg_preds"], out32["reg_preds"]],
-            "center_logits": [out8["center_logits"], out16["center_logits"], out32["center_logits"]],
-            "strides": [8, 16, 32],
+            "features": {"stride4": p1_out, "stride8": p2_out, "stride16": p3_out, "stride32": p4_out},
+            "cls_logits": [out4["cls_logits"], out8["cls_logits"], out16["cls_logits"], out32["cls_logits"]],
+            "reg_preds": [out4["reg_preds"], out8["reg_preds"], out16["reg_preds"], out32["reg_preds"]],
+            "center_logits": [out4["center_logits"], out8["center_logits"], out16["center_logits"], out32["center_logits"]],
+            "strides": [4, 8, 16, 32],
         }
 
         if self.legacy_single_output:
-            # Compatibility path: merge stride16/32 predictions to stride8 resolution.
-            size8 = out8["cls_logits"].shape[-2:]
-            cls16_up = F.interpolate(out16["cls_logits"], size=size8, mode="nearest")
-            cls32_up = F.interpolate(out32["cls_logits"], size=size8, mode="nearest")
-            reg16_up = F.interpolate(out16["reg_preds"], size=size8, mode="nearest")
-            reg32_up = F.interpolate(out32["reg_preds"], size=size8, mode="nearest")
-            ctr16_up = F.interpolate(out16["center_logits"], size=size8, mode="nearest")
-            ctr32_up = F.interpolate(out32["center_logits"], size=size8, mode="nearest")
+            # Compatibility path: merge higher-stride predictions to stride4 resolution.
+            size4 = out4["cls_logits"].shape[-2:]
+            cls8_up = F.interpolate(out8["cls_logits"], size=size4, mode="nearest")
+            cls16_up = F.interpolate(out16["cls_logits"], size=size4, mode="nearest")
+            cls32_up = F.interpolate(out32["cls_logits"], size=size4, mode="nearest")
+            reg8_up = F.interpolate(out8["reg_preds"], size=size4, mode="nearest")
+            reg16_up = F.interpolate(out16["reg_preds"], size=size4, mode="nearest")
+            reg32_up = F.interpolate(out32["reg_preds"], size=size4, mode="nearest")
+            ctr8_up = F.interpolate(out8["center_logits"], size=size4, mode="nearest")
+            ctr16_up = F.interpolate(out16["center_logits"], size=size4, mode="nearest")
+            ctr32_up = F.interpolate(out32["center_logits"], size=size4, mode="nearest")
 
-            outputs["cls_logits_legacy"] = (out8["cls_logits"] + cls16_up + cls32_up) / 3.0
-            outputs["reg_preds_legacy"] = (out8["reg_preds"] + reg16_up + reg32_up) / 3.0
-            outputs["center_logits_legacy"] = (out8["center_logits"] + ctr16_up + ctr32_up) / 3.0
+            outputs["cls_logits_legacy"] = (out4["cls_logits"] + cls8_up + cls16_up + cls32_up) / 4.0
+            outputs["reg_preds_legacy"] = (out4["reg_preds"] + reg8_up + reg16_up + reg32_up) / 4.0
+            outputs["center_logits_legacy"] = (out4["center_logits"] + ctr8_up + ctr16_up + ctr32_up) / 4.0
 
         return outputs
 
