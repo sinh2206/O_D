@@ -14,7 +14,7 @@ DEFAULT_HARDCASE = Path("results/hardcase_summary.json")
 DEFAULT_PREDICTIONS = Path("val_predictions.json")
 DEFAULT_OUTPUT_DIR = Path("small_obj")
 DEFAULT_OUTPUT_JSON = DEFAULT_OUTPUT_DIR / "small_obj.json"
-DEFAULT_MIN_AREA = 5000.0
+DEFAULT_MIN_AREA = 2000.0
 DEFAULT_MAX_AREA = 10000.0
 
 
