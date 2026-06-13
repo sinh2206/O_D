@@ -336,7 +336,15 @@ def maybe_focus_crop(
         1.0,
     )
     aspect = np.maximum(box_w / box_h, box_h / box_w)
-    weights = label_weights * (1.0 + 1.4 * smallness) * (1.0 + 0.18 * np.clip(aspect - 1.0, 0.0, 3.0))
+    
+    # Class-specific detail focus: prioritize car (wheels), dog/cat (ears/fur)
+    # idx: 1 (car), 2 (dog), 3 (cat)
+    class_focus = np.ones_like(label_weights)
+    class_focus[labels_arr == 1] = 1.25
+    class_focus[labels_arr == 2] = 1.35
+    class_focus[labels_arr == 3] = 1.40
+    
+    weights = label_weights * class_focus * (1.0 + 1.6 * smallness) * (1.0 + 0.22 * np.clip(aspect - 1.0, 0.0, 3.0))
     if not np.isfinite(weights).all() or float(weights.sum()) <= 0.0:
         weights = np.ones_like(weights, dtype=np.float32)
     weights = weights / max(float(weights.sum()), 1e-6)
@@ -453,7 +461,8 @@ def get_train_transforms(img_size: int) -> A.Compose:
             A.HorizontalFlip(p=0.5),
             A.VerticalFlip(p=0.05),
             A.RandomRotate90(p=0.12),
-            A.CLAHE(clip_limit=2.2, tile_grid_size=(8, 8), p=0.2),
+            A.CLAHE(clip_limit=2.5, tile_grid_size=(8, 8), p=0.25),
+            A.HueSaturationValue(hue_shift_limit=15, sat_shift_limit=25, val_shift_limit=20, p=0.35),
             A.OneOf(
                 [
                     A.GaussianBlur(blur_limit=(3, 7), p=1.0),
@@ -463,8 +472,9 @@ def get_train_transforms(img_size: int) -> A.Compose:
                 p=0.18,
             ),
             coarse_dropout,
-            A.Sharpen(alpha=(0.15, 0.35), lightness=(0.85, 1.15), p=0.16),
-            A.RandomGamma(gamma_limit=(88, 122), p=0.25),
+            A.Sharpen(alpha=(0.15, 0.40), lightness=(0.80, 1.20), p=0.22),
+            A.UnsharpMask(blur_limit=(3, 7), sigma_limit=0.0, alpha=(0.2, 0.5), p=0.18),
+            A.RandomGamma(gamma_limit=(85, 125), p=0.25),
             A.ColorJitter(brightness=0.12, contrast=0.12, saturation=0.1, hue=0.05, p=0.45),
             affine,
             A.Normalize(mean=MEAN, std=STD),

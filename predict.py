@@ -378,11 +378,15 @@ def _needs_tta_refine(boxes: Sequence[dict], width: int, height: int) -> bool:
         if not isinstance(bbox, list) or len(bbox) != 4:
             continue
         area_ratio = _box_area_ratio(bbox, width=width, height=height)
-        if cls_name in {"dog", "cat"} and area_ratio <= 0.08:
-            return True
-        if cls_name == "car" and area_ratio <= 0.12 and score <= 0.72:
-            return True
-        if score <= 0.42:
+        
+        # Increased sensitivity for dog/cat (discrimination/occlusion) and car (wheels)
+        if cls_name in {"dog", "cat"}:
+            if area_ratio <= 0.10 or score <= 0.65:
+                return True
+        if cls_name == "car":
+            if area_ratio <= 0.15 and score <= 0.78:
+                return True
+        if score <= 0.45:
             return True
     return False
 
