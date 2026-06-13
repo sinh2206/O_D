@@ -4,7 +4,7 @@ from __future__ import annotations
 Shared configuration for the anchor-free object detection project.
 """
 
-IMG_SIZE = 640
+IMG_SIZE = 704
 
 CLASS_NAMES = ["person", "car", "dog", "cat", "chair"]
 NUM_CLASSES = len(CLASS_NAMES)
