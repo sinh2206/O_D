@@ -34,6 +34,7 @@ try:
         LAMBDA_CLS,
         LAMBDA_CTR,
         LAMBDA_REG,
+        LAMBDA_REG_L1,
         NEGATIVE_FOCAL_WEIGHT,
         NUM_CLASSES,
         STRIDES,
@@ -43,17 +44,18 @@ try:
 except Exception:
     # Safe fallbacks so this module still works if config.py is not available.
     NUM_CLASSES = 5
-    STRIDES = [8, 16, 32]
-    CENTER_RADIUS = 2.0
+    STRIDES = [4, 8, 16, 32]
+    CENTER_RADIUS = 2.75
     FOCAL_GAMMA = 2.0
     FOCAL_ALPHA = 0.25
     LABEL_SMOOTHING = 0.01
     NEGATIVE_FOCAL_WEIGHT = 0.5
     LAMBDA_CLS = 1.0
     LAMBDA_REG = 1.0
+    LAMBDA_REG_L1 = 0.0
     LAMBDA_CTR = 0.5
-    TINY_OBJECT_MAX_SIDE_FACTOR = 2.0
-    TINY_ASSIGN_EXPAND_STRIDE = 0.75
+    TINY_OBJECT_MAX_SIDE_FACTOR = 2.5
+    TINY_ASSIGN_EXPAND_STRIDE = 1.0
 
 EPS = 1e-8
 DEFAULT_CENTER_RADIUS = float(CENTER_RADIUS)
@@ -624,6 +626,7 @@ def compute_loss(
     strides: Optional[Sequence[int]] = None,
     lambda_cls: float = LAMBDA_CLS,
     lambda_reg: float = LAMBDA_REG,
+    lambda_reg_l1: float = LAMBDA_REG_L1,
     lambda_ctr: float = LAMBDA_CTR,
     focal_alpha: float = FOCAL_ALPHA,
     focal_gamma: float = FOCAL_GAMMA,
@@ -665,7 +668,8 @@ def compute_loss(
     bg_index = int(target_pack["bg_index"])
 
     total_cls = cls_levels[0].new_tensor(0.0)
-    total_reg = cls_levels[0].new_tensor(0.0)
+    total_reg_iou = cls_levels[0].new_tensor(0.0)
+    total_reg_l1 = cls_levels[0].new_tensor(0.0)
     total_ctr = cls_levels[0].new_tensor(0.0)
     total_pos = cls_levels[0].new_tensor(0.0)
 
@@ -718,7 +722,13 @@ def compute_loss(
 
             pred_boxes = tlbr_to_xyxy(pts_pos, reg_pos)
             tgt_boxes = tlbr_to_xyxy(pts_pos, tgt_pos)
-            total_reg = total_reg + giou_loss(pred_boxes, tgt_boxes, reduction="sum")
+            total_reg_iou = total_reg_iou + giou_loss(pred_boxes, tgt_boxes, reduction="sum")
+            total_reg_l1 = total_reg_l1 + F.smooth_l1_loss(
+                reg_pos,
+                tgt_pos,
+                beta=1.0,
+                reduction="sum",
+            )
 
             if ctr_levels is not None:
                 ctr_logits = ctr_levels[lvl].permute(0, 2, 3, 1).reshape(-1)
@@ -733,7 +743,7 @@ def compute_loss(
     normalizer = torch.clamp(total_pos, min=1.0)
 
     loss_cls = total_cls / normalizer
-    loss_reg = total_reg / normalizer
+    loss_reg = (total_reg_iou + float(lambda_reg_l1) * total_reg_l1) / normalizer
     loss_ctr = total_ctr / normalizer if ctr_levels is not None else total_cls.new_tensor(0.0)
 
     total = (
@@ -767,6 +777,7 @@ class DetectionLoss(nn.Module):
         strides: Optional[Sequence[int]] = None,
         lambda_cls: float = LAMBDA_CLS,
         lambda_reg: float = LAMBDA_REG,
+        lambda_reg_l1: float = LAMBDA_REG_L1,
         lambda_ctr: float = LAMBDA_CTR,
         focal_alpha: float = FOCAL_ALPHA,
         focal_gamma: float = FOCAL_GAMMA,
@@ -783,6 +794,7 @@ class DetectionLoss(nn.Module):
         self.strides = list(strides) if strides is not None else list(STRIDES)
         self.lambda_cls = float(lambda_cls)
         self.lambda_reg = float(lambda_reg)
+        self.lambda_reg_l1 = float(lambda_reg_l1)
         self.lambda_ctr = float(lambda_ctr)
         self.focal_alpha = float(focal_alpha)
         self.focal_gamma = float(focal_gamma)
@@ -805,6 +817,7 @@ class DetectionLoss(nn.Module):
             strides=self.strides,
             lambda_cls=self.lambda_cls,
             lambda_reg=self.lambda_reg,
+            lambda_reg_l1=self.lambda_reg_l1,
             lambda_ctr=self.lambda_ctr,
             focal_alpha=self.focal_alpha,
             focal_gamma=self.focal_gamma,

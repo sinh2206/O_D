@@ -25,13 +25,22 @@ from utils.config import (
     CLASS_LOSS_WEIGHTS,
     CLASS_NAMES,
     CLASS_SAMPLER_WEIGHTS,
+    CONF_THRESH,
+    DETAIL_FOCUS_AREA_RATIO,
+    DETAIL_FOCUS_CONTEXT_RANGE,
+    DETAIL_FOCUS_JITTER,
+    DETAIL_FOCUS_MIN_VISIBLE,
+    DETAIL_FOCUS_PROB,
     IMG_SIZE,
+    INFER_CENTER_COMBINE,
     LABEL_SMOOTHING,
     LOW_LIGHT_CLAHE_CLIP,
     LOW_LIGHT_GAMMA,
     LOW_LIGHT_MEAN_THRESH,
     MEAN,
+    NMS_IOU_THRESH,
     NUM_CLASSES,
+    PARTIAL_OCCLUSION_PROB,
     SMALL_OBJECT_AREA_RATIO,
     SMALL_OBJECT_BONUS,
     STD,
@@ -39,6 +48,7 @@ from utils.config import (
 )
 from utils.loss import DetectionLoss
 from utils.model import AnchorFreeDetector
+from utils.nms import postprocess_batch
 from utils.runtime import create_grad_scaler, resolve_num_workers, should_pin_memory
 
 VALID_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
@@ -266,6 +276,131 @@ def make_pad_if_needed(img_size: int):
     return A.PadIfNeeded(**kwargs)
 
 
+def make_partial_occlusion(img_size: int) -> A.BasicTransform:
+    prob = max(0.0, float(PARTIAL_OCCLUSION_PROB))
+    if prob <= 0.0:
+        return A.NoOp(p=1.0)
+
+    params = inspect.signature(A.CoarseDropout.__init__).parameters
+    min_size = max(6, int(round(img_size * 0.08)))
+    max_size = max(min_size + 1, int(round(img_size * 0.22)))
+
+    if "num_holes_range" in params:
+        kwargs = {
+            "num_holes_range": (1, 3),
+            "hole_height_range": (0.08, 0.22),
+            "hole_width_range": (0.08, 0.22),
+            "p": prob,
+        }
+        if "fill" in params:
+            kwargs["fill"] = (114, 114, 114)
+        if "fill_mask" in params:
+            kwargs["fill_mask"] = 0
+        return A.CoarseDropout(**kwargs)
+
+    kwargs = {
+        "min_holes": 1,
+        "max_holes": 3,
+        "min_height": min_size,
+        "max_height": max_size,
+        "min_width": min_size,
+        "max_width": max_size,
+        "p": prob,
+    }
+    if "fill_value" in params:
+        kwargs["fill_value"] = (114, 114, 114)
+    elif "value" in params:
+        kwargs["value"] = (114, 114, 114)
+    if "mask_fill_value" in params:
+        kwargs["mask_fill_value"] = 0
+    elif "fill_mask" in params:
+        kwargs["fill_mask"] = 0
+    return A.CoarseDropout(**kwargs)
+
+
+def maybe_focus_crop(
+    image_rgb: np.ndarray,
+    boxes: List[List[float]],
+    labels: List[int],
+    focus_prob: float,
+) -> Tuple[np.ndarray, List[List[float]], List[int]]:
+    if focus_prob <= 0.0 or random.random() >= float(focus_prob) or len(boxes) == 0 or len(labels) == 0:
+        return image_rgb, boxes, labels
+
+    height, width = image_rgb.shape[:2]
+    if height <= 2 or width <= 2:
+        return image_rgb, boxes, labels
+
+    img_area = float(max(width * height, 1))
+    sampler_boost = np.asarray(CLASS_SAMPLER_WEIGHTS, dtype=np.float64)
+    focus_weights: List[float] = []
+
+    for box, label in zip(boxes, labels):
+        x1, y1, x2, y2 = [float(v) for v in box]
+        bw = max(1.0, x2 - x1)
+        bh = max(1.0, y2 - y1)
+        area_ratio = (bw * bh) / img_area
+        smallness = np.clip(
+            (float(DETAIL_FOCUS_AREA_RATIO) - area_ratio) / max(float(DETAIL_FOCUS_AREA_RATIO), 1e-6),
+            0.0,
+            1.0,
+        )
+        class_bonus = float(sampler_boost[label]) if 0 <= int(label) < len(sampler_boost) else 1.0
+        focus_weights.append(max(1e-3, class_bonus * (1.0 + 1.8 * float(smallness))))
+
+    weights_np = np.asarray(focus_weights, dtype=np.float64)
+    weights_np = weights_np / max(weights_np.sum(), 1e-12)
+    focus_idx = int(np.random.choice(len(boxes), p=weights_np))
+    fx1, fy1, fx2, fy2 = [float(v) for v in boxes[focus_idx]]
+    bw = max(1.0, fx2 - fx1)
+    bh = max(1.0, fy2 - fy1)
+    cx = 0.5 * (fx1 + fx2)
+    cy = 0.5 * (fy1 + fy2)
+
+    context_min, context_max = DETAIL_FOCUS_CONTEXT_RANGE
+    context_scale = random.uniform(float(context_min), float(context_max))
+    crop_w = min(float(width), max(bw * context_scale, bw + 24.0))
+    crop_h = min(float(height), max(bh * context_scale, bh + 24.0))
+    cx += random.uniform(-float(DETAIL_FOCUS_JITTER), float(DETAIL_FOCUS_JITTER)) * bw
+    cy += random.uniform(-float(DETAIL_FOCUS_JITTER), float(DETAIL_FOCUS_JITTER)) * bh
+
+    crop_x1 = int(round(cx - crop_w * 0.5))
+    crop_y1 = int(round(cy - crop_h * 0.5))
+    crop_x1 = max(0, min(crop_x1, width - int(round(crop_w))))
+    crop_y1 = max(0, min(crop_y1, height - int(round(crop_h))))
+    crop_x2 = min(width, crop_x1 + max(2, int(round(crop_w))))
+    crop_y2 = min(height, crop_y1 + max(2, int(round(crop_h))))
+
+    if crop_x2 - crop_x1 < 2 or crop_y2 - crop_y1 < 2:
+        return image_rgb, boxes, labels
+
+    cropped = image_rgb[crop_y1:crop_y2, crop_x1:crop_x2]
+    kept_boxes: List[List[float]] = []
+    kept_labels: List[int] = []
+
+    for idx, (box, label) in enumerate(zip(boxes, labels)):
+        x1, y1, x2, y2 = [float(v) for v in box]
+        ix1 = max(x1, float(crop_x1))
+        iy1 = max(y1, float(crop_y1))
+        ix2 = min(x2, float(crop_x2))
+        iy2 = min(y2, float(crop_y2))
+        if ix2 <= ix1 or iy2 <= iy1:
+            continue
+
+        visible = (ix2 - ix1) * (iy2 - iy1)
+        area = max((x2 - x1) * (y2 - y1), 1e-6)
+        visible_ratio = visible / area
+        if idx != focus_idx and visible_ratio < float(DETAIL_FOCUS_MIN_VISIBLE):
+            continue
+
+        kept_boxes.append([ix1 - crop_x1, iy1 - crop_y1, ix2 - crop_x1, iy2 - crop_y1])
+        kept_labels.append(int(label))
+
+    if len(kept_boxes) == 0:
+        return image_rgb, boxes, labels
+    return cropped, kept_boxes, kept_labels
+
+
 def get_train_transforms(img_size: int) -> A.Compose:
     affine_params = inspect.signature(A.Affine.__init__).parameters
     affine_kwargs = dict(
@@ -302,9 +437,10 @@ def get_train_transforms(img_size: int) -> A.Compose:
         downscale_aug = A.Downscale(scale_min=0.72, scale_max=0.90, p=1.0)
 
     try:
-        crop_aug = A.RandomSizedBBoxSafeCrop(height=img_size, width=img_size, erosion_rate=0.0, p=0.24)
+        crop_aug = A.RandomSizedBBoxSafeCrop(height=img_size, width=img_size, erosion_rate=0.0, p=0.16)
     except TypeError:
         crop_aug = A.NoOp(p=1.0)
+    coarse_dropout = make_partial_occlusion(img_size)
 
     return A.Compose(
         [
@@ -314,6 +450,7 @@ def get_train_transforms(img_size: int) -> A.Compose:
             A.HorizontalFlip(p=0.5),
             A.VerticalFlip(p=0.05),
             A.RandomRotate90(p=0.12),
+            coarse_dropout,
             A.CLAHE(clip_limit=2.2, tile_grid_size=(8, 8), p=0.2),
             A.OneOf(
                 [
@@ -359,9 +496,10 @@ def get_val_transforms(img_size: int) -> A.Compose:
 
 
 class DetectionDataset(Dataset):
-    def __init__(self, samples: List[Sample], transforms: A.Compose):
+    def __init__(self, samples: List[Sample], transforms: A.Compose, detail_focus_prob: float = 0.0):
         self.samples = samples
         self.transforms = transforms
+        self.detail_focus_prob = float(detail_focus_prob)
 
     def __len__(self) -> int:
         return len(self.samples)
@@ -376,6 +514,12 @@ class DetectionDataset(Dataset):
 
         bboxes = [list(b) for b in sample.boxes]
         class_labels = list(sample.labels)
+        image, bboxes, class_labels = maybe_focus_crop(
+            image_rgb=image,
+            boxes=bboxes,
+            labels=class_labels,
+            focus_prob=self.detail_focus_prob,
+        )
 
         transformed = self.transforms(image=image, bboxes=bboxes, class_labels=class_labels)
         img_t = transformed["image"].float()
@@ -478,6 +622,130 @@ def train_one_epoch(
     return {k: v / steps for k, v in running.items()}
 
 
+def box_iou(a: List[float], b: List[float]) -> float:
+    ax1, ay1, ax2, ay2 = [float(v) for v in a]
+    bx1, by1, bx2, by2 = [float(v) for v in b]
+    xx1 = max(ax1, bx1)
+    yy1 = max(ay1, by1)
+    xx2 = min(ax2, bx2)
+    yy2 = min(ay2, by2)
+    inter_w = max(0.0, xx2 - xx1)
+    inter_h = max(0.0, yy2 - yy1)
+    inter = inter_w * inter_h
+    area_a = max(0.0, ax2 - ax1) * max(0.0, ay2 - ay1)
+    area_b = max(0.0, bx2 - bx1) * max(0.0, by2 - by1)
+    return inter / max(area_a + area_b - inter, 1e-9)
+
+
+def evaluate_image_predictions(
+    gt_boxes: List[dict],
+    pred_boxes: List[dict],
+    class_names: List[str],
+    iou_thresh: float = 0.5,
+    img_area: float = 1.0,
+) -> Dict[str, object]:
+    per_class = {
+        cls_name: {"gt": 0, "tp": 0, "fp": 0, "fn": 0}
+        for cls_name in class_names
+    }
+    gt_small_flags: List[bool] = []
+    key_classes = {"car", "dog", "cat"}
+
+    for gt in gt_boxes:
+        cls_name = str(gt.get("class", ""))
+        if cls_name in per_class:
+            per_class[cls_name]["gt"] += 1
+        x1, y1, x2, y2 = [float(v) for v in gt.get("bbox", [0, 0, 0, 0])]
+        area_ratio = (max(0.0, x2 - x1) * max(0.0, y2 - y1)) / max(float(img_area), 1e-9)
+        gt_small_flags.append(area_ratio <= float(SMALL_OBJECT_AREA_RATIO))
+
+    matched_gt = [False] * len(gt_boxes)
+    matched_pred = [False] * len(pred_boxes)
+    matched_ious = [0.0] * len(gt_boxes)
+
+    for cls_name in class_names:
+        gt_indices = [idx for idx, gt in enumerate(gt_boxes) if str(gt.get("class", "")) == cls_name]
+        pred_indices = [
+            idx
+            for idx, pred in enumerate(pred_boxes)
+            if str(pred.get("class", "")) == cls_name
+        ]
+        pred_indices.sort(key=lambda idx: float(pred_boxes[idx].get("confidence", 0.0)), reverse=True)
+
+        for pred_idx in pred_indices:
+            pred_bbox = pred_boxes[pred_idx].get("bbox", [0, 0, 0, 0])
+            best_iou = 0.0
+            best_gt_idx = -1
+            for gt_idx in gt_indices:
+                if matched_gt[gt_idx]:
+                    continue
+                iou = box_iou(pred_bbox, gt_boxes[gt_idx].get("bbox", [0, 0, 0, 0]))
+                if iou > best_iou:
+                    best_iou = iou
+                    best_gt_idx = gt_idx
+
+            if best_gt_idx >= 0 and best_iou >= float(iou_thresh):
+                matched_gt[best_gt_idx] = True
+                matched_pred[pred_idx] = True
+                matched_ious[best_gt_idx] = best_iou
+                per_class[cls_name]["tp"] += 1
+            else:
+                per_class[cls_name]["fp"] += 1
+
+        per_class[cls_name]["fn"] += sum(1 for gt_idx in gt_indices if not matched_gt[gt_idx])
+
+    matched_count = sum(1 for flag in matched_gt if flag)
+    matched_iou_sum = float(sum(iou for iou in matched_ious if iou > 0.0))
+    small_gt_count = sum(1 for flag in gt_small_flags if flag)
+    small_tp_count = sum(1 for gt_idx, flag in enumerate(gt_small_flags) if flag and matched_gt[gt_idx])
+    key_iou_sum = float(
+        sum(
+            matched_ious[idx]
+            for idx, gt in enumerate(gt_boxes)
+            if matched_gt[idx] and str(gt.get("class", "")) in key_classes
+        )
+    )
+    key_iou_count = sum(
+        1
+        for idx, gt in enumerate(gt_boxes)
+        if matched_gt[idx] and str(gt.get("class", "")) in key_classes
+    )
+
+    dog_cat_gt_count = sum(1 for gt in gt_boxes if str(gt.get("class", "")) in {"dog", "cat"})
+    dog_cat_confusions = 0
+    for pred_idx, pred in enumerate(pred_boxes):
+        if matched_pred[pred_idx]:
+            continue
+        pred_cls = str(pred.get("class", ""))
+        if pred_cls not in {"dog", "cat"}:
+            continue
+        opposite = "cat" if pred_cls == "dog" else "dog"
+        for gt in gt_boxes:
+            if str(gt.get("class", "")) != opposite:
+                continue
+            if box_iou(pred.get("bbox", [0, 0, 0, 0]), gt.get("bbox", [0, 0, 0, 0])) >= 0.30:
+                dog_cat_confusions += 1
+                break
+
+    total_tp = sum(stats["tp"] for stats in per_class.values())
+    total_fp = sum(stats["fp"] for stats in per_class.values())
+    total_fn = sum(stats["fn"] for stats in per_class.values())
+    return {
+        "tp": total_tp,
+        "fp": total_fp,
+        "fn": total_fn,
+        "matched_count": matched_count,
+        "matched_iou_sum": matched_iou_sum,
+        "small_gt_count": small_gt_count,
+        "small_tp_count": small_tp_count,
+        "key_iou_sum": key_iou_sum,
+        "key_iou_count": key_iou_count,
+        "dog_cat_gt_count": dog_cat_gt_count,
+        "dog_cat_confusions": dog_cat_confusions,
+        "per_class": per_class,
+    }
+
+
 @torch.no_grad()
 def validate_one_epoch(
     model: nn.Module,
@@ -485,12 +753,36 @@ def validate_one_epoch(
     loader: DataLoader,
     device: torch.device,
     amp_enabled: bool,
+    class_names: Optional[List[str]] = None,
+    img_size: int = IMG_SIZE,
+    conf_thresh: float = CONF_THRESH,
+    nms_thresh: float = NMS_IOU_THRESH,
+    center_combine: str = INFER_CENTER_COMBINE,
 ) -> Dict[str, float]:
     model.eval()
     running = {"loss": 0.0, "loss_cls": 0.0, "loss_reg": 0.0, "loss_ctr": 0.0}
     steps = 0
+    metric_classes = list(class_names) if class_names is not None else []
+    per_class_totals = {
+        cls_name: {"gt": 0, "tp": 0, "fp": 0, "fn": 0}
+        for cls_name in metric_classes
+    }
+    totals = {
+        "tp": 0,
+        "fp": 0,
+        "fn": 0,
+        "matched_count": 0,
+        "matched_iou_sum": 0.0,
+        "small_gt_count": 0,
+        "small_tp_count": 0,
+        "key_iou_sum": 0.0,
+        "key_iou_count": 0,
+        "dog_cat_gt_count": 0,
+        "dog_cat_confusions": 0,
+    }
 
     for images, targets in loader:
+        image_ids = [t["image_id"] for t in targets]
         images = images.to(device, non_blocking=True).to(memory_format=torch.channels_last)
         targets = move_targets_to_device(targets, device)
 
@@ -505,15 +797,111 @@ def validate_one_epoch(
         running["loss_ctr"] += float(loss_dict["loss_ctr"].item())
         steps += 1
 
+        if metric_classes:
+            batch_predictions = postprocess_batch(
+                outputs=outputs,
+                image_ids=image_ids,
+                metas=None,
+                class_names=metric_classes,
+                num_classes=len(metric_classes),
+                img_size=int(img_size),
+                conf_thresh=float(conf_thresh),
+                nms_thresh=float(nms_thresh),
+                reg_decode="auto",
+                center_combine=str(center_combine),
+            )
+            for pred, target in zip(batch_predictions, targets):
+                gt_entries = []
+                gt_boxes_np = target["boxes"].detach().cpu().numpy()
+                gt_labels_np = target["labels"].detach().cpu().numpy()
+                for box, label in zip(gt_boxes_np.tolist(), gt_labels_np.tolist()):
+                    cls_idx = int(label)
+                    if 0 <= cls_idx < len(metric_classes):
+                        gt_entries.append({"class": metric_classes[cls_idx], "bbox": [float(v) for v in box]})
+
+                image_metrics = evaluate_image_predictions(
+                    gt_boxes=gt_entries,
+                    pred_boxes=list(pred.get("boxes", [])),
+                    class_names=metric_classes,
+                    iou_thresh=0.5,
+                    img_area=float(max(int(img_size) * int(img_size), 1)),
+                )
+                for key in totals:
+                    totals[key] += image_metrics[key]
+                per_class_metrics = image_metrics["per_class"]
+                for cls_name, stats in per_class_metrics.items():
+                    for stat_name, value in stats.items():
+                        per_class_totals[cls_name][stat_name] += int(value)
+
     if steps == 0:
         return {k: float("inf") for k in running}
-    return {k: v / steps for k, v in running.items()}
+
+    metrics = {k: v / steps for k, v in running.items()}
+    if not metric_classes:
+        return metrics
+
+    total_tp = int(totals["tp"])
+    total_fp = int(totals["fp"])
+    total_fn = int(totals["fn"])
+    micro_precision = total_tp / max(total_tp + total_fp, 1)
+    micro_recall = total_tp / max(total_tp + total_fn, 1)
+
+    per_class_recalls: List[float] = []
+    key_recalls: List[float] = []
+    for cls_name in metric_classes:
+        gt_count = per_class_totals[cls_name]["gt"]
+        recall = per_class_totals[cls_name]["tp"] / max(gt_count, 1) if gt_count > 0 else 0.0
+        metrics[f"recall_{cls_name}"] = float(recall)
+        if gt_count > 0:
+            per_class_recalls.append(recall)
+        if cls_name in {"car", "dog", "cat"} and gt_count > 0:
+            key_recalls.append(recall)
+
+    macro_recall = float(np.mean(per_class_recalls)) if per_class_recalls else float(micro_recall)
+    key_recall = float(np.mean(key_recalls)) if key_recalls else float(micro_recall)
+    small_gt_count = int(totals["small_gt_count"])
+    small_object_recall = (
+        float(totals["small_tp_count"]) / small_gt_count
+        if small_gt_count > 0
+        else float(micro_recall)
+    )
+    mean_matched_iou = float(totals["matched_iou_sum"]) / max(int(totals["matched_count"]), 1)
+    key_mean_iou = (
+        float(totals["key_iou_sum"]) / max(int(totals["key_iou_count"]), 1)
+        if int(totals["key_iou_count"]) > 0
+        else float(mean_matched_iou)
+    )
+    dog_cat_confusion_rate = float(totals["dog_cat_confusions"]) / max(int(totals["dog_cat_gt_count"]), 1)
+    selection_score = (
+        0.35 * key_recall
+        + 0.20 * small_object_recall
+        + 0.20 * key_mean_iou
+        + 0.15 * micro_recall
+        + 0.10 * micro_precision
+        - 0.20 * dog_cat_confusion_rate
+    )
+
+    metrics.update(
+        {
+            "micro_precision": float(micro_precision),
+            "micro_recall": float(micro_recall),
+            "macro_recall": float(macro_recall),
+            "key_recall": float(key_recall),
+            "small_object_recall": float(small_object_recall),
+            "mean_matched_iou": float(mean_matched_iou),
+            "key_mean_iou": float(key_mean_iou),
+            "dog_cat_confusion_rate": float(dog_cat_confusion_rate),
+            "selection_score": float(selection_score),
+        }
+    )
+    return metrics
 
 
 def build_optimizer(model: AnchorFreeDetector, lr_backbone: float, lr_head: float, weight_decay: float) -> torch.optim.Optimizer:
     backbone_params = list(model.backbone_fpn.parameters())
     head_params = (
-        list(model.head_s8.parameters())
+        list(model.head_s4.parameters())
+        + list(model.head_s8.parameters())
         + list(model.head_s16.parameters())
         + list(model.head_s32.parameters())
     )
@@ -536,6 +924,9 @@ def save_checkpoint(
     best_val_loss: float,
     classes: List[str],
     img_size: int,
+    best_metric_score: Optional[float] = None,
+    selection_metric: str = "val_loss",
+    extra_metrics: Optional[Dict[str, float]] = None,
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(
@@ -548,20 +939,23 @@ def save_checkpoint(
             "classes": classes,
             "img_size": img_size,
             "strides": STRIDES,
+            "best_metric_score": best_metric_score,
+            "selection_metric": selection_metric,
+            "metrics": extra_metrics or {},
         },
         str(path),
     )
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Train anchor-free detector (ResNet34 + 3-level FPN).")
+    parser = argparse.ArgumentParser(description="Train anchor-free detector (ResNet34 + 4-level FPN).")
     parser.add_argument("--train_data", type=Path, required=True)
     parser.add_argument("--val_data", type=Path, required=True)
     parser.add_argument("--image_dir", type=Path, required=True)
     parser.add_argument("--val_image_dir", type=Path, required=True)
     parser.add_argument("--checkpoint_dir", type=Path, default=Path("./models"))
     parser.add_argument("--img_size", type=int, default=IMG_SIZE)
-    parser.add_argument("--batch_size", type=int, default=16)
+    parser.add_argument("--batch_size", type=int, default=8)
     parser.add_argument("--epochs", type=int, default=30)
     parser.add_argument("--lr_backbone", type=float, default=2e-4)
     parser.add_argument("--lr_head", type=float, default=2e-3)
@@ -571,6 +965,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--resume", type=Path, default=None)
     parser.add_argument("--label_smoothing", type=float, default=LABEL_SMOOTHING)
     parser.add_argument("--center_radius", type=float, default=CENTER_RADIUS)
+    parser.add_argument("--detail_focus_prob", type=float, default=DETAIL_FOCUS_PROB)
+    parser.add_argument("--metric_conf_thresh", type=float, default=CONF_THRESH)
+    parser.add_argument("--metric_nms_thresh", type=float, default=NMS_IOU_THRESH)
+    parser.add_argument(
+        "--metric_center_combine",
+        type=str,
+        default=str(INFER_CENTER_COMBINE),
+        choices=["cls", "soft", "sqrt", "mul"],
+    )
     parser.add_argument("--no_scale_ranges", action="store_true")
     parser.add_argument("--no_balanced_sampling", action="store_true")
     parser.add_argument("--no_class_weights", action="store_true")
@@ -595,8 +998,16 @@ def main() -> None:
     val_samples, _ = parse_samples(args.val_data, args.val_image_dir, class_names=classes)
     num_classes = len(classes)
 
-    train_ds = DetectionDataset(train_samples, transforms=get_train_transforms(args.img_size))
-    val_ds = DetectionDataset(val_samples, transforms=get_val_transforms(args.img_size))
+    train_ds = DetectionDataset(
+        train_samples,
+        transforms=get_train_transforms(args.img_size),
+        detail_focus_prob=float(args.detail_focus_prob),
+    )
+    val_ds = DetectionDataset(
+        val_samples,
+        transforms=get_val_transforms(args.img_size),
+        detail_focus_prob=0.0,
+    )
 
     class_weights = None if args.no_class_weights else compute_class_weights(
         num_classes=num_classes,
@@ -643,6 +1054,7 @@ def main() -> None:
 
     start_epoch = 1
     best_val_loss = float("inf")
+    best_metric_score = float("-inf")
     if args.resume is not None and args.resume.exists():
         ckpt = torch.load(str(args.resume), map_location=device)
         try:
@@ -653,20 +1065,29 @@ def main() -> None:
             print(f"Missing keys: {missing}")
             print(f"Unexpected keys: {unexpected}")
         if "optimizer_state_dict" in ckpt:
-            optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+            try:
+                optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+            except ValueError as exc:
+                print(f"Skipped optimizer state from resume checkpoint: {exc}")
         if "scheduler_state_dict" in ckpt:
-            scheduler.load_state_dict(ckpt["scheduler_state_dict"])
+            try:
+                scheduler.load_state_dict(ckpt["scheduler_state_dict"])
+            except ValueError as exc:
+                print(f"Skipped scheduler state from resume checkpoint: {exc}")
         start_epoch = int(ckpt.get("epoch", 0)) + 1
         best_val_loss = float(ckpt.get("best_val_loss", float("inf")))
+        best_metric_score = float(ckpt.get("best_metric_score", float("-inf")))
 
     args.checkpoint_dir.mkdir(parents=True, exist_ok=True)
     best_path = args.checkpoint_dir / "best.pth"
+    best_loss_path = args.checkpoint_dir / "best_loss.pth"
     last_path = args.checkpoint_dir / "last.pth"
 
     print(f"Device: {device}, AMP: {amp_enabled}")
     print(f"Train samples: {len(train_ds)}, Val samples: {len(val_ds)}, Classes: {classes}")
     print(f"Balanced sampling: {not args.no_balanced_sampling}")
     print(f"Class weights enabled: {not args.no_class_weights}")
+    print(f"Detail focus crop probability: {float(args.detail_focus_prob):.2f}")
     print(f"Num workers: requested={args.num_workers}, resolved={resolved_workers}, max_safe={max_safe_workers}")
     print(f"Pin memory: {pin_memory}")
     if class_weights is not None:
@@ -688,6 +1109,11 @@ def main() -> None:
             loader=val_loader,
             device=device,
             amp_enabled=amp_enabled,
+            class_names=classes,
+            img_size=args.img_size,
+            conf_thresh=float(args.metric_conf_thresh),
+            nms_thresh=float(args.metric_nms_thresh),
+            center_combine=str(args.metric_center_combine),
         )
         scheduler.step()
 
@@ -695,8 +1121,50 @@ def main() -> None:
             f"Epoch {epoch:03d}/{args.epochs:03d} | "
             f"train_loss={train_metrics['loss']:.4f} "
             f"(cls={train_metrics['loss_cls']:.4f}, reg={train_metrics['loss_reg']:.4f}, ctr={train_metrics['loss_ctr']:.4f}) | "
-            f"val_loss={val_metrics['loss']:.4f}"
+            f"val_loss={val_metrics['loss']:.4f} | "
+            f"score={val_metrics.get('selection_score', 0.0):.4f} | "
+            f"recall={val_metrics.get('micro_recall', 0.0):.4f} | "
+            f"key_recall={val_metrics.get('key_recall', 0.0):.4f} | "
+            f"small_recall={val_metrics.get('small_object_recall', 0.0):.4f} | "
+            f"dog_cat_conf={val_metrics.get('dog_cat_confusion_rate', 0.0):.4f}"
         )
+
+        if val_metrics["loss"] < best_val_loss:
+            best_val_loss = val_metrics["loss"]
+            save_checkpoint(
+                path=best_loss_path,
+                model=model,
+                optimizer=optimizer,
+                scheduler=scheduler,
+                epoch=epoch,
+                best_val_loss=best_val_loss,
+                classes=classes,
+                img_size=args.img_size,
+                best_metric_score=best_metric_score,
+                selection_metric="val_loss",
+                extra_metrics=val_metrics,
+            )
+            print(f"Saved best loss checkpoint: {best_loss_path} (val_loss={best_val_loss:.4f})")
+
+        if float(val_metrics.get("selection_score", float("-inf"))) > best_metric_score:
+            best_metric_score = float(val_metrics["selection_score"])
+            save_checkpoint(
+                path=best_path,
+                model=model,
+                optimizer=optimizer,
+                scheduler=scheduler,
+                epoch=epoch,
+                best_val_loss=best_val_loss,
+                classes=classes,
+                img_size=args.img_size,
+                best_metric_score=best_metric_score,
+                selection_metric="selection_score",
+                extra_metrics=val_metrics,
+            )
+            print(
+                f"Saved best detection checkpoint: {best_path} "
+                f"(score={best_metric_score:.4f}, key_recall={val_metrics.get('key_recall', 0.0):.4f})"
+            )
 
         save_checkpoint(
             path=last_path,
@@ -707,21 +1175,10 @@ def main() -> None:
             best_val_loss=best_val_loss,
             classes=classes,
             img_size=args.img_size,
+            best_metric_score=best_metric_score,
+            selection_metric="last",
+            extra_metrics=val_metrics,
         )
-
-        if val_metrics["loss"] < best_val_loss:
-            best_val_loss = val_metrics["loss"]
-            save_checkpoint(
-                path=best_path,
-                model=model,
-                optimizer=optimizer,
-                scheduler=scheduler,
-                epoch=epoch,
-                best_val_loss=best_val_loss,
-                classes=classes,
-                img_size=args.img_size,
-            )
-            print(f"Saved best checkpoint: {best_path} (val_loss={best_val_loss:.4f})")
 
     if not best_path.exists():
         save_checkpoint(
@@ -733,9 +1190,25 @@ def main() -> None:
             best_val_loss=best_val_loss,
             classes=classes,
             img_size=args.img_size,
+            best_metric_score=best_metric_score,
+            selection_metric="selection_score",
+        )
+    if not best_loss_path.exists():
+        save_checkpoint(
+            path=best_loss_path,
+            model=model,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            epoch=args.epochs,
+            best_val_loss=best_val_loss,
+            classes=classes,
+            img_size=args.img_size,
+            best_metric_score=best_metric_score,
+            selection_metric="val_loss",
         )
 
-    print(f"Training done. Best model: {best_path}")
+    print(f"Training done. Best detection model: {best_path}")
+    print(f"Best loss model: {best_loss_path}")
 
 
 if __name__ == "__main__":

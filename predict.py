@@ -16,6 +16,7 @@ from utils.config import (
     CLASS_CONF_THRESH,
     CLASS_NAMES,
     CONF_THRESH,
+    CONTAINED_BOX_REPLACE_MARGIN,
     LOW_LIGHT_CLAHE_CLIP,
     LOW_LIGHT_GAMMA,
     LOW_LIGHT_MEAN_THRESH,
@@ -27,6 +28,7 @@ from utils.config import (
     MEAN,
     NMS_IOU_THRESH,
     NUM_CLASSES,
+    STRIDES,
     STD,
 )
 from utils.model import AnchorFreeDetector
@@ -178,7 +180,7 @@ def _suppress_same_class_contained_int(boxes: List[dict]) -> List[dict]:
             if not (cand_inside_kept or kept_inside_cand):
                 continue
 
-            if kept_inside_cand and area > kept_area and score + 0.03 >= kept_score:
+            if kept_inside_cand and area > kept_area and score + float(CONTAINED_BOX_REPLACE_MARGIN) >= kept_score:
                 replace_idx = k_idx
                 break
 
@@ -350,6 +352,33 @@ def box_iou(a: Sequence[float], b: Sequence[float]) -> float:
     area_a = max(0.0, ax2 - ax1) * max(0.0, ay2 - ay1)
     area_b = max(0.0, bx2 - bx1) * max(0.0, by2 - by1)
     return inter / (area_a + area_b - inter + 1e-9)
+
+
+def _box_area_ratio(bbox: Sequence[float], width: int, height: int) -> float:
+    if not isinstance(bbox, (list, tuple)) or len(bbox) != 4:
+        return 0.0
+    x1, y1, x2, y2 = [float(v) for v in bbox]
+    area = max(0.0, x2 - x1) * max(0.0, y2 - y1)
+    return area / max(float(width * height), 1e-9)
+
+
+def _needs_tta_refine(boxes: Sequence[dict], width: int, height: int) -> bool:
+    if len(boxes) == 0:
+        return True
+    if len(boxes) > 2:
+        return False
+
+    for box in boxes:
+        cls_name = str(box.get("class", ""))
+        conf = float(box.get("confidence", 0.0))
+        area_ratio = _box_area_ratio(box.get("bbox", [0, 0, 0, 0]), width=width, height=height)
+        if conf <= 0.42:
+            return True
+        if cls_name in {"dog", "cat"} and (area_ratio <= 0.08 or conf <= 0.50):
+            return True
+        if cls_name == "car" and area_ratio <= 0.12 and conf <= 0.72:
+            return True
+    return False
 
 
 def _inverse_hflip_boxes(boxes: Sequence[dict], width: int) -> List[dict]:
@@ -839,11 +868,13 @@ def run_inference(
 
         if enable_tta_fallback:
             for item in batch_results:
-                if len(item.get("boxes", [])) > 0:
-                    continue
                 image_id = str(item.get("image_id", ""))
                 image_bgr = originals.get(image_id)
                 if image_bgr is None:
+                    continue
+                existing_boxes = list(item.get("boxes", []))
+                height, width = image_bgr.shape[:2]
+                if not _needs_tta_refine(existing_boxes, width=width, height=height):
                     continue
                 tta_boxes = _run_tta_fallback_single(
                     model=model,
@@ -857,8 +888,14 @@ def run_inference(
                     center_combine=center_combine,
                     tta_min_votes=tta_min_votes,
                 )
-                if tta_boxes:
-                    item["boxes"] = tta_boxes
+                merged_boxes = _merge_tta_boxes(
+                    list(existing_boxes) + list(tta_boxes),
+                    iou_thresh=0.45,
+                    min_votes=1 if len(existing_boxes) > 0 else max(1, int(tta_min_votes)),
+                )
+                merged_boxes = _suppress_same_class_contained_int(merged_boxes)
+                merged_boxes = sorted(merged_boxes, key=lambda b: float(b.get("confidence", 0.0)), reverse=True)
+                item["boxes"] = merged_boxes[: int(MAX_OBJECTS_PER_IMAGE)]
 
         results.extend(batch_results)
 
@@ -888,6 +925,12 @@ def load_checkpoint_model(checkpoint_path: Path, device: torch.device) -> Tuple[
     classes = ckpt.get("classes", CLASS_NAMES)
     img_size = int(ckpt.get("img_size", IMG_SIZE))
     num_classes = len(classes)
+    ckpt_strides = list(ckpt.get("strides", []))
+    if ckpt_strides and ckpt_strides != list(STRIDES):
+        raise ValueError(
+            f"Checkpoint strides {ckpt_strides} do not match current model strides {list(STRIDES)}. "
+            "Checkpoint nay thuoc kien truc cu; hay train lai voi code moi de tao best.pth tuong thich."
+        )
 
     model = AnchorFreeDetector(num_classes=num_classes, pretrained=False).to(device)
     state = ckpt.get("model_state_dict", ckpt)
@@ -918,7 +961,7 @@ def parse_args() -> argparse.Namespace:
         help="Path to trained model checkpoint (.pth). '--model_path' is kept as a backward-compatible alias.",
     )
     parser.add_argument("--img_size", type=int, default=IMG_SIZE)
-    parser.add_argument("--batch_size", type=int, default=16)
+    parser.add_argument("--batch_size", type=int, default=8)
     parser.add_argument("--conf_thresh", type=float, default=CONF_THRESH)
     parser.add_argument("--nms_thresh", type=float, default=NMS_IOU_THRESH)
     parser.add_argument(
@@ -937,7 +980,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--chair_suppress_iou", type=float, default=CHAIR_SUPPRESS_WITH_PERSON_IOU)
     parser.add_argument("--hardcase_topk", type=int, default=50)
     parser.add_argument("--hardcase_iou", type=float, default=0.5)
-    parser.add_argument("--tta_fallback", action="store_true", help="Enable TTA fallback on images with zero detections.")
+    parser.set_defaults(tta_fallback=True)
+    parser.add_argument("--tta_fallback", dest="tta_fallback", action="store_true", help="Enable TTA fallback/refinement.")
+    parser.add_argument("--no_tta_fallback", dest="tta_fallback", action="store_false", help="Disable TTA fallback/refinement.")
     parser.add_argument("--tta_min_votes", type=int, default=2, help="Minimum TTA consensus votes to keep a fallback box.")
     parser.add_argument("--device", type=str, default="auto", choices=["auto", "cuda", "cpu"])
     return parser.parse_args()
@@ -1027,7 +1072,7 @@ def main() -> None:
     )
     print(f"Predicted images: {len(predictions)}")
     print(f"Saved JSON: {args.output}")
-    print(f"TTA fallback: {bool(args.tta_fallback)} (min_votes={max(1, int(args.tta_min_votes))})")
+    print(f"TTA fallback/refine: {bool(args.tta_fallback)} (min_votes={max(1, int(args.tta_min_votes))})")
     print(f"Hardcase items: {hardcase_count}")
     print(f"Hardcase summary: {summary_path}")
 
