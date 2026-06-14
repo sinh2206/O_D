@@ -8,17 +8,17 @@ Architecture summary (input IMG_SIZE x IMG_SIZE):
   stem(stride 4) -> layer1(C1, stride 4, 64ch) -> layer2(C2, stride 8, 128ch)
   -> layer3(C3, stride 16, 256ch) -> layer4(C4, stride 32, 512ch)
 - Neck: 4-level FPN
-  lateral1: 1x1 conv (64  -> 128)
-  lateral2: 1x1 conv (128 -> 128)
-  lateral3: 1x1 conv (256 -> 128)
-  lateral4: 1x1 conv (512 -> 128)
+  lateral1: 1x1 conv (64  -> FPN_CHANNELS)
+  lateral2: 1x1 conv (128 -> FPN_CHANNELS)
+  lateral3: 1x1 conv (256 -> FPN_CHANNELS)
+  lateral4: 1x1 conv (512 -> FPN_CHANNELS)
   top-down: upsample(P4) + P3, upsample(P3) + P2, upsample(P2) + P1
   smooth: conv3x3 + BN + LeakyReLU(0.1) on all levels
 - Outputs:
-  P1_out: (B, 128, H/4,  W/4),  stride 4
-  P2_out: (B, 128, H/8,  W/8),  stride 8
-  P3_out: (B, 128, H/16, W/16), stride 16
-  P4_out: (B, 128, H/32, W/32), stride 32
+  P1_out: (B, FPN_CHANNELS, H/4,  W/4),  stride 4
+  P2_out: (B, FPN_CHANNELS, H/8,  W/8),  stride 8
+  P3_out: (B, FPN_CHANNELS, H/16, W/16), stride 16
+  P4_out: (B, FPN_CHANNELS, H/32, W/32), stride 32
 """
 
 from typing import Dict, List, Tuple
@@ -28,7 +28,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torchvision import models
 
-from .config import FPN_CHANNELS, NUM_CLASSES, STRIDES
+from .config import FPN_CHANNELS, HEAD_NUM_CONVS, NUM_CLASSES, STRIDES
 
 
 class ConvBNLeaky(nn.Module):
@@ -178,10 +178,10 @@ class AnchorFreeDetector(nn.Module):
         self.legacy_single_output = bool(legacy_single_output)
 
         self.backbone_fpn = ResNet34FPN3L(fpn_channels=feat_channels, pretrained=pretrained)
-        self.head_s4 = AnchorFreeHead(in_ch=feat_channels, num_classes=num_classes, num_convs=2)
-        self.head_s8 = AnchorFreeHead(in_ch=feat_channels, num_classes=num_classes, num_convs=2)
-        self.head_s16 = AnchorFreeHead(in_ch=feat_channels, num_classes=num_classes, num_convs=2)
-        self.head_s32 = AnchorFreeHead(in_ch=feat_channels, num_classes=num_classes, num_convs=2)
+        self.head_s4 = AnchorFreeHead(in_ch=feat_channels, num_classes=num_classes, num_convs=HEAD_NUM_CONVS)
+        self.head_s8 = AnchorFreeHead(in_ch=feat_channels, num_classes=num_classes, num_convs=HEAD_NUM_CONVS)
+        self.head_s16 = AnchorFreeHead(in_ch=feat_channels, num_classes=num_classes, num_convs=HEAD_NUM_CONVS)
+        self.head_s32 = AnchorFreeHead(in_ch=feat_channels, num_classes=num_classes, num_convs=HEAD_NUM_CONVS)
 
     def extract_features(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         return self.backbone_fpn(x)

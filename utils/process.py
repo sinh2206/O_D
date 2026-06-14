@@ -315,7 +315,7 @@ def build_train_transform(img_size: int) -> A.Compose:
             shear=(-1.0, 1.0),
             border_mode=cv2.BORDER_CONSTANT,
             fill=114,
-            p=0.25,
+            p=0.15,
         )
     except TypeError:
         affine = A.Affine(
@@ -325,11 +325,11 @@ def build_train_transform(img_size: int) -> A.Compose:
             shear=(-1.0, 1.0),
             mode=cv2.BORDER_CONSTANT,
             cval=114,
-            p=0.25,
+            p=0.15,
         )
 
     try:
-        crop_aug = A.RandomSizedBBoxSafeCrop(height=img_size, width=img_size, erosion_rate=0.0, p=0.16)
+        crop_aug = A.RandomSizedBBoxSafeCrop(height=img_size, width=img_size, erosion_rate=0.0, p=0.10)
     except TypeError:
         crop_aug = A.NoOp(p=1.0)
 
@@ -339,8 +339,6 @@ def build_train_transform(img_size: int) -> A.Compose:
             A.LongestMaxSize(max_size=img_size, interpolation=cv2.INTER_LINEAR),
             make_pad_if_needed(img_size),
             A.HorizontalFlip(p=0.5),
-            A.VerticalFlip(p=0.05),
-            A.RandomRotate90(p=0.12),
             make_partial_occlusion(img_size),
             affine,
             A.OneOf(
@@ -349,12 +347,11 @@ def build_train_transform(img_size: int) -> A.Compose:
                     A.MotionBlur(blur_limit=5, p=1.0),
                     A.Downscale(scale_range=(0.72, 0.90), p=1.0) if "scale_range" in inspect.signature(A.Downscale.__init__).parameters else A.Downscale(scale_min=0.72, scale_max=0.90, p=1.0),
                 ],
-                p=0.18,
+                p=0.15,
             ),
-            A.CLAHE(clip_limit=2.2, tile_grid_size=(8, 8), p=0.2),
-            A.Sharpen(alpha=(0.15, 0.35), lightness=(0.85, 1.15), p=0.16),
-            A.RandomGamma(gamma_limit=(88, 122), p=0.25),
-            A.ColorJitter(brightness=0.12, contrast=0.12, saturation=0.1, hue=0.05, p=0.45),
+            A.CLAHE(clip_limit=2.0, tile_grid_size=(8, 8), p=0.08),
+            A.RandomGamma(gamma_limit=(92, 116), p=0.10),
+            A.ColorJitter(brightness=0.10, contrast=0.10, saturation=0.08, hue=0.04, p=0.30),
             A.Normalize(mean=MEAN, std=STD),
             ToTensorV2(),
         ],

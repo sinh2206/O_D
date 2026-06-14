@@ -1,865 +1,129 @@
-Diễn giải dự án theo kiểu một học sinh đang học tập
-==================================================
+Ghi chú cập nhật `train.py` và tối ưu tốc độ
+===========================================
 
-1. Nhìn tổng thể: dự án này giống một học sinh học môn nhận diện đồ vật
------------------------------------------------------------------------
+1. `train.py` học tốt hơn bản trước ở điểm nào
+----------------------------------------------
 
-Nếu nói dự án này như một con người đang học tập, thì có thể hình dung như sau:
+`train.py` mới không còn học theo kiểu "nhìn cả ảnh rồi đoán chung chung".
+Nó được chỉnh để tập trung hơn vào các chi tiết đặc trưng gây lỗi trong hardcase.
 
-- `public/annotations/train.json` là bộ sách bài tập có đáp án để học sinh luyện hàng ngày.
-- `public/annotations/val.json` là một đề kiểm tra thử có đáp án, dùng để xem học sinh đang làm tốt đến đâu.
-- `public/train/images` và `public/val/images` là những tờ hình mà học sinh phải nhìn vào để nhận ra vật thể.
-- `train.py` là quá trình ngồi học, làm bài luyện, sửa tư duy dần dần.
-- `models/best.pth` là cuốn sổ ghi nhớ kiến thức tốt nhất mà học sinh đã học được ở một thời điểm.
-- `predict.py` là lúc học sinh cầm cuốn sổ kiến thức đó đi làm bài kiểm tra mới.
-- `val_predictions.json` là bài làm của học sinh sau khi nộp.
-- `public/tools/evaluate_predictions.py` là giáo viên chấm điểm.
-- `results/` là chỗ lưu lại những bài sai nặng nhất để xem học sinh đã vấp ở đâu.
-- `utils/` là toàn bộ lý thuyết, luật chơi, công thức, mẹo học, và trợ giúp kỹ thuật đứng phía sau.
-- `obj-detec.ipynb` giống như tờ giấy thi hoặc quy trình làm bài thi trên Kaggle: mở đề, cài dụng cụ, học, làm bài, chấm điểm, soi lỗi.
+- Có nhánh `stride 4` nên mô hình nhìn sát hơn vào chi tiết nhỏ như tai mèo, bánh xe, gầm xe, gáy và lưng chó.
+- Có `focus crop` nên ảnh train thường được cắt gần vật thể nhỏ hoặc khó, đặc biệt là `car`, `dog`, `cat`.
+- Có `partial occlusion` nên mô hình được luyện cả khi vật thể bị che một phần, thay vì chỉ học từ ảnh thấy trọn vẹn.
+- Loss hồi quy có thêm thành phần SmoothL1 nhẹ, nên mô hình không chỉ biết "có vật" mà còn học khoanh box sát hơn.
+- Validation không chỉ nhìn `val_loss`, mà còn theo dõi:
+  - recall chung
+  - recall riêng cho `car`, `dog`, `cat`
+  - recall vật nhỏ
+  - IoU trung bình của box đã match
+  - tỷ lệ nhầm `dog` với `cat`
 
+Hiểu như một học sinh:
 
-2. Dữ liệu mà học sinh đang học
--------------------------------
+- Bản cũ: em có thể làm bài tổng thể tạm ổn, nhưng hay trượt ở ca khó.
+- Bản mới: em được luyện đúng những thứ từng làm sai, nên nhạy hơn với chi tiết đặc trưng của `car`, `dog`, `cat`.
 
-Hiện tại mình đọc được:
 
-- Tập train có 7500 ảnh và 10642 annotation.
-- Tập val có 1500 ảnh và 2021 annotation.
-- Các lớp cần học là:
-  - `person`
-  - `car`
-  - `dog`
-  - `cat`
-  - `chair`
+2. Vì sao bản mới nhanh hơn trên Kaggle T4
+------------------------------------------
 
-Nói như con người:
+Mục tiêu của lần tối ưu này là giảm thời gian mỗi epoch mạnh xuống, nhưng vẫn giữ những ý học quan trọng nhất.
 
-- Học sinh này không học tiếng Anh hay toán, mà học cách nhìn ảnh rồi nói:
-  - đây là người,
-  - đây là xe,
-  - đây là chó,
-  - đây là mèo,
-  - đây là ghế.
+Các thay đổi chính:
 
-Nhưng bài toán còn khó hơn gọi tên thông thường, vì em không chỉ phải nói “có con mèo”.
-Em còn phải khoanh đúng vị trí của con mèo bằng một hình chữ nhật `bbox = [x1, y1, x2, y2]`.
+- `IMG_SIZE` giảm xuống `512`.
+  Số pixel ít hơn nên backbone, FPN và head đều chạy nhẹ hơn rõ rệt.
 
-Tức là học sinh phải làm đồng thời 2 việc:
+- `FPN_CHANNELS` giảm từ `128` xuống `96`.
+  Vẫn đủ giữ thông tin, nhưng giảm lượng tính toán trong FPN và head.
 
-- Nhận ra vật đó là lớp gì.
-- Chỉ ra vật đó nằm ở đâu trong ảnh.
+- `HEAD_NUM_CONVS = 1`.
+  Đây là thay đổi rất đáng kể cho tốc độ vì head ở nhánh `stride 4` vốn rất tốn compute.
 
+- `batch_size` mặc định tăng lên `16`.
+  Trên T4 với AMP, cấu hình này thường hiệu quả hơn `batch_size = 8` vì giảm số step mỗi epoch.
 
-3. `train.py` là quá trình học ra sao
--------------------------------------
+- `num_workers = -1`.
+  Code sẽ tự chọn số worker hợp lý cho môi trường Kaggle thay vì khóa cứng ở `2`.
 
-3.1. Bước đầu: học sinh đọc đề, ảnh và đáp án
+- Có `prefetch_factor` và `worker_init_fn`.
+  Điều này giúp worker nạp data sớm hơn và tránh tranh chấp luồng OpenCV quá mức.
 
-`train.py` làm những việc đầu tiên như sau:
+- Mặc định tắt `low-light enhance` trong train/val.
+  Bước này khá nặng trên CPU. Khi cần vẫn có thể bật lại bằng cờ dòng lệnh.
 
-- Đọc file annotation train và val.
-- Ghép từng ảnh với danh sách vật thể đúng trong ảnh đó.
-- Mỗi vật thể có:
-  - tên lớp,
-  - vị trí hộp giới hạn.
+- Pipeline augment được làm gọn.
+  Bản nhanh vẫn giữ các augment có ích nhất:
+  - focus crop
+  - partial occlusion
+  - blur/downscale
+  - color jitter
+  - affine
+  Nhưng đã giảm bớt các phép biến đổi nặng hoặc lợi ích thấp.
 
-Nói như một học sinh:
+- Validation chuyển sang chế độ nhanh hơn.
+  Không còn decode và chấm detection metric trên toàn bộ `val` ở mọi epoch.
+  Thay vào đó:
+  - mỗi epoch chỉ duyệt một phần `val`
+  - metric detection chi tiết chỉ chạy theo chu kỳ `metric_interval`
+  - epoch cuối vẫn chạy metric để chọn checkpoint hợp lý
 
-- Em mở sách bài tập.
-- Mỗi trang là một bức ảnh.
-- Trên ảnh giáo viên đã chỉ sẵn:
-  - “đây là car”
-  - “đây là dog”
-  - “đây là cat”
-  - và khoanh vùng vị trí của chúng.
+- Có hỗ trợ `torch.compile` khi chạy CUDA.
+  Điều này giúp giảm overhead Python ở phần forward của mô hình nếu môi trường hỗ trợ.
 
-Nhờ vậy, em không học mù.
-Em học có thầy chỉ đáp án.
 
+3. Những file `utils` đã được chỉnh để phục vụ mục tiêu này
+-----------------------------------------------------------
 
-3.2. Bước thứ hai: học sinh được luyện với nhiều biến thể của cùng một vật
+- `utils/config.py`
+  Chứa preset nhanh cho T4:
+  - `IMG_SIZE = 512`
+  - `FPN_CHANNELS = 96`
+  - `HEAD_NUM_CONVS = 1`
+  - `TRAIN_BATCH_SIZE = 16`
+  - `TRAIN_NUM_WORKERS = -1`
+  - `MAX_VAL_BATCHES`, `METRIC_EVAL_INTERVAL`, `METRIC_EVAL_BATCHES`
+  - cờ `ENABLE_TORCH_COMPILE`
 
-`train.py` không đưa ảnh gốc y nguyên cho mô hình mãi mãi.
-Nó dùng augmentation để tạo ra nhiều tình huống khác nhau:
+- `utils/model.py`
+  Head gọn hơn do lấy `HEAD_NUM_CONVS` từ config.
+  FPN dùng ít kênh hơn nên nhanh hơn nhưng vẫn giữ nhánh `stride 4`.
 
-- lật ngang,
-- xoay nhẹ,
-- đổi sáng tối,
-- đổi màu chút ít,
-- làm mờ,
-- tăng tương phản,
-- crop gần vật thể,
-- che bớt một phần vật thể.
+- `utils/runtime.py`
+  Có thêm:
+  - nhận diện Kaggle để giới hạn worker hợp lý
+  - `seed_worker()` cho DataLoader
+  - `maybe_compile_model()` để bật `torch.compile` an toàn khi có CUDA
 
-Nói như học sinh:
+- `utils/process.py`
+  Pipeline preview augment đã được chỉnh lại để phản ánh train pipeline nhẹ hơn.
 
-- Thầy không cho em chỉ nhìn một con mèo trong tư thế hoàn hảo.
-- Thầy sẽ cho em nhìn:
-  - mèo hơi tối,
-  - mèo nằm nghiêng,
-  - mèo bị cỏ che,
-  - mèo chỉ lộ mặt và tai,
-  - chó quay lưng,
-  - xe bị lật và chỉ thấy bánh xe cùng gầm xe.
 
-Mục đích là:
+4. Cái giá phải chấp nhận khi đổi sang bản nhanh
+------------------------------------------------
 
-- Để em không học vẹt theo một hình dáng duy nhất.
-- Để em học “đặc trưng bản chất” của vật thể.
+Bản nhanh không phải miễn phí hoàn toàn.
+Nó đánh đổi một phần độ kỹ để đổi lấy tốc độ.
 
-Đây là điểm rất quan trọng với các hardcase bạn nêu:
+- Ảnh nhỏ hơn nên cực tiểu vật thể có thể khó hơn một chút so với bản ảnh lớn hơn.
+- Validation theo lô con và theo chu kỳ sẽ nhanh hơn, nhưng metric mỗi epoch không còn "đủ toàn bộ tập val".
+- Head gọn hơn làm mô hình bớt nặng, nhưng cũng giảm một phần sức biểu diễn so với head dày hơn.
 
-- `car` có thể nhận ra qua 4 bánh xe và cấu trúc khung xe.
-- `cat` có thể nhận ra qua tai nhọn, màu lông, dáng đầu.
-- `dog` có thể bị nhầm nếu mặt không rõ, nên phải học thêm dáng tai, cổ, lưng, dây dắt, tỷ lệ cơ thể.
-- `cat` trong cỏ có thể chỉ lộ một phần cơ thể, nên phải học nhận dạng từ phần thấy được chứ không chờ thấy toàn thân.
+Tuy nhiên, vì các ý quan trọng như `stride 4`, focus crop, partial occlusion, loss hồi quy và metric cho `car/dog/cat` vẫn được giữ lại, nên bản này là kiểu:
 
+- nhanh hơn rất nhiều
+- vẫn học đúng trọng tâm
+- phù hợp hơn với GPU T4 trên Kaggle
 
-3.3. Bước thứ ba: học sinh nhìn ảnh ở nhiều độ chi tiết
 
-Kiến trúc hiện tại của code đã được mở rộng theo hướng học nhiều mức chi tiết.
+5. Cách hiểu ngắn gọn nhất
+--------------------------
 
-Các mức `stride` có thể hiểu là các mức nhìn:
-
-- nhìn rất sát, rất chi tiết,
-- nhìn vừa vừa,
-- nhìn rộng hơn,
-- nhìn rất rộng.
-
-Hiện code mới đang hướng tới `STRIDES = [4, 8, 16, 32]`.
-Điều đó giống như:
-
-- mức 4: em dí sát mắt vào các chi tiết nhỏ,
-- mức 8: em nhìn tương đối gần,
-- mức 16: em nhìn vừa,
-- mức 32: em nhìn toàn cảnh hơn.
-
-Lý do cần nhiều mức nhìn:
-
-- vật nhỏ cần nhìn gần,
-- vật lớn cần nhìn rộng,
-- vật bị che một phần thường cần cả cái nhìn gần và cái nhìn tổng thể.
-
-Ví dụ:
-
-- bánh xe của `car` rất cần mức nhìn chi tiết,
-- tai mèo trong cỏ cũng cần mức nhìn chi tiết,
-- còn toàn bộ dáng của người hay chiếc xe lớn thì mức nhìn rộng cũng có ích.
-
-
-3.4. Bước thứ tư: học sinh bị trừ điểm khi đoán sai
-
-Trong `train.py`, sau khi mô hình đoán, hệ thống loss sẽ chấm sai ở nhiều mặt:
-
-- đoán sai lớp,
-- khoanh sai vị trí,
-- khoanh lệch tâm vật,
-- khoanh quá nhỏ hoặc quá to.
-
-Nói như học sinh:
-
-- Nếu em nhìn con chó mà bảo là mèo, em bị trừ điểm vì sai kiến thức.
-- Nếu em bảo đúng là chó nhưng khoanh sai vị trí, em vẫn bị trừ điểm.
-- Nếu em chỉ khoanh cái đầu, trong khi đáp án là cả con chó, em vẫn bị trừ điểm.
-
-Nghĩa là học sinh không chỉ cần “đoán đúng tên”.
-Em còn phải “khoanh đúng toàn bộ vùng hợp lý”.
-
-
-3.5. Bước thứ năm: học sinh học dần qua nhiều epoch
-
-Mỗi `epoch` là:
-
-- em đi hết một vòng qua gần như toàn bộ bài luyện.
-
-Sau mỗi epoch:
-
-- hệ thống xem em làm bài train thế nào,
-- rồi kiểm tra em trên `val` xem em có tiến bộ thật không.
-
-Nếu một phiên bản kiến thức của em làm bài `val` tốt hơn trước:
-
-- nó được lưu lại thành `best.pth`.
-
-Điều đó giống như:
-
-- sau mỗi đợt ôn thi,
-- thầy giữ lại bản “trình độ tốt nhất” của em để sau này đem đi thi.
-
-
-4. Học sinh này học những đặc điểm chính nào của vật thể
---------------------------------------------------------
-
-Điều cực kỳ quan trọng là:
-
-Mô hình không học theo câu chữ kiểu:
-
-- “mèo là động vật có tai nhọn”
-- “xe có 4 bánh”
-
-Nó học bằng trọng số số học trong mạng thần kinh.
-Nhưng nếu diễn giải ra như con người, thì ta có thể hiểu nó đang cố học các nhóm đặc trưng sau.
-
-
-4.1. Với `car`
-
-Các đặc trưng mà học sinh nên học:
-
-- hình tròn hoặc gần tròn của bánh xe,
-- cặp bánh trước sau tạo cấu trúc hợp lý,
-- khung thân xe,
-- gầm xe,
-- các cạnh kim loại, kính, đèn, mui.
-
-Với hardcase `hardcase_012_img_38aa91aa2b7b.jpg`:
-
-- chiếc xe bị lật,
-- góc nhìn không phải kiểu xe đứng bình thường,
-- em không thể chỉ học “thân xe như ảnh quảng cáo”.
-
-Muốn đúng, học sinh phải linh hoạt hiểu rằng:
-
-- dù chiếc xe lật,
-- dù chỉ thấy rõ bánh, trục, gầm,
-- đó vẫn là `car`.
-
-Nói như học sinh giỏi:
-
-- “Em không chỉ nhận xe khi nó đứng đẹp.
-  Em nhận xe cả khi nó bị lật, vì em nhận ra bộ phận đặc trưng của nó.”
-
-
-4.2. Với `cat`
-
-Các đặc trưng mà học sinh nên học:
-
-- tai nhọn,
-- đầu nhỏ,
-- lông,
-- mắt, mũi, dáng ngồi, tỷ lệ thân,
-- sự mềm mại của tư thế nằm hoặc cuộn người.
-
-Với hardcase `hardcase_014_img_3ebfd325ccc4.jpg`:
-
-- mèo hiện lên khá rõ qua màu lông và tai,
-- nên nếu bỏ sót thì nghĩa là học sinh chưa đủ nhạy với chi tiết đặc trưng.
-
-Mô hình tốt phải hiểu:
-
-- không cần thấy mèo ở tư thế đối diện camera mới nhận ra,
-- chỉ cần tai, lông, đầu, dáng cuộn người cũng đủ là bằng chứng mạnh.
-
-
-4.3. Với `dog`
-
-Các đặc trưng mà học sinh nên học:
-
-- tỷ lệ đầu, cổ, lưng,
-- tai,
-- mõm,
-- tư thế đứng hoặc quay đầu,
-- lông,
-- dây dắt, vòng cổ,
-- khối cơ thể thường khác mèo.
-
-Với hardcase `hardcase_025_img_0d6d2588c38c.jpg`:
-
-- chó có thể bị quay lưng,
-- mặt không rõ,
-- nếu chỉ học bằng khuôn mặt, học sinh sẽ dễ nhầm sang `cat`.
-
-Nói như con người:
-
-- học sinh yếu thường dựa quá nhiều vào mặt.
-- học sinh khá hơn sẽ nói:
-  - “Dù không thấy rõ mặt, em vẫn nhìn ra đây là chó qua tai, gáy, lưng, cổ và dáng cơ thể.”
-
-
-4.4. Với `cat` bị che khuất
-
-Với hardcase `hardcase_033_img_046d0d26cad5.jpg`:
-
-- con mèo bị cỏ che,
-- mô hình cũ có xu hướng chỉ khoanh phần mặt hoặc khoanh quá hẹp,
-- IoU thấp vì đáp án muốn hộp lớn hơn bao trùm phần cơ thể hợp lý.
-
-Điều này cho thấy một học sinh có thể:
-
-- nhận ra “có mèo”,
-- nhưng lại chưa hiểu “toàn bộ con mèo nằm ở đâu”.
-
-Nói dễ hiểu:
-
-- em nhận ra mặt mèo,
-- nhưng khi khoanh, em chỉ khoanh phần dễ thấy nhất,
-- thay vì suy luận hợp lý rằng cơ thể còn kéo xuống dưới và sang bên.
-
-Đó là lý do training cần:
-
-- học từ crop gần vật thể,
-- học từ trường hợp bị che một phần,
-- học cách khoanh full-object box chứ không chỉ khoanh phần rõ nhất.
-
-
-5. `best.pth` chứa được thông tin gì
-------------------------------------
-
-`best.pth` không phải là ảnh, không phải là câu văn, và cũng không phải là “bí kíp viết bằng tiếng người”.
-
-Nó là một gói kiến thức số học.
-
-Khi mình đọc metadata hiện tại của `models/best.pth`, file này đang chứa:
-
-- `epoch = 30`
-- `best_val_loss = 0.8082473823364745`
-- `img_size = 640`
-- `classes = ['person', 'car', 'dog', 'cat', 'chair']`
-- `strides = [8, 16, 32]`
-
-Ngoài ra còn có các phần:
-
-- `model_state_dict`
-- `optimizer_state_dict`
-- `scheduler_state_dict`
-
-
-5.1. `model_state_dict` là gì
-
-Đây là phần quan trọng nhất.
-Nó chứa toàn bộ trọng số của mô hình.
-
-Nói như học sinh:
-
-- đây là toàn bộ kết quả sau khi em đã luyện rất nhiều bài,
-- tức là:
-  - em nhạy thế nào với bánh xe,
-  - em nhạy thế nào với tai mèo,
-  - em nhạy thế nào với thân chó,
-  - em biết kết hợp các dấu hiệu đó ra sao,
-  - em khoanh vật thể rộng hay hẹp tới mức nào.
-
-Nhưng tất cả những cái đó không được viết thành câu chữ.
-Chúng được nén thành những con số trong các lớp CNN.
-
-
-5.2. `optimizer_state_dict` là gì
-
-Phần này giống như trạng thái học tập hiện thời của học sinh:
-
-- tốc độ sửa sai đang nhanh hay chậm,
-- quán tính cập nhật trọng số đang ở mức nào.
-
-Nếu resume train:
-
-- học sinh không phải học lại từ đầu,
-- mà học tiếp từ đúng nhịp học cũ.
-
-
-5.3. `scheduler_state_dict` là gì
-
-Đây giống như kế hoạch học:
-
-- lúc đầu học mạnh,
-- sau đó giảm dần tốc độ điều chỉnh.
-
-Tức là:
-
-- khi mới học, sai đâu sửa mạnh đó,
-- về sau tinh chỉnh nhẹ hơn để ổn định.
-
-
-5.4. Điều cực kỳ đáng chú ý về `best.pth` hiện tại
-
-Checkpoint hiện có đang mang:
-
-- `img_size = 640`
-- `strides = [8, 16, 32]`
-
-Trong khi code hiện tại đã được chỉnh mạnh theo hướng mới hơn.
-
-Nói như học sinh:
-
-- cuốn sổ `best.pth` hiện tại là kiến thức của “phiên bản học sinh cũ”.
-- Em ấy đã học theo cách nhìn 3 mức `8/16/32`, chưa phải bản mới có mức nhìn sát hơn `stride 4`.
+- Bản trước: học rất kỹ trong mỗi buổi, nhưng một buổi kéo quá dài.
+- Bản mới: vẫn học đúng trọng tâm, nhưng giáo án gọn hơn, cách nạp bài thông minh hơn và cách kiểm tra cũng hợp lý hơn.
 
 Vì vậy:
 
-- nếu code hiện tại đã đổi kiến trúc,
-- mà bạn vẫn cố dùng `best.pth` cũ,
-- thì giống như đem trí nhớ của học sinh lớp cũ gắn vào bộ não mới có cấu trúc khác.
-
-Kết quả là dễ không khớp.
-
-Nói thật và rõ:
-
-- `best.pth` hiện tại là trí nhớ tốt nhất của bản mô hình cũ,
-- chưa phải trí nhớ tốt nhất của bản code mới sau khi bạn chỉnh để bắt hardcase tốt hơn.
-
-Tức là:
-
-- muốn kiểm tra đúng “đứa học sinh mới”,
-- bạn phải train lại để sinh ra một `best.pth` mới phù hợp với kiến trúc mới.
-
-
-6. `predict.py` áp dụng kiến thức từ `best.pth` để làm bài ra sao
------------------------------------------------------------------
-
-Khi đã có `best.pth`, `predict.py` sẽ làm giống một học sinh đem kiến thức đi thi.
-
-
-6.1. Mở cuốn sổ kiến thức
-
-Đầu tiên `predict.py`:
-
-- nạp checkpoint,
-- dựng lại mô hình đúng theo số lớp,
-- đổ các trọng số vào mô hình.
-
-Nói như học sinh:
-
-- em mở cuốn sổ ôn thi,
-- nhớ lại mình từng học gì,
-- rồi mang kiến thức đó vào phòng thi.
-
-
-6.2. Nhìn ảnh kiểm tra theo cùng quy tắc đã học
-
-`predict.py` sẽ:
-
-- đọc từng ảnh,
-- resize + letterbox để đưa về kích thước phù hợp,
-- normalize theo đúng chuẩn đã dùng khi train.
-
-Giống như:
-
-- trong phòng thi, mọi đề đều được trình bày theo cùng quy cách,
-- để học sinh không bị rối do format khác nhau.
-
-
-6.3. Mô hình phát hiện ứng viên ở nhiều vị trí
-
-Khi nhìn vào một ảnh, mô hình không nói ngay:
-
-- “đây chắc chắn là mèo”.
-
-Nó sẽ sinh ra rất nhiều ứng viên:
-
-- ở điểm này có thể là `cat`,
-- ở điểm kia có thể là `dog`,
-- ở vùng nọ có thể là `car`,
-- kèm mức tin tưởng và hộp giới hạn.
-
-Nói như học sinh:
-
-- em nhìn quanh ảnh,
-- ghi nháp ra rất nhiều khả năng,
-- chứ chưa kết luận ngay.
-
-
-6.4. Kết hợp kiến thức lớp và độ “đúng tâm”
-
-Trong `predict.py` + `utils/nms.py`, mô hình không chỉ dùng điểm lớp.
-Nó còn dùng tín hiệu centerness.
-
-Hiểu đơn giản:
-
-- một dự đoán đẹp thường không chỉ đúng lớp,
-- mà còn nằm ở vùng trung tâm hợp lý của vật thể.
-
-Giống như học sinh:
-
-- không chỉ nhận ra “có vẻ giống mèo”,
-- mà còn phải cảm thấy:
-  - “vùng em khoanh nằm đúng vào phần cốt lõi của con mèo”.
-
-
-6.5. Loại bớt các đáp án trùng nhau
-
-Sau khi mô hình sinh nhiều hộp, `predict.py` dùng NMS.
-
-NMS giống như:
-
-- nếu em khoanh 5 ô gần như trùng nhau cho cùng một con mèo,
-- giáo viên sẽ bảo:
-  - “không, đây thực chất chỉ là một con mèo thôi”.
-
-Vậy NMS giúp:
-
-- giữ hộp tốt nhất,
-- bỏ các hộp dư thừa.
-
-
-6.6. Nếu bài quá khó, học sinh nhìn lại theo vài góc đơn giản
-
-`predict.py` còn có TTA fallback/refinement.
-Nó giống như:
-
-- em nhìn ảnh gốc,
-- nếu vẫn chưa chắc,
-- em thử tưởng tượng ảnh bị lật ngang,
-- hoặc xoay lại,
-- rồi xem có nhận ra vật thể rõ hơn không.
-
-Điều này hữu ích với các ca:
-
-- vật bị xoay,
-- vật bị lật,
-- chó mèo ở tư thế lạ,
-- xe nằm ngược.
-
-
-6.7. Nộp bài
-
-Cuối cùng `predict.py` xuất ra kết quả kiểu:
-
-- ảnh nào có vật gì,
-- mỗi vật là lớp gì,
-- độ tin tưởng bao nhiêu,
-- hộp ở đâu.
-
-Đó chính là bài làm của học sinh.
-
-
-7. `results/` giống gì trong câu chuyện học tập
------------------------------------------------
-
-`results/` giống như chồng bài kiểm tra đã được giáo viên đánh dấu lỗi đỏ.
-
-Trong đó:
-
-- `hardcase_summary.json` là danh sách các ảnh sai nặng.
-- Các file `hardcase_0xx_...jpg` là ảnh đã được vẽ:
-  - đáp án thật,
-  - dự đoán sai,
-  - điểm lỗi.
-
-Đây chính là nơi “học từ lỗi sai” diễn ra.
-
-
-7.1. Học sinh nên học từ lỗi sai thế nào
-
-Một học sinh tốt không chỉ nhìn điểm số tổng.
-Em phải soi bài sai cụ thể:
-
-- sai vì không nhận ra vật thể,
-- sai vì nhận ra nhưng gọi nhầm lớp,
-- sai vì gọi đúng lớp nhưng khoanh quá nhỏ,
-- sai vì khoanh lệch vị trí,
-- sai vì bỏ sót vật nhỏ.
-
-Tương ứng trong bài toán này:
-
-- miss hoàn toàn `car` bị lật:
-  - nghĩa là chưa học đủ về bộ phận xe trong tư thế bất thường.
-
-- miss `cat` nằm trên cỏ:
-  - nghĩa là chưa đủ nhạy với tai, màu lông, dáng nằm.
-
-- nhầm `dog` thành `cat`:
-  - nghĩa là đang phụ thuộc quá nhiều vào vài đặc trưng giống nhau,
-  - chưa tách rõ đặc trưng phân biệt chó và mèo trong tư thế khó.
-
-- nhận ra `cat` trong cỏ nhưng box quá hẹp:
-  - nghĩa là học sinh mới “thấy khuôn mặt”,
-  - chưa “suy luận toàn thân”.
-
-
-7.2. Cách biến lỗi sai thành bài học mới
-
-Nói như một giáo viên đang kèm học sinh:
-
-- Nếu em bỏ sót xe bị lật:
-  - ta phải cho em luyện thêm ảnh xe ở góc khó, xe lật, xe bị che, xe chỉ lộ bánh.
-
-- Nếu em bỏ sót mèo trong cỏ:
-  - ta phải cho em luyện thêm ảnh bị che khuất một phần,
-  - và tăng khả năng nhìn chi tiết nhỏ.
-
-- Nếu em nhầm chó thành mèo:
-  - ta phải cho em chú ý các dấu hiệu phân biệt:
-    - cổ,
-    - lưng,
-    - tai,
-    - tỷ lệ đầu-thân,
-    - dáng cơ thể,
-    - phụ kiện như dây dắt, vòng cổ.
-
-- Nếu em khoanh mặt mèo thay vì cả con mèo:
-  - ta phải dạy em rằng:
-    - “em thấy mặt mèo là tốt,
-      nhưng box đúng là vùng bao trùm vật thể hợp lý, không chỉ phần rõ nhất.”
-
-Đó chính là logic của việc:
-
-- chỉnh augmentation,
-- chỉnh target assignment,
-- chỉnh loss,
-- chỉnh decode và NMS,
-- rồi train lại.
-
-
-8. `utils/` là cơ sở lý thuyết, luật học và trợ giúp như nào
-------------------------------------------------------------
-
-Có thể coi `utils/` là phần “hậu trường sư phạm”.
-
-
-8.1. `utils/config.py`
-
-Đây là nội quy lớp học và cấu hình chung:
-
-- tên lớp,
-- kích thước ảnh,
-- stride,
-- ngưỡng confidence,
-- trọng số loss,
-- các tham số tiny object,
-- các tham số tăng cường dữ liệu,
-- các ngưỡng hậu xử lý.
-
-Nói như đời thường:
-
-- đây là bảng nội quy và kế hoạch học.
-
-
-8.2. `utils/model.py`
-
-Đây là bộ não và đôi mắt của học sinh.
-
-Phần này quy định:
-
-- em nhìn ảnh qua backbone,
-- em tổng hợp đặc trưng nhiều mức,
-- em có các đầu dự đoán lớp, hộp, centerness.
-
-Nếu `config.py` là nội quy,
-thì `model.py` là cấu trúc não bộ.
-
-
-8.3. `utils/loss.py`
-
-Đây là hệ thống chấm sai trong lúc luyện.
-
-Nó quyết định:
-
-- sai lớp bị phạt thế nào,
-- sai hộp bị phạt thế nào,
-- sai tâm bị phạt thế nào,
-- vật nhỏ được gán điểm học ra sao.
-
-Nói như giáo viên:
-
-- “Em sai kiểu nào thì thầy trừ điểm kiểu đó.”
-
-Không có phần này, học sinh không biết nên sửa cái gì.
-
-
-8.4. `utils/nms.py`
-
-Đây là phần dọn bài làm trước khi nộp:
-
-- gộp các dự đoán trùng nhau,
-- loại bớt hộp dư,
-- remap hộp về ảnh gốc,
-- giữ kết quả hợp lý nhất.
-
-Giống như học sinh:
-
-- xoá bớt các đáp án nháp lặp lại,
-- chỉ giữ kết luận cuối.
-
-
-8.5. `utils/runtime.py`
-
-Đây là trợ giảng kỹ thuật:
-
-- chọn device,
-- chọn số worker,
-- bật/tắt AMP,
-- tối ưu chuyện chạy nhanh hay chậm.
-
-Nó không dạy kiến thức nhận diện trực tiếp,
-nhưng giúp buổi học diễn ra ổn định.
-
-
-8.6. `utils/process.py`
-
-Đây giống như chỗ mô phỏng, minh hoạ, hoặc chuẩn bị dữ liệu xem trước.
-
-Bạn có thể nghĩ nó là:
-
-- khu vực thử bài,
-- xem trước ảnh augment,
-- phân tích cách ảnh bị biến đổi.
-
-
-8.7. `utils/forecast.py`
-
-Đây là một nhánh helper liên quan đến dự đoán / decode.
-
-Hiểu đơn giản:
-
-- nó giống một bộ công cụ phụ để chuyển đặc trưng thành dự đoán hữu hình.
-
-
-8.8. `utils/image_ops.py`
-
-Đây là phần xử lý ảnh phụ trợ.
-
-Ví dụ:
-
-- tăng sáng ảnh tối,
-- chỉnh CLAHE,
-- hỗ trợ nhìn ảnh trong điều kiện khó.
-
-Nói như con người:
-
-- nếu học sinh đang làm bài trong ảnh quá tối,
-- trợ lý sẽ bật thêm đèn cho em nhìn rõ hơn một chút.
-
-
-9. `obj-detec.ipynb` giống một tờ giấy thi như nào
---------------------------------------------------
-
-Notebook hiện tại có 8 cell và làm việc rất tuần tự.
-
-Nó giống một quy trình đi thi hoặc làm bài thực hành:
-
-1. Mở phòng thi, tải đề về
-   - clone repo.
-
-2. Kiểm tra mình đang ở đâu
-   - `pwd`, `ls`.
-
-3. Chuẩn bị dụng cụ
-   - cài `requirements.txt`.
-
-4. Học bài
-   - chạy `train.py`.
-
-5. Làm bài kiểm tra
-   - chạy `predict.py` trên tập val.
-
-6. Nhờ giáo viên chấm điểm
-   - chạy `evaluate_predictions.py`.
-
-7. Soi bài sai
-   - chạy `img_error.py`.
-
-8. Gom bài nộp
-   - zip project.
-
-Vậy nếu ví `obj-detec.ipynb` là một tờ giấy thi, thì chính xác hơn:
-
-- nó là toàn bộ quy trình của một buổi thi thực hành.
-
-Nó không phải “bộ não học”.
-Nó là “nơi tổ chức buổi học và buổi kiểm tra”.
-
-
-10. Bức tranh đầy đủ: đứa học sinh này học tập ra sao
------------------------------------------------------
-
-Nếu kể mạch học tập của dự án này như một câu chuyện con người:
-
-- Ban đầu học sinh được phát rất nhiều ảnh có đáp án.
-- Em nhìn ảnh, nhìn hộp khoanh đúng, học xem vật nào là người, xe, chó, mèo, ghế.
-- Nhưng thầy không cho em học thuộc lòng ảnh đẹp.
-- Thầy cố tình làm khó:
-  - đổi sáng tối,
-  - đổi màu,
-  - lật,
-  - crop,
-  - che bớt,
-  - để em học bản chất.
-
-- Em có nhiều mức quan sát:
-  - nhìn rất gần để thấy tai mèo, bánh xe,
-  - nhìn rộng để hiểu toàn thân và bối cảnh.
-
-- Mỗi lần em đoán sai:
-  - sai tên lớp,
-  - sai vị trí,
-  - sai độ rộng hộp,
-  - đều bị trừ điểm theo loss.
-
-- Em học đi học lại rất nhiều vòng.
-- Sau mỗi vòng, thầy đem em đi kiểm tra thử trên `val`.
-- Phiên bản nào làm bài thử tốt nhất thì được lưu thành `best.pth`.
-
-- Khi đi làm bài thật bằng `predict.py`,
-  em mở lại kiến thức trong `best.pth`,
-  nhìn ảnh mới,
-  khoanh các vật thể,
-  loại bớt đáp án trùng,
-  rồi nộp bài.
-
-- Giáo viên chấm bài xong,
-  những bài sai nặng được đưa vào `results/`.
-- Em không chỉ nhìn điểm tổng,
-  mà còn phải xem từng ảnh sai để hiểu:
-  - em đang mù với vật nhỏ,
-  - hay em bị nhầm chó với mèo,
-  - hay em chỉ thấy mặt mèo mà không suy ra toàn thân.
-
-- Sau đó thầy chỉnh lại cách dạy:
-  - tăng khả năng nhìn chi tiết,
-  - cho luyện vật bị che,
-  - nới cách gán điểm cho vật nhỏ,
-  - sửa cách gộp dự đoán,
-  - rồi cho em học lại.
-
-Đó chính là tinh thần thật của toàn bộ dự án này.
-
-
-11. Kết luận rất quan trọng về trạng thái hiện tại
---------------------------------------------------
-
-Hiện tại có một sự thật bạn nên nắm rất rõ:
-
-- code đã được chỉnh theo hướng học sinh mới mạnh hơn với hardcase,
-- nhưng `models/best.pth` hiện có lại là kiến thức của mô hình cũ:
-  - `img_size = 640`
-  - `strides = [8, 16, 32]`
-
-Điều này nghĩa là:
-
-- phần lý thuyết và cách dạy mới đã tốt hơn,
-- nhưng cuốn sổ trí nhớ hiện thời chưa chắc đã phản ánh các cải tiến đó.
-
-Nói như người thật:
-
-- giáo án đã được nâng cấp,
-- nhưng em học sinh trong `best.pth` vẫn là em của khóa cũ.
-
-Muốn xem đúng “đứa học sinh mới học ra sao”,
-bạn cần:
-
-- train lại bằng code mới,
-- sinh ra `best.pth` mới,
-- rồi dùng `predict.py` với checkpoint mới đó,
-- sau đó nhìn `results/` mới để xem em ấy đã tiến bộ ra sao trên các lỗi cũ.
-
-
-12. Một câu ngắn gọn để nhớ
----------------------------
-
-Toàn bộ dự án này có thể tóm lại như sau:
-
-- `train.py` là quá trình học.
-- `best.pth` là trí nhớ đã chắt lọc.
-- `predict.py` là lúc đem trí nhớ đi làm bài.
-- `results/` là chỗ xem lại lỗi sai để học tiếp.
-- `utils/` là lý thuyết, luật học và trợ giúp hậu trường.
-- `obj-detec.ipynb` là quy trình thi và chấm bài.
-
-Nếu nhìn đúng theo góc đó, bạn sẽ thấy đây không chỉ là một đống file code.
-Nó thật sự là câu chuyện của một học sinh đang:
-
-- học,
-- nhớ,
-- làm bài,
-- sai,
-- sửa,
-- rồi học tốt hơn ở vòng sau.
+- khả năng học hardcase vẫn được giữ
+- thời gian mỗi epoch được cắt xuống mạnh hơn
+- phù hợp hơn để train thực tế trên Kaggle T4

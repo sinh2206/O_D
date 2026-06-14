@@ -4,7 +4,7 @@ from __future__ import annotations
 Shared configuration for the anchor-free object detection project.
 """
 
-IMG_SIZE = 640
+IMG_SIZE = 512
 
 CLASS_NAMES = ["person", "car", "dog", "cat", "chair"]
 NUM_CLASSES = len(CLASS_NAMES)
@@ -19,10 +19,22 @@ CLASS_FREQ_PRIOR_VAL = [0.5314, 0.1400, 0.1019, 0.0871, 0.1395]
 CLASS_LOSS_WEIGHTS = [0.50, 1.10, 1.25, 1.35, 1.55]
 CLASS_SAMPLER_WEIGHTS = [0.65, 1.12, 1.28, 1.30, 1.45]
 
-# Use a stride-4 branch to preserve tiny details such as ears, wheels and
-# partially visible body parts.
+# Speed-oriented default preset for Kaggle T4:
+# keep the stride-4 branch for tiny details, but shrink the feature width and
+# image size so epoch time stays practical.
 STRIDES = [4, 8, 16, 32]
-FPN_CHANNELS = 128
+FPN_CHANNELS = 96
+HEAD_NUM_CONVS = 1
+
+TRAIN_BATCH_SIZE = 16
+TRAIN_NUM_WORKERS = -1
+TRAIN_PREFETCH_FACTOR = 2
+TRAIN_ENABLE_LOW_LIGHT = False
+VAL_ENABLE_LOW_LIGHT = False
+MAX_VAL_BATCHES = 32
+METRIC_EVAL_INTERVAL = 3
+METRIC_EVAL_BATCHES = 32
+ENABLE_TORCH_COMPILE = True
 
 MEAN = [0.485, 0.456, 0.406]
 STD = [0.229, 0.224, 0.225]
@@ -62,12 +74,12 @@ DARK_LUMA_THRESHOLD = LOW_LIGHT_MEAN_THRESH
 LOWLIGHT_GAMMA = LOW_LIGHT_GAMMA
 
 # Object-centric augmentation for hard cases.
-DETAIL_FOCUS_PROB = 0.38
+DETAIL_FOCUS_PROB = 0.22
 DETAIL_FOCUS_CONTEXT_RANGE = (1.35, 2.60)
 DETAIL_FOCUS_JITTER = 0.18
 DETAIL_FOCUS_MIN_VISIBLE = 0.45
 DETAIL_FOCUS_AREA_RATIO = 0.10
-PARTIAL_OCCLUSION_PROB = 0.16
+PARTIAL_OCCLUSION_PROB = 0.10
 
 TINY_OBJECT_MAX_SIDE_FACTOR = 2.5
 TINY_ASSIGN_EXPAND_STRIDE = 1.0

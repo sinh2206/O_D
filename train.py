@@ -31,13 +31,17 @@ from utils.config import (
     DETAIL_FOCUS_JITTER,
     DETAIL_FOCUS_MIN_VISIBLE,
     DETAIL_FOCUS_PROB,
+    ENABLE_TORCH_COMPILE,
     IMG_SIZE,
     INFER_CENTER_COMBINE,
     LABEL_SMOOTHING,
     LOW_LIGHT_CLAHE_CLIP,
     LOW_LIGHT_GAMMA,
     LOW_LIGHT_MEAN_THRESH,
+    MAX_VAL_BATCHES,
     MEAN,
+    METRIC_EVAL_BATCHES,
+    METRIC_EVAL_INTERVAL,
     NMS_IOU_THRESH,
     NUM_CLASSES,
     PARTIAL_OCCLUSION_PROB,
@@ -45,11 +49,16 @@ from utils.config import (
     SMALL_OBJECT_BONUS,
     STD,
     STRIDES,
+    TRAIN_BATCH_SIZE,
+    TRAIN_ENABLE_LOW_LIGHT,
+    TRAIN_NUM_WORKERS,
+    TRAIN_PREFETCH_FACTOR,
+    VAL_ENABLE_LOW_LIGHT,
 )
 from utils.loss import DetectionLoss
 from utils.model import AnchorFreeDetector
 from utils.nms import postprocess_batch
-from utils.runtime import create_grad_scaler, resolve_num_workers, should_pin_memory
+from utils.runtime import create_grad_scaler, maybe_compile_model, resolve_num_workers, seed_worker, should_pin_memory
 
 VALID_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 
@@ -162,6 +171,11 @@ def seed_everything(seed: int) -> None:
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
+    cv2.setNumThreads(1)
+    try:
+        cv2.ocl.setUseOpenCL(False)
+    except Exception:
+        pass
 
 
 def imread_unicode(path: Path) -> Optional[np.ndarray]:
@@ -408,7 +422,7 @@ def get_train_transforms(img_size: int) -> A.Compose:
         translate_percent=(-0.04, 0.04),
         rotate=(-4, 4),
         shear=(-1.0, 1.0),
-        p=0.20,
+        p=0.15,
     )
     if "border_mode" in affine_params:
         affine_kwargs["border_mode"] = cv2.BORDER_CONSTANT
@@ -437,7 +451,7 @@ def get_train_transforms(img_size: int) -> A.Compose:
         downscale_aug = A.Downscale(scale_min=0.72, scale_max=0.90, p=1.0)
 
     try:
-        crop_aug = A.RandomSizedBBoxSafeCrop(height=img_size, width=img_size, erosion_rate=0.0, p=0.16)
+        crop_aug = A.RandomSizedBBoxSafeCrop(height=img_size, width=img_size, erosion_rate=0.0, p=0.10)
     except TypeError:
         crop_aug = A.NoOp(p=1.0)
     coarse_dropout = make_partial_occlusion(img_size)
@@ -448,21 +462,18 @@ def get_train_transforms(img_size: int) -> A.Compose:
             A.LongestMaxSize(max_size=img_size, interpolation=cv2.INTER_LINEAR),
             make_pad_if_needed(img_size),
             A.HorizontalFlip(p=0.5),
-            A.VerticalFlip(p=0.05),
-            A.RandomRotate90(p=0.12),
             coarse_dropout,
-            A.CLAHE(clip_limit=2.2, tile_grid_size=(8, 8), p=0.2),
             A.OneOf(
                 [
                     A.GaussianBlur(blur_limit=(3, 7), p=1.0),
                     A.MotionBlur(blur_limit=5, p=1.0),
                     downscale_aug,
                 ],
-                p=0.18,
+                p=0.15,
             ),
-            A.Sharpen(alpha=(0.15, 0.35), lightness=(0.85, 1.15), p=0.16),
-            A.RandomGamma(gamma_limit=(88, 122), p=0.25),
-            A.ColorJitter(brightness=0.12, contrast=0.12, saturation=0.1, hue=0.05, p=0.45),
+            A.CLAHE(clip_limit=2.0, tile_grid_size=(8, 8), p=0.08),
+            A.RandomGamma(gamma_limit=(92, 116), p=0.10),
+            A.ColorJitter(brightness=0.10, contrast=0.10, saturation=0.08, hue=0.04, p=0.30),
             affine,
             A.Normalize(mean=MEAN, std=STD),
             ToTensorV2(),
@@ -496,10 +507,17 @@ def get_val_transforms(img_size: int) -> A.Compose:
 
 
 class DetectionDataset(Dataset):
-    def __init__(self, samples: List[Sample], transforms: A.Compose, detail_focus_prob: float = 0.0):
+    def __init__(
+        self,
+        samples: List[Sample],
+        transforms: A.Compose,
+        detail_focus_prob: float = 0.0,
+        use_low_light_enhance: bool = False,
+    ):
         self.samples = samples
         self.transforms = transforms
         self.detail_focus_prob = float(detail_focus_prob)
+        self.use_low_light_enhance = bool(use_low_light_enhance)
 
     def __len__(self) -> int:
         return len(self.samples)
@@ -509,7 +527,8 @@ class DetectionDataset(Dataset):
         image = imread_unicode(sample.image_path)
         if image is None:
             raise FileNotFoundError(f"Cannot read image: {sample.image_path}")
-        image = enhance_low_light_bgr(image)
+        if self.use_low_light_enhance:
+            image = enhance_low_light_bgr(image)
         image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
 
         bboxes = [list(b) for b in sample.boxes]
@@ -567,18 +586,24 @@ def make_dataloader(
     num_workers: int,
     sampler: Optional[WeightedRandomSampler] = None,
     pin_memory: bool = False,
+    drop_last: bool = False,
+    prefetch_factor: int = TRAIN_PREFETCH_FACTOR,
 ) -> DataLoader:
-    return DataLoader(
-        dataset,
-        batch_size=batch_size,
-        shuffle=(shuffle and sampler is None),
-        sampler=sampler,
-        num_workers=num_workers,
-        pin_memory=pin_memory,
-        persistent_workers=(num_workers > 0),
-        drop_last=False,
-        collate_fn=collate_fn,
-    )
+    kwargs = {
+        "dataset": dataset,
+        "batch_size": batch_size,
+        "shuffle": (shuffle and sampler is None),
+        "sampler": sampler,
+        "num_workers": num_workers,
+        "pin_memory": pin_memory,
+        "persistent_workers": (num_workers > 0),
+        "drop_last": drop_last,
+        "collate_fn": collate_fn,
+    }
+    if num_workers > 0:
+        kwargs["prefetch_factor"] = max(2, int(prefetch_factor))
+        kwargs["worker_init_fn"] = seed_worker
+    return DataLoader(**kwargs)
 
 
 def train_one_epoch(
@@ -758,11 +783,13 @@ def validate_one_epoch(
     conf_thresh: float = CONF_THRESH,
     nms_thresh: float = NMS_IOU_THRESH,
     center_combine: str = INFER_CENTER_COMBINE,
+    max_batches: Optional[int] = None,
+    collect_detection_metrics: bool = True,
 ) -> Dict[str, float]:
     model.eval()
     running = {"loss": 0.0, "loss_cls": 0.0, "loss_reg": 0.0, "loss_ctr": 0.0}
     steps = 0
-    metric_classes = list(class_names) if class_names is not None else []
+    metric_classes = list(class_names) if (class_names is not None and collect_detection_metrics) else []
     per_class_totals = {
         cls_name: {"gt": 0, "tp": 0, "fp": 0, "fn": 0}
         for cls_name in metric_classes
@@ -781,7 +808,9 @@ def validate_one_epoch(
         "dog_cat_confusions": 0,
     }
 
-    for images, targets in loader:
+    for batch_idx, (images, targets) in enumerate(loader, start=1):
+        if max_batches is not None and batch_idx > int(max_batches):
+            break
         image_ids = [t["image_id"] for t in targets]
         images = images.to(device, non_blocking=True).to(memory_format=torch.channels_last)
         targets = move_targets_to_device(targets, device)
@@ -838,6 +867,19 @@ def validate_one_epoch(
 
     metrics = {k: v / steps for k, v in running.items()}
     if not metric_classes:
+        metrics.update(
+            {
+                "micro_precision": float("nan"),
+                "micro_recall": float("nan"),
+                "macro_recall": float("nan"),
+                "key_recall": float("nan"),
+                "small_object_recall": float("nan"),
+                "mean_matched_iou": float("nan"),
+                "key_mean_iou": float("nan"),
+                "dog_cat_confusion_rate": float("nan"),
+                "selection_score": float("nan"),
+            }
+        )
         return metrics
 
     total_tp = int(totals["tp"])
@@ -955,17 +997,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--val_image_dir", type=Path, required=True)
     parser.add_argument("--checkpoint_dir", type=Path, default=Path("./models"))
     parser.add_argument("--img_size", type=int, default=IMG_SIZE)
-    parser.add_argument("--batch_size", type=int, default=8)
+    parser.add_argument("--batch_size", type=int, default=TRAIN_BATCH_SIZE)
     parser.add_argument("--epochs", type=int, default=30)
     parser.add_argument("--lr_backbone", type=float, default=2e-4)
     parser.add_argument("--lr_head", type=float, default=2e-3)
     parser.add_argument("--weight_decay", type=float, default=1e-4)
-    parser.add_argument("--num_workers", type=int, default=2)
+    parser.add_argument("--num_workers", type=int, default=TRAIN_NUM_WORKERS)
+    parser.add_argument("--prefetch_factor", type=int, default=TRAIN_PREFETCH_FACTOR)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--resume", type=Path, default=None)
     parser.add_argument("--label_smoothing", type=float, default=LABEL_SMOOTHING)
     parser.add_argument("--center_radius", type=float, default=CENTER_RADIUS)
     parser.add_argument("--detail_focus_prob", type=float, default=DETAIL_FOCUS_PROB)
+    parser.add_argument("--max_val_batches", type=int, default=MAX_VAL_BATCHES)
+    parser.add_argument("--metric_interval", type=int, default=METRIC_EVAL_INTERVAL)
+    parser.add_argument("--metric_batches", type=int, default=METRIC_EVAL_BATCHES)
     parser.add_argument("--metric_conf_thresh", type=float, default=CONF_THRESH)
     parser.add_argument("--metric_nms_thresh", type=float, default=NMS_IOU_THRESH)
     parser.add_argument(
@@ -974,6 +1020,14 @@ def parse_args() -> argparse.Namespace:
         default=str(INFER_CENTER_COMBINE),
         choices=["cls", "soft", "sqrt", "mul"],
     )
+    parser.set_defaults(compile_model=bool(ENABLE_TORCH_COMPILE))
+    parser.add_argument("--compile_model", dest="compile_model", action="store_true")
+    parser.add_argument("--no_compile_model", dest="compile_model", action="store_false")
+    parser.set_defaults(train_low_light=bool(TRAIN_ENABLE_LOW_LIGHT), val_low_light=bool(VAL_ENABLE_LOW_LIGHT))
+    parser.add_argument("--train_low_light", dest="train_low_light", action="store_true")
+    parser.add_argument("--no_train_low_light", dest="train_low_light", action="store_false")
+    parser.add_argument("--val_low_light", dest="val_low_light", action="store_true")
+    parser.add_argument("--no_val_low_light", dest="val_low_light", action="store_false")
     parser.add_argument("--no_scale_ranges", action="store_true")
     parser.add_argument("--no_balanced_sampling", action="store_true")
     parser.add_argument("--no_class_weights", action="store_true")
@@ -1002,11 +1056,13 @@ def main() -> None:
         train_samples,
         transforms=get_train_transforms(args.img_size),
         detail_focus_prob=float(args.detail_focus_prob),
+        use_low_light_enhance=bool(args.train_low_light),
     )
     val_ds = DetectionDataset(
         val_samples,
         transforms=get_val_transforms(args.img_size),
         detail_focus_prob=0.0,
+        use_low_light_enhance=bool(args.val_low_light),
     )
 
     class_weights = None if args.no_class_weights else compute_class_weights(
@@ -1030,6 +1086,8 @@ def main() -> None:
         num_workers=resolved_workers,
         sampler=train_sampler,
         pin_memory=pin_memory,
+        drop_last=(len(train_ds) >= int(args.batch_size)),
+        prefetch_factor=int(args.prefetch_factor),
     )
     val_loader = make_dataloader(
         val_ds,
@@ -1037,6 +1095,8 @@ def main() -> None:
         shuffle=False,
         num_workers=resolved_workers,
         pin_memory=pin_memory,
+        drop_last=False,
+        prefetch_factor=int(args.prefetch_factor),
     )
 
     model = AnchorFreeDetector(num_classes=num_classes, pretrained=True).to(device).to(memory_format=torch.channels_last)
@@ -1051,6 +1111,7 @@ def main() -> None:
     optimizer = build_optimizer(model, lr_backbone=args.lr_backbone, lr_head=args.lr_head, weight_decay=args.weight_decay)
     scheduler = CosineAnnealingLR(optimizer, T_max=max(args.epochs, 1))
     scaler = create_grad_scaler(device=device, enabled=amp_enabled)
+    train_model = maybe_compile_model(model, device=device, enabled=bool(args.compile_model))
 
     start_epoch = 1
     best_val_loss = float("inf")
@@ -1088,14 +1149,26 @@ def main() -> None:
     print(f"Balanced sampling: {not args.no_balanced_sampling}")
     print(f"Class weights enabled: {not args.no_class_weights}")
     print(f"Detail focus crop probability: {float(args.detail_focus_prob):.2f}")
+    print(f"Low-light enhance: train={bool(args.train_low_light)}, val={bool(args.val_low_light)}")
     print(f"Num workers: requested={args.num_workers}, resolved={resolved_workers}, max_safe={max_safe_workers}")
+    print(f"Prefetch factor: {max(2, int(args.prefetch_factor)) if resolved_workers > 0 else 0}")
+    print(f"Torch compile: {bool(args.compile_model) and (train_model is not model)}")
     print(f"Pin memory: {pin_memory}")
     if class_weights is not None:
         print(f"Class weights: {[round(x, 4) for x in class_weights.tolist()]}")
 
     for epoch in range(start_epoch, args.epochs + 1):
+        run_metric_eval = (
+            int(args.metric_interval) <= 1
+            or epoch == start_epoch
+            or epoch == args.epochs
+            or (epoch % max(int(args.metric_interval), 1) == 0)
+        )
+        val_batch_limit = int(args.metric_batches) if run_metric_eval else int(args.max_val_batches)
+        if val_batch_limit <= 0:
+            val_batch_limit = None
         train_metrics = train_one_epoch(
-            model=model,
+            model=train_model,
             criterion=criterion,
             loader=train_loader,
             optimizer=optimizer,
@@ -1104,7 +1177,7 @@ def main() -> None:
             amp_enabled=amp_enabled,
         )
         val_metrics = validate_one_epoch(
-            model=model,
+            model=train_model,
             criterion=criterion,
             loader=val_loader,
             device=device,
@@ -1114,19 +1187,31 @@ def main() -> None:
             conf_thresh=float(args.metric_conf_thresh),
             nms_thresh=float(args.metric_nms_thresh),
             center_combine=str(args.metric_center_combine),
+            max_batches=val_batch_limit,
+            collect_detection_metrics=run_metric_eval,
         )
         scheduler.step()
+
+        score_value = float(val_metrics.get("selection_score", float("nan")))
+        recall_value = float(val_metrics.get("micro_recall", float("nan")))
+        key_recall_value = float(val_metrics.get("key_recall", float("nan")))
+        small_recall_value = float(val_metrics.get("small_object_recall", float("nan")))
+        dog_cat_conf_value = float(val_metrics.get("dog_cat_confusion_rate", float("nan")))
+
+        def _metric_text(value: float) -> str:
+            return f"{value:.4f}" if np.isfinite(value) else "skip"
 
         print(
             f"Epoch {epoch:03d}/{args.epochs:03d} | "
             f"train_loss={train_metrics['loss']:.4f} "
             f"(cls={train_metrics['loss_cls']:.4f}, reg={train_metrics['loss_reg']:.4f}, ctr={train_metrics['loss_ctr']:.4f}) | "
             f"val_loss={val_metrics['loss']:.4f} | "
-            f"score={val_metrics.get('selection_score', 0.0):.4f} | "
-            f"recall={val_metrics.get('micro_recall', 0.0):.4f} | "
-            f"key_recall={val_metrics.get('key_recall', 0.0):.4f} | "
-            f"small_recall={val_metrics.get('small_object_recall', 0.0):.4f} | "
-            f"dog_cat_conf={val_metrics.get('dog_cat_confusion_rate', 0.0):.4f}"
+            f"score={_metric_text(score_value)} | "
+            f"recall={_metric_text(recall_value)} | "
+            f"key_recall={_metric_text(key_recall_value)} | "
+            f"small_recall={_metric_text(small_recall_value)} | "
+            f"dog_cat_conf={_metric_text(dog_cat_conf_value)} | "
+            f"metric_eval={run_metric_eval} | val_batches={'all' if val_batch_limit is None else val_batch_limit}"
         )
 
         if val_metrics["loss"] < best_val_loss:
@@ -1146,8 +1231,8 @@ def main() -> None:
             )
             print(f"Saved best loss checkpoint: {best_loss_path} (val_loss={best_val_loss:.4f})")
 
-        if float(val_metrics.get("selection_score", float("-inf"))) > best_metric_score:
-            best_metric_score = float(val_metrics["selection_score"])
+        if run_metric_eval and np.isfinite(score_value) and score_value > best_metric_score:
+            best_metric_score = score_value
             save_checkpoint(
                 path=best_path,
                 model=model,
@@ -1163,7 +1248,7 @@ def main() -> None:
             )
             print(
                 f"Saved best detection checkpoint: {best_path} "
-                f"(score={best_metric_score:.4f}, key_recall={val_metrics.get('key_recall', 0.0):.4f})"
+                    f"(score={best_metric_score:.4f}, key_recall={key_recall_value:.4f})"
             )
 
         save_checkpoint(
