@@ -9,3 +9,4 @@ results/*
 models/*
 val_score.json
 val_predictions.json
+main.tex
