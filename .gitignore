@@ -5,3 +5,7 @@ __pycache__/
 *.pyc
 
 small_obj/*
+results/*
+models/*
+val_score.json
+val_predictions.json
