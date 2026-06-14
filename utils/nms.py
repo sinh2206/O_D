@@ -26,7 +26,24 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 import torch
 
 try:
-    from .config import CLASS_NAMES, CLASS_SCORE_SCALES, CONF_THRESH, IMG_SIZE, INFER_CENTER_COMBINE, MAX_OBJECTS_PER_IMAGE, MIN_BOX_SIZE, NMS_IOU_THRESH, NUM_CLASSES, STRIDES
+    from .config import (
+        BOX_REFINE_BLEND,
+        BOX_REFINE_BORDER_MARGIN,
+        BOX_REFINE_CENTER_RADIUS,
+        BOX_REFINE_ENABLE,
+        BOX_REFINE_MIN_CANDIDATE_SCORE,
+        BOX_REFINE_SIDE_MARGIN,
+        CLASS_NAMES,
+        CLASS_SCORE_SCALES,
+        CONF_THRESH,
+        IMG_SIZE,
+        INFER_CENTER_COMBINE,
+        MAX_OBJECTS_PER_IMAGE,
+        MIN_BOX_SIZE,
+        NMS_IOU_THRESH,
+        NUM_CLASSES,
+        STRIDES,
+    )
 except Exception:
     # Safe fallbacks when config.py is not present.
     CLASS_NAMES = ["person", "car", "dog", "cat", "chair"]
@@ -39,6 +56,12 @@ except Exception:
     STRIDES = [8, 16, 32]
     MAX_OBJECTS_PER_IMAGE = 15
     MIN_BOX_SIZE = 1.0
+    BOX_REFINE_ENABLE = False
+    BOX_REFINE_MIN_CANDIDATE_SCORE = 0.05
+    BOX_REFINE_CENTER_RADIUS = 1.20
+    BOX_REFINE_SIDE_MARGIN = 4.0
+    BOX_REFINE_BLEND = 0.65
+    BOX_REFINE_BORDER_MARGIN = 2.0
 
 
 @dataclass
@@ -356,6 +379,139 @@ def _box_area_xyxy(box: torch.Tensor) -> float:
     return float(max(0.0, float(box[2]) - float(box[0])) * max(0.0, float(box[3]) - float(box[1])))
 
 
+def _box_centers_xyxy(boxes: torch.Tensor) -> torch.Tensor:
+    """Return center `(x, y)` coordinates for a tensor of xyxy boxes."""
+
+    return torch.stack(
+        [
+            0.5 * (boxes[:, 0] + boxes[:, 2]),
+            0.5 * (boxes[:, 1] + boxes[:, 3]),
+        ],
+        dim=-1,
+    )
+
+
+def _weighted_quantile(values: torch.Tensor, weights: torch.Tensor, q: float) -> torch.Tensor:
+    """Compute one weighted quantile directly on a tensor without leaving PyTorch."""
+
+    if values.numel() == 0:
+        return values.new_tensor(0.0)
+    if values.numel() == 1:
+        return values[0]
+
+    order = torch.argsort(values)
+    sorted_values = values[order]
+    sorted_weights = weights[order]
+    cdf = torch.cumsum(sorted_weights, dim=0)
+    threshold = float(q) * float(cdf[-1].item())
+    idx = int(torch.searchsorted(cdf, values.new_tensor(threshold), right=False).item())
+    idx = max(0, min(idx, sorted_values.numel() - 1))
+    return sorted_values[idx]
+
+
+def _refine_kept_boxes_with_candidates(
+    boxes: torch.Tensor,
+    scores: torch.Tensor,
+    class_ids: torch.Tensor,
+    candidate_boxes: torch.Tensor,
+    candidate_scores: torch.Tensor,
+    candidate_class_ids: torch.Tensor,
+    image_w: int,
+    image_h: int,
+) -> torch.Tensor:
+    """Adjust kept boxes using lower-score same-class candidates around the same object."""
+
+    if not BOX_REFINE_ENABLE or boxes.numel() == 0 or candidate_boxes.numel() == 0:
+        return boxes
+
+    refined = boxes.clone().float()
+
+    for idx in range(refined.shape[0]):
+        cls_id = class_ids[idx]
+        same_class = candidate_class_ids == cls_id
+        if int(same_class.sum().item()) < 2:
+            continue
+
+        pool_boxes = candidate_boxes[same_class]
+        pool_scores = candidate_scores[same_class]
+
+        score_floor = max(float(BOX_REFINE_MIN_CANDIDATE_SCORE), float(scores[idx].item()) * 0.10)
+        pool_mask = pool_scores >= float(score_floor)
+        if int(pool_mask.sum().item()) < 2:
+            continue
+
+        pool_boxes = pool_boxes[pool_mask]
+        pool_scores = pool_scores[pool_mask]
+
+        anchor = refined[idx]
+        anchor_w = (anchor[2] - anchor[0]).clamp(min=1.0)
+        anchor_h = (anchor[3] - anchor[1]).clamp(min=1.0)
+        anchor_center = _box_centers_xyxy(anchor.view(1, 4))[0]
+
+        pool_centers = _box_centers_xyxy(pool_boxes)
+        pool_w = (pool_boxes[:, 2] - pool_boxes[:, 0]).clamp(min=1.0)
+        pool_h = (pool_boxes[:, 3] - pool_boxes[:, 1]).clamp(min=1.0)
+        dx = (pool_centers[:, 0] - anchor_center[0]).abs() / ((anchor_w + pool_w) * 0.5).clamp(min=1.0)
+        dy = (pool_centers[:, 1] - anchor_center[1]).abs() / ((anchor_h + pool_h) * 0.5).clamp(min=1.0)
+        overlap = _box_iou_xyxy(anchor, pool_boxes)
+
+        # Use either close-center boxes or visibly overlapping boxes to capture
+        # alternate full-object hypotheses that hard NMS would normally discard.
+        neighborhood = ((dx <= float(BOX_REFINE_CENTER_RADIUS)) & (dy <= float(BOX_REFINE_CENTER_RADIUS))) | (overlap >= 0.10)
+        if int(neighborhood.sum().item()) < 2:
+            continue
+
+        pool_boxes = pool_boxes[neighborhood]
+        pool_scores = pool_scores[neighborhood]
+        weights = pool_scores.clamp(min=float(BOX_REFINE_MIN_CANDIDATE_SCORE)).pow(0.5)
+
+        x1_q25 = _weighted_quantile(pool_boxes[:, 0], weights, 0.25)
+        x1_q85 = _weighted_quantile(pool_boxes[:, 0], weights, 0.85)
+        y1_q25 = _weighted_quantile(pool_boxes[:, 1], weights, 0.25)
+        y1_q85 = _weighted_quantile(pool_boxes[:, 1], weights, 0.85)
+        x2_q35 = _weighted_quantile(pool_boxes[:, 2], weights, 0.35)
+        x2_q90 = _weighted_quantile(pool_boxes[:, 2], weights, 0.90)
+        y2_q35 = _weighted_quantile(pool_boxes[:, 3], weights, 0.35)
+        y2_q90 = _weighted_quantile(pool_boxes[:, 3], weights, 0.90)
+
+        margin_x = max(float(BOX_REFINE_SIDE_MARGIN), 0.08 * float(anchor_w.item()))
+        margin_y = max(float(BOX_REFINE_SIDE_MARGIN), 0.08 * float(anchor_h.item()))
+        blend = float(BOX_REFINE_BLEND)
+        border_margin = float(BOX_REFINE_BORDER_MARGIN)
+
+        # x1 / y1: smaller means more outward.
+        if float(anchor[0] - x1_q25) > margin_x:
+            anchor[0] = (1.0 - blend) * anchor[0] + blend * x1_q25
+        elif float(anchor[0]) <= border_margin and float(x1_q85 - anchor[0]) > margin_x:
+            anchor[0] = (1.0 - blend) * anchor[0] + blend * x1_q85
+
+        if float(anchor[1] - y1_q25) > margin_y:
+            anchor[1] = (1.0 - blend) * anchor[1] + blend * y1_q25
+        elif float(anchor[1]) <= border_margin and float(y1_q85 - anchor[1]) > margin_y:
+            anchor[1] = (1.0 - blend) * anchor[1] + blend * y1_q85
+
+        # x2 / y2: larger means more outward.
+        if float(x2_q90 - anchor[2]) > margin_x:
+            anchor[2] = (1.0 - blend) * anchor[2] + blend * x2_q90
+        elif float(anchor[2]) >= float(image_w) - border_margin and float(anchor[2] - x2_q35) > margin_x:
+            anchor[2] = (1.0 - blend) * anchor[2] + blend * x2_q35
+
+        if float(y2_q90 - anchor[3]) > margin_y:
+            anchor[3] = (1.0 - blend) * anchor[3] + blend * y2_q90
+        elif float(anchor[3]) >= float(image_h) - border_margin and float(anchor[3] - y2_q35) > margin_y:
+            anchor[3] = (1.0 - blend) * anchor[3] + blend * y2_q35
+
+        anchor[0] = anchor[0].clamp(0.0, float(image_w))
+        anchor[1] = anchor[1].clamp(0.0, float(image_h))
+        anchor[2] = anchor[2].clamp(0.0, float(image_w))
+        anchor[3] = anchor[3].clamp(0.0, float(image_h))
+        anchor[2] = torch.maximum(anchor[2], anchor[0] + 1.0)
+        anchor[3] = torch.maximum(anchor[3], anchor[1] + 1.0)
+        refined[idx] = anchor
+
+    return refined
+
+
 def _suppress_same_class_contained(
     boxes: torch.Tensor,
     scores: torch.Tensor,
@@ -559,6 +715,10 @@ def postprocess_single_image(
     if boxes.numel() == 0:
         return {"image_id": image_id, "boxes": []}
 
+    candidate_boxes = boxes
+    candidate_scores = scores
+    candidate_cls_ids = cls_ids
+
     keep = class_wise_nms(
         boxes=boxes,
         scores=scores,
@@ -570,8 +730,24 @@ def postprocess_single_image(
     scores = scores[keep]
     cls_ids = cls_ids[keep]
 
+    image_w = int(img_size)
+    image_h = int(img_size)
     if letterbox_meta is not None:
         boxes = remap_boxes_to_original(boxes, letterbox_meta)
+        candidate_boxes = remap_boxes_to_original(candidate_boxes, letterbox_meta)
+        image_w = int(letterbox_meta.orig_w)
+        image_h = int(letterbox_meta.orig_h)
+
+    boxes = _refine_kept_boxes_with_candidates(
+        boxes=boxes,
+        scores=scores,
+        class_ids=cls_ids,
+        candidate_boxes=candidate_boxes,
+        candidate_scores=candidate_scores,
+        candidate_class_ids=candidate_cls_ids,
+        image_w=image_w,
+        image_h=image_h,
+    )
 
     valid = filter_small_boxes(boxes, min_size=min_box_size)
     boxes = boxes[valid]

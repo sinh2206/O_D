@@ -29,7 +29,7 @@ MEAN = [0.485, 0.456, 0.406]
 STD = [0.229, 0.224, 0.225]
 
 # Inference and post-processing thresholds.
-CONF_THRESH = 0.35
+CONF_THRESH = 0.05
 NMS_IOU_THRESH = 0.50
 MAX_OBJECTS_PER_IMAGE = 15
 # Per-class confidence thresholds used after decode/NMS:
@@ -41,7 +41,7 @@ CHAIR_SUPPRESS_WITH_PERSON_IOU = 0.92
 CHAIR_SUPPRESS_MAX_AREA_RATIO = 0.25
 MIN_BOX_SIZE = 1.0
 NEGATIVE_FOCAL_WEIGHT = 0.35
-CENTER_RADIUS = 2.5
+CENTER_RADIUS = 3.0
 INFER_CENTER_COMBINE = "sqrt"
 
 # Small/difficult object handling and low-light preprocessing knobs.
@@ -61,3 +61,15 @@ LAMBDA_CLS = 1.25
 LAMBDA_REG = 1.20
 LAMBDA_CTR = 0.30
 LABEL_SMOOTHING = 0.0
+LAMBDA_REG_IOU = 1.0
+LAMBDA_REG_L1 = 0.35
+REG_SMOOTH_L1_BETA = 0.10
+
+# Low-score candidate refinement helps rescue truncated boxes and shrink boxes
+# that bleed into background after the primary NMS pass.
+BOX_REFINE_ENABLE = True
+BOX_REFINE_MIN_CANDIDATE_SCORE = 0.05
+BOX_REFINE_CENTER_RADIUS = 1.20
+BOX_REFINE_SIDE_MARGIN = 4.0
+BOX_REFINE_BLEND = 0.65
+BOX_REFINE_BORDER_MARGIN = 2.0

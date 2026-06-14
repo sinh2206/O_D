@@ -8,7 +8,7 @@ Total loss:
 
 Where:
 - L_cls: focal loss for classification.
-- L_reg: GIoU loss for box regression (decoded from t,l,b,r distances).
+- L_reg: GIoU + normalized SmoothL1 for box regression.
 - L_ctr: BCE-with-logits for centerness (optional if branch exists).
 
 Target assignment:
@@ -34,8 +34,11 @@ try:
         LAMBDA_CLS,
         LAMBDA_CTR,
         LAMBDA_REG,
+        LAMBDA_REG_IOU,
+        LAMBDA_REG_L1,
         NEGATIVE_FOCAL_WEIGHT,
         NUM_CLASSES,
+        REG_SMOOTH_L1_BETA,
         STRIDES,
         TINY_ASSIGN_EXPAND_STRIDE,
         TINY_OBJECT_MAX_SIDE_FACTOR,
@@ -52,6 +55,9 @@ except Exception:
     LAMBDA_CLS = 1.0
     LAMBDA_REG = 1.0
     LAMBDA_CTR = 0.5
+    LAMBDA_REG_IOU = 1.0
+    LAMBDA_REG_L1 = 0.25
+    REG_SMOOTH_L1_BETA = 0.10
     TINY_OBJECT_MAX_SIDE_FACTOR = 2.0
     TINY_ASSIGN_EXPAND_STRIDE = 0.75
 
@@ -144,6 +150,36 @@ def giou_loss(pred_boxes: torch.Tensor, target_boxes: torch.Tensor, reduction: s
         return loss.mean()
     if reduction == "sum":
         return loss.sum()
+    return loss
+
+
+def normalized_box_l1_loss(
+    pred_boxes: torch.Tensor,
+    target_boxes: torch.Tensor,
+    beta: float = REG_SMOOTH_L1_BETA,
+    reduction: str = "mean",
+) -> torch.Tensor:
+    """SmoothL1 on xyxy edges after normalizing by target box width/height."""
+
+    if pred_boxes.numel() == 0:
+        return pred_boxes.new_tensor(0.0)
+
+    tgt_w = (target_boxes[:, 2] - target_boxes[:, 0]).clamp(min=1.0)
+    tgt_h = (target_boxes[:, 3] - target_boxes[:, 1]).clamp(min=1.0)
+    scale = torch.stack([tgt_w, tgt_h, tgt_w, tgt_h], dim=-1)
+
+    diff = (pred_boxes - target_boxes) / scale
+    loss = F.smooth_l1_loss(
+        diff,
+        torch.zeros_like(diff),
+        beta=float(beta),
+        reduction="none",
+    ).sum(dim=-1)
+
+    if reduction == "sum":
+        return loss.sum()
+    if reduction == "mean":
+        return loss.mean()
     return loss
 
 
@@ -631,11 +667,14 @@ def compute_loss(
     lambda_cls: float = LAMBDA_CLS,
     lambda_reg: float = LAMBDA_REG,
     lambda_ctr: float = LAMBDA_CTR,
+    lambda_reg_iou: float = LAMBDA_REG_IOU,
+    lambda_reg_l1: float = LAMBDA_REG_L1,
     focal_alpha: float = FOCAL_ALPHA,
     focal_gamma: float = FOCAL_GAMMA,
     negative_focal_weight: float = NEGATIVE_FOCAL_WEIGHT,
     class_weights: Optional[torch.Tensor] = None,
     label_smoothing: float = LABEL_SMOOTHING,
+    reg_smooth_l1_beta: float = REG_SMOOTH_L1_BETA,
     center_radius: float = DEFAULT_CENTER_RADIUS,
     use_scale_ranges: bool = True,
     tiny_object_max_side_factor: float = TINY_OBJECT_MAX_SIDE_FACTOR,
@@ -671,7 +710,8 @@ def compute_loss(
     bg_index = int(target_pack["bg_index"])
 
     total_cls = cls_levels[0].new_tensor(0.0)
-    total_reg = cls_levels[0].new_tensor(0.0)
+    total_reg_iou = cls_levels[0].new_tensor(0.0)
+    total_reg_l1 = cls_levels[0].new_tensor(0.0)
     total_ctr = cls_levels[0].new_tensor(0.0)
     total_pos = cls_levels[0].new_tensor(0.0)
 
@@ -724,7 +764,13 @@ def compute_loss(
 
             pred_boxes = tlbr_to_xyxy(pts_pos, reg_pos)
             tgt_boxes = tlbr_to_xyxy(pts_pos, tgt_pos)
-            total_reg = total_reg + giou_loss(pred_boxes, tgt_boxes, reduction="sum")
+            total_reg_iou = total_reg_iou + giou_loss(pred_boxes, tgt_boxes, reduction="sum")
+            total_reg_l1 = total_reg_l1 + normalized_box_l1_loss(
+                pred_boxes,
+                tgt_boxes,
+                beta=float(reg_smooth_l1_beta),
+                reduction="sum",
+            )
 
             if ctr_levels is not None:
                 ctr_logits = ctr_levels[lvl].permute(0, 2, 3, 1).reshape(-1)
@@ -739,7 +785,9 @@ def compute_loss(
     normalizer = torch.clamp(total_pos, min=1.0)
 
     loss_cls = total_cls / normalizer
-    loss_reg = total_reg / normalizer
+    loss_reg_iou = total_reg_iou / normalizer
+    loss_reg_l1 = total_reg_l1 / normalizer
+    loss_reg = float(lambda_reg_iou) * loss_reg_iou + float(lambda_reg_l1) * loss_reg_l1
     loss_ctr = total_ctr / normalizer if ctr_levels is not None else total_cls.new_tensor(0.0)
 
     total = (
@@ -774,11 +822,14 @@ class DetectionLoss(nn.Module):
         lambda_cls: float = LAMBDA_CLS,
         lambda_reg: float = LAMBDA_REG,
         lambda_ctr: float = LAMBDA_CTR,
+        lambda_reg_iou: float = LAMBDA_REG_IOU,
+        lambda_reg_l1: float = LAMBDA_REG_L1,
         focal_alpha: float = FOCAL_ALPHA,
         focal_gamma: float = FOCAL_GAMMA,
         negative_focal_weight: float = NEGATIVE_FOCAL_WEIGHT,
         class_weights: Optional[torch.Tensor] = None,
         label_smoothing: float = LABEL_SMOOTHING,
+        reg_smooth_l1_beta: float = REG_SMOOTH_L1_BETA,
         center_radius: float = DEFAULT_CENTER_RADIUS,
         use_scale_ranges: bool = True,
         tiny_object_max_side_factor: float = TINY_OBJECT_MAX_SIDE_FACTOR,
@@ -792,6 +843,8 @@ class DetectionLoss(nn.Module):
         self.lambda_cls = float(lambda_cls)
         self.lambda_reg = float(lambda_reg)
         self.lambda_ctr = float(lambda_ctr)
+        self.lambda_reg_iou = float(lambda_reg_iou)
+        self.lambda_reg_l1 = float(lambda_reg_l1)
         self.focal_alpha = float(focal_alpha)
         self.focal_gamma = float(focal_gamma)
         self.negative_focal_weight = float(negative_focal_weight)
@@ -800,6 +853,7 @@ class DetectionLoss(nn.Module):
         else:
             self.register_buffer("class_weights", torch.as_tensor(class_weights, dtype=torch.float32), persistent=False)
         self.label_smoothing = float(label_smoothing)
+        self.reg_smooth_l1_beta = float(reg_smooth_l1_beta)
         self.center_radius = float(center_radius)
         self.use_scale_ranges = bool(use_scale_ranges)
         self.tiny_object_max_side_factor = float(tiny_object_max_side_factor)
@@ -816,11 +870,14 @@ class DetectionLoss(nn.Module):
             lambda_cls=self.lambda_cls,
             lambda_reg=self.lambda_reg,
             lambda_ctr=self.lambda_ctr,
+            lambda_reg_iou=self.lambda_reg_iou,
+            lambda_reg_l1=self.lambda_reg_l1,
             focal_alpha=self.focal_alpha,
             focal_gamma=self.focal_gamma,
             negative_focal_weight=self.negative_focal_weight,
             class_weights=self.class_weights if self.class_weights.numel() > 0 else None,
             label_smoothing=self.label_smoothing,
+            reg_smooth_l1_beta=self.reg_smooth_l1_beta,
             center_radius=self.center_radius,
             use_scale_ranges=self.use_scale_ranges,
             tiny_object_max_side_factor=self.tiny_object_max_side_factor,

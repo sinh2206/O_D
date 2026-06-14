@@ -302,11 +302,13 @@ def get_train_transforms(img_size: int) -> A.Compose:
 
     affine_params = inspect.signature(A.Affine.__init__).parameters
     affine_kwargs = dict(
-        scale=(0.85, 1.25),
-        translate_percent=(-0.04, 0.04),
-        rotate=(-4, 4),
-        shear=(-1.0, 1.0),
-        p=0.20,
+        # Keep geometry changes gentle so the model learns full-object boxes
+        # instead of overfitting to heavily clipped torsos/limbs.
+        scale=(0.90, 1.15),
+        translate_percent=(-0.02, 0.02),
+        rotate=(-3, 3),
+        shear=(-0.5, 0.5),
+        p=0.16,
     )
     if "border_mode" in affine_params:
         affine_kwargs["border_mode"] = cv2.BORDER_CONSTANT
@@ -335,7 +337,9 @@ def get_train_transforms(img_size: int) -> A.Compose:
         downscale_aug = A.Downscale(scale_min=0.72, scale_max=0.90, p=1.0)
 
     try:
-        crop_aug = A.RandomSizedBBoxSafeCrop(height=img_size, width=img_size, erosion_rate=0.0, p=0.24)
+        # Safe crop stays available for scale diversity, but a lower
+        # probability preserves more full-body/full-object supervision.
+        crop_aug = A.RandomSizedBBoxSafeCrop(height=img_size, width=img_size, erosion_rate=0.0, p=0.10)
     except TypeError:
         crop_aug = A.NoOp(p=1.0)
 
@@ -345,8 +349,6 @@ def get_train_transforms(img_size: int) -> A.Compose:
             A.LongestMaxSize(max_size=img_size, interpolation=cv2.INTER_LINEAR),
             make_pad_if_needed(img_size),
             A.HorizontalFlip(p=0.5),
-            A.VerticalFlip(p=0.05),
-            A.RandomRotate90(p=0.12),
             A.CLAHE(clip_limit=2.2, tile_grid_size=(8, 8), p=0.2),
             A.OneOf(
                 [
@@ -354,7 +356,7 @@ def get_train_transforms(img_size: int) -> A.Compose:
                     A.MotionBlur(blur_limit=5, p=1.0),
                     downscale_aug,
                 ],
-                p=0.18,
+                p=0.14,
             ),
             A.Sharpen(alpha=(0.15, 0.35), lightness=(0.85, 1.15), p=0.16),
             A.RandomGamma(gamma_limit=(88, 122), p=0.25),
@@ -621,7 +623,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--checkpoint_dir", type=Path, default=Path("./models"))
     parser.add_argument("--img_size", type=int, default=IMG_SIZE)
     parser.add_argument("--batch_size", type=int, default=8)
-    parser.add_argument("--epochs", type=int, default=50)
+    parser.add_argument("--epochs", type=int, default=30)
     parser.add_argument("--lr_backbone", type=float, default=2e-4)
     parser.add_argument("--lr_head", type=float, default=2e-3)
     parser.add_argument("--weight_decay", type=float, default=1e-4)
