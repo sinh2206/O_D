@@ -36,6 +36,8 @@ class ConvBNLeaky(nn.Module):
     """Conv2d + BatchNorm2d + LeakyReLU(0.1)."""
 
     def __init__(self, in_ch: int, out_ch: int, k: int = 3, s: int = 1, p: int = 1):
+        """Build the basic convolutional block reused across the detector."""
+
         super().__init__()
         self.block = nn.Sequential(
             nn.Conv2d(in_ch, out_ch, kernel_size=k, stride=s, padding=p, bias=False),
@@ -44,6 +46,8 @@ class ConvBNLeaky(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply convolution, normalization and activation in one step."""
+
         return self.block(x)
 
 
@@ -51,6 +55,8 @@ class ResNet34FPN3L(nn.Module):
     """Backbone + 3-level FPN feature extractor (stride 8/16/32)."""
 
     def __init__(self, fpn_channels: int = FPN_CHANNELS, pretrained: bool = True):
+        """Create the pretrained ResNet34 backbone and the 3-level FPN neck."""
+
         super().__init__()
 
         backbone = self._build_resnet34(pretrained=pretrained)
@@ -74,6 +80,8 @@ class ResNet34FPN3L(nn.Module):
 
     @staticmethod
     def _build_resnet34(pretrained: bool):
+        """Load ResNet34 weights in a torchvision-version-tolerant way."""
+
         if not pretrained:
             return models.resnet34(weights=None)
 
@@ -88,6 +96,8 @@ class ResNet34FPN3L(nn.Module):
                 return models.resnet34(weights=None)
 
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Return the three fused FPN feature maps used by the detector heads."""
+
         x = self.stem(x)
         x = self.layer1(x)
         c2 = self.layer2(x)
@@ -123,6 +133,8 @@ class AnchorFreeHead(nn.Module):
     """
 
     def __init__(self, in_ch: int, num_classes: int, num_convs: int = 2):
+        """Build classification/regression towers plus their output layers."""
+
         super().__init__()
 
         cls_layers: List[nn.Module] = []
@@ -143,6 +155,8 @@ class AnchorFreeHead(nn.Module):
         self._init_params()
 
     def _init_params(self) -> None:
+        """Initialize head outputs with stable priors for early training."""
+
         # Low prior for positives at init.
         nn.init.normal_(self.cls_out.weight, mean=0.0, std=0.01)
         nn.init.constant_(self.cls_out.bias, -1.2)
@@ -154,6 +168,8 @@ class AnchorFreeHead(nn.Module):
         nn.init.constant_(self.center_out.bias, -1.0)
 
     def forward(self, feat: torch.Tensor) -> Dict[str, torch.Tensor]:
+        """Predict class logits, box distances and centerness for one level."""
+
         cls_feat = self.cls_tower(feat)
         reg_feat = self.reg_tower(feat)
 
@@ -192,6 +208,8 @@ class AnchorFreeDetector(nn.Module):
         pretrained: bool = True,
         legacy_single_output: bool = False,
     ):
+        """Assemble backbone, FPN and one anchor-free head per scale."""
+
         super().__init__()
 
         self.num_classes = num_classes
@@ -203,9 +221,13 @@ class AnchorFreeDetector(nn.Module):
         self.head_s32 = AnchorFreeHead(in_ch=feat_channels, num_classes=num_classes, num_convs=2)
 
     def extract_features(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Run only the backbone+FPN part and return the three feature maps."""
+
         return self.backbone_fpn(x)
 
     def forward(self, x: torch.Tensor) -> Dict[str, object]:
+        """Run the full detector and return multi-scale prediction tensors."""
+
         p2_out, p3_out, p4_out = self.extract_features(x)
 
         out8 = self.head_s8(p2_out)

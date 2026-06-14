@@ -60,6 +60,8 @@ DEFAULT_CENTER_RADIUS = float(CENTER_RADIUS)
 
 
 def _meshgrid_xy(height: int, width: int, device: torch.device) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Create x/y coordinate grids in feature-map space."""
+
     ys = torch.arange(height, device=device, dtype=torch.float32)
     xs = torch.arange(width, device=device, dtype=torch.float32)
     try:
@@ -101,12 +103,14 @@ def tlbr_to_xyxy(points_xy: torch.Tensor, tlbr: torch.Tensor) -> torch.Tensor:
 
 
 def _box_area(boxes: torch.Tensor) -> torch.Tensor:
+    """Compute area for a batch of xyxy boxes."""
+
     wh = (boxes[:, 2:] - boxes[:, :2]).clamp(min=0)
     return wh[:, 0] * wh[:, 1]
 
 
-def ciou_loss(pred_boxes: torch.Tensor, target_boxes: torch.Tensor, reduction: str = "mean") -> torch.Tensor:
-    """Complete IoU loss between two sets of boxes (N,4) in xyxy."""
+def giou_loss(pred_boxes: torch.Tensor, target_boxes: torch.Tensor, reduction: str = "mean") -> torch.Tensor:
+    """Generalized IoU loss between two sets of boxes (N,4) in xyxy."""
     if pred_boxes.numel() == 0:
         return pred_boxes.new_tensor(0.0)
 
@@ -124,26 +128,17 @@ def ciou_loss(pred_boxes: torch.Tensor, target_boxes: torch.Tensor, reduction: s
     union = area_p + area_t - inter + EPS
     iou = inter / union
 
-    # Enclosing box
     ex1 = torch.min(pred_boxes[:, 0], target_boxes[:, 0])
     ey1 = torch.min(pred_boxes[:, 1], target_boxes[:, 1])
     ex2 = torch.max(pred_boxes[:, 2], target_boxes[:, 2])
     ey2 = torch.max(pred_boxes[:, 3], target_boxes[:, 3])
 
-    c2 = (ex2 - ex1).pow(2) + (ey2 - ey1).pow(2) + EPS  # convex diagonal squared
-    rho2 = (
-        (pred_boxes[:, 0] + pred_boxes[:, 2] - (target_boxes[:, 0] + target_boxes[:, 2])).pow(2)
-        + (pred_boxes[:, 1] + pred_boxes[:, 3] - (target_boxes[:, 1] + target_boxes[:, 3])).pow(2)
-    ) / 4.0  # center distance squared
+    enc_w = (ex2 - ex1).clamp(min=0)
+    enc_h = (ey2 - ey1).clamp(min=0)
+    enc_area = enc_w * enc_h + EPS
 
-    w1, h1 = pred_boxes[:, 2] - pred_boxes[:, 0], pred_boxes[:, 3] - pred_boxes[:, 1]
-    w2, h2 = target_boxes[:, 2] - target_boxes[:, 0], target_boxes[:, 3] - target_boxes[:, 1]
-
-    v = (4 / (math.pi**2)) * torch.pow(torch.atan(w2 / (h2 + EPS)) - torch.atan(w1 / (h1 + EPS)), 2)
-    with torch.no_grad():
-        alpha = v / (1 - iou + v + EPS)
-
-    loss = 1.0 - iou + rho2 / c2 + alpha * v
+    giou = iou - (enc_area - union) / enc_area
+    loss = 1.0 - giou
 
     if reduction == "mean":
         return loss.mean()
@@ -251,6 +246,8 @@ def _normalize_targets(
     """
 
     def _clean_one(boxes: torch.Tensor, labels: torch.Tensor) -> Dict[str, torch.Tensor]:
+        """Normalize one image target by removing padding and invalid boxes."""
+
         if boxes.numel() == 0:
             return {
                 "boxes": torch.zeros((0, 4), dtype=torch.float32, device=device),
@@ -727,7 +724,7 @@ def compute_loss(
 
             pred_boxes = tlbr_to_xyxy(pts_pos, reg_pos)
             tgt_boxes = tlbr_to_xyxy(pts_pos, tgt_pos)
-            total_reg = total_reg + ciou_loss(pred_boxes, tgt_boxes, reduction="sum")
+            total_reg = total_reg + giou_loss(pred_boxes, tgt_boxes, reduction="sum")
 
             if ctr_levels is not None:
                 ctr_logits = ctr_levels[lvl].permute(0, 2, 3, 1).reshape(-1)
@@ -787,6 +784,8 @@ class DetectionLoss(nn.Module):
         tiny_object_max_side_factor: float = TINY_OBJECT_MAX_SIDE_FACTOR,
         tiny_assign_expand_stride: float = TINY_ASSIGN_EXPAND_STRIDE,
     ):
+        """Store loss hyperparameters and optional class weights as buffers."""
+
         super().__init__()
         self.num_classes = int(num_classes)
         self.strides = list(strides) if strides is not None else list(STRIDES)
@@ -807,6 +806,8 @@ class DetectionLoss(nn.Module):
         self.tiny_assign_expand_stride = float(tiny_assign_expand_stride)
 
     def forward(self, outputs: Dict[str, Any], targets: Any) -> Dict[str, torch.Tensor]:
+        """Compute the full multi-branch detection loss for one batch."""
+
         return compute_loss(
             outputs=outputs,
             targets=targets,

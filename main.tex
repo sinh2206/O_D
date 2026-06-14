@@ -1,0 +1,697 @@
+\documentclass[12pt,a4paper]{article}
+
+\usepackage[utf8]{inputenc}
+\usepackage[T5]{fontenc}
+\usepackage[vietnamese]{babel}
+\usepackage{geometry}
+\usepackage{graphicx}
+\usepackage{float}
+\usepackage{longtable}
+\usepackage{booktabs}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{hyperref}
+\usepackage[table]{xcolor}
+\usepackage{caption}
+\usepackage{subcaption}
+\usepackage{indentfirst}
+\usepackage{fancyhdr}
+\usepackage{titlesec}
+\usepackage{array}
+\usepackage{enumitem}
+\usepackage{tabularx}
+\usepackage{tikz}
+\usepackage{url}
+
+\usetikzlibrary{arrows.meta, positioning, shapes.geometric, fit, calc}
+
+\geometry{
+    a4paper,
+    left=2.5cm,
+    right=2.2cm,
+    top=2.3cm,
+    bottom=2.3cm
+}
+
+\pagestyle{fancy}
+\fancyhf{}
+\fancyhead[L]{\footnotesize Báo cáo dự án phát hiện đối tượng}
+\fancyhead[R]{\footnotesize UET - VNU}
+\fancyfoot[C]{\thepage}
+\renewcommand{\headrulewidth}{0.4pt}
+\renewcommand{\footrulewidth}{0pt}
+
+\titleformat{\section}
+  {\normalfont\Large\bfseries}{\thesection}{1em}{}
+\titleformat{\subsection}
+  {\normalfont\large\bfseries}{\thesubsection}{1em}{}
+\titleformat{\subsubsection}
+  {\normalfont\normalsize\bfseries}{\thesubsubsection}{1em}{}
+
+\renewcommand{\contentsname}{MỤC LỤC}
+\renewcommand{\listfigurename}{DANH SÁCH HÌNH ẢNH}
+\renewcommand{\listtablename}{DANH SÁCH BẢNG}
+\renewcommand{\figurename}{Hình}
+\renewcommand{\tablename}{Bảng}
+
+\hypersetup{
+    colorlinks=true,
+    linkcolor=black,
+    citecolor=black,
+    urlcolor=blue
+}
+
+\newcolumntype{Y}{>{\raggedright\arraybackslash}X}
+\setlist[itemize]{leftmargin=1.8em}
+\setlength{\parskip}{0.35em}
+\setlength{\parindent}{1.2em}
+
+\newcommand{\studentname}{ĐINH VĂN SINH}
+\newcommand{\studentid}{22022615}
+\newcommand{\advisorname}{TS. Trần Quốc Long}
+\newcommand{\projecttitle}{Phát hiện đối tượng trong ảnh theo hướng Anchor-Free với ResNet34-FPN}
+
+\begin{document}
+
+\begin{titlepage}
+    \thispagestyle{empty}
+
+    \begin{tikzpicture}[overlay, remember picture]
+        \draw[line width=2.6pt]
+            ($(current page.north west) + (1.7cm,-1.4cm)$)
+            rectangle
+            ($(current page.south east) + (-1.7cm,1.4cm)$);
+        \draw[line width=0.8pt]
+            ($(current page.north west) + (1.9cm,-1.6cm)$)
+            rectangle
+            ($(current page.south east) + (-1.9cm,1.6cm)$);
+    \end{tikzpicture}
+
+    \centering
+    \textbf{\large ĐẠI HỌC QUỐC GIA HÀ NỘI}\\[0.15cm]
+    \textbf{\large TRƯỜNG ĐẠI HỌC CÔNG NGHỆ}\\[0.25cm]
+    \rule{7cm}{0.8pt}
+
+    \vspace{0.9cm}
+
+    \IfFileExists{logo_uet.png}
+    {\includegraphics[width=3.4cm]{logo_uet.png}}
+    {\fbox{\parbox[c][3cm][c]{3.5cm}{\centering LOGO UET}}}
+
+    \vspace{0.9cm}
+
+    {\Large \textbf{BÁO CÁO HỌC PHẦN}}\\[0.2cm]
+    {\Large \textbf{DỰ ÁN}}\\[0.35cm]
+    {\large Học phần: Xử lý và Phân tích hình ảnh}\\[1.0cm]
+
+    {\LARGE \textbf{\projecttitle}}\\[1.0cm]
+
+    \begin{tabular}{rl}
+        Giảng viên hướng dẫn: & \advisorname \\
+        Họ và tên sinh viên: & \studentname \\
+        Mã sinh viên: & \studentid \\
+    \end{tabular}
+
+    \vfill
+
+    {\large Hà Nội, tháng 06 năm 2026}
+\end{titlepage}
+
+\clearpage
+\thispagestyle{empty}
+\begin{center}
+    {\Large \textbf{Ý KIẾN ĐÁNH GIÁ}}\\[1.2cm]
+\end{center}
+
+\noindent Ý kiến đánh giá:\\[0.4cm]
+\rule{\textwidth}{0.4pt}\\[0.85cm]
+\rule{\textwidth}{0.4pt}\\[0.85cm]
+\rule{\textwidth}{0.4pt}\\[0.85cm]
+\rule{\textwidth}{0.4pt}\\[0.85cm]
+\rule{\textwidth}{0.4pt}\\[0.85cm]
+\rule{\textwidth}{0.4pt}\\[0.85cm]
+\rule{\textwidth}{0.4pt}\\[0.85cm]
+\rule{\textwidth}{0.4pt}\\[0.85cm]
+
+\vfill
+\begin{flushright}
+    Hà Nội, ngày \dotfill\ tháng \dotfill\ năm 20\dotfill\\[0.9cm]
+    Giảng viên đánh giá\\[1.8cm]
+    (Ký, ghi rõ họ tên)
+\end{flushright}
+
+\clearpage
+\setcounter{page}{3}
+\pagenumbering{arabic}
+
+\section*{LỜI CẢM ƠN}
+\addcontentsline{toc}{section}{LỜI CẢM ƠN}
+Em xin trân trọng cảm ơn \advisorname\ đã hướng dẫn, góp ý và định hướng cho em trong suốt quá trình thực hiện dự án của học phần Xử lý và Phân tích hình ảnh. Những trao đổi về cách đặt bài toán, cách tổ chức thí nghiệm và cách phân tích lỗi đã giúp em hiểu rõ hơn không chỉ về lập trình mô hình mà còn về tư duy nghiên cứu trong thị giác máy tính.
+
+Em cũng xin cảm ơn các thầy cô của Trường Đại học Công nghệ, Đại học Quốc gia Hà Nội đã trang bị nền tảng kiến thức về xử lý ảnh, học máy và lập trình, là cơ sở để em hoàn thành báo cáo này. Trong quá trình làm việc với mã nguồn, dữ liệu và các công cụ huấn luyện, em nhận ra rằng việc xây dựng một hệ thống phát hiện đối tượng hiệu quả đòi hỏi sự kết hợp chặt chẽ giữa lý thuyết, cài đặt và đánh giá định lượng.
+
+Do thời gian và kinh nghiệm còn hạn chế, báo cáo chắc chắn vẫn còn thiếu sót. Em rất mong nhận được các góp ý từ giảng viên để tiếp tục hoàn thiện dự án trong các lần phát triển tiếp theo.
+
+\clearpage
+\section*{TỔNG QUAN}
+\addcontentsline{toc}{section}{TỔNG QUAN}
+Báo cáo này trình bày dự án xây dựng một hệ thống phát hiện đối tượng trong ảnh với năm lớp \texttt{person}, \texttt{car}, \texttt{dog}, \texttt{cat}, \texttt{chair}. Toàn bộ hệ thống được triển khai bằng PyTorch theo hướng \textbf{anchor-free}, sử dụng \textbf{ResNet34} làm backbone, \textbf{Feature Pyramid Network (FPN)} ba mức để gom đặc trưng đa tỉ lệ, và ba nhánh dự đoán gồm \textbf{classification}, \textbf{box regression}, \textbf{centerness}. Dự án được tổ chức xung quanh bốn thành phần chính: \texttt{train.py}, \texttt{predict.py}, thư mục \texttt{utils/} và notebook \texttt{obj-detec.ipynb}.
+
+Điểm đáng chú ý của mã nguồn là hệ thống không chỉ nhắm đến phát hiện đối tượng trong điều kiện thuận lợi mà còn cố gắng xử lý các ca khó như vật thể nhỏ, vật thể bị che khuất, ảnh tối, và các trường hợp dễ nhầm lẫn giữa chó và mèo hoặc giữa ghế và người. Điều này thể hiện rõ qua các lựa chọn kỹ thuật trong phần huấn luyện như cân bằng mẫu, tăng cường dữ liệu mạnh, gán nhãn đa mức với cơ chế ưu tiên vật thể nhỏ, và trong phần suy luận như kết hợp centerness, soft-NMS, ngưỡng riêng theo lớp, suy luận tăng cường TTA cho ảnh không phát hiện được đối tượng, cũng như cơ chế sinh danh sách hardcase để phân tích lỗi.
+
+Khác với một báo cáo chỉ mô tả ý tưởng ở mức khái quát, tài liệu này bám trực tiếp vào mã nguồn hiện có. Mỗi phần nội dung đều được liên hệ với các tệp cụ thể trong dự án để làm rõ cách mô hình học từ dữ liệu, cách checkpoint \texttt{best.pth} lưu giữ trạng thái tri thức tốt nhất, cách \texttt{predict.py} vận dụng checkpoint đó để tạo dự đoán, và cách notebook \texttt{obj-detec.ipynb} đóng vai trò kịch bản thực thi hoàn chỉnh trên môi trường Kaggle.
+
+\clearpage
+\tableofcontents
+\clearpage
+\listoffigures
+\clearpage
+\listoftables
+\clearpage
+
+\section{GIỚI THIỆU}
+
+\subsection{Đặt vấn đề}
+Object detection là bài toán yêu cầu hệ thống trả lời đồng thời hai câu hỏi: đối tượng trong ảnh là gì và đối tượng nằm ở đâu. Khác với phân loại ảnh, đầu ra của object detection không chỉ là nhãn lớp mà còn gồm một hay nhiều hộp giới hạn (bounding box) dạng $(x_{\min}, y_{\min}, x_{\max}, y_{\max})$ kèm theo độ tin cậy.
+
+Trong dự án này, tập dữ liệu bao gồm các ảnh đời thực với năm lớp đối tượng: người, ô tô, chó, mèo và ghế. Đây là một bài toán khó ở nhiều khía cạnh. Thứ nhất, cùng một ảnh có thể chứa nhiều đối tượng với kích thước rất khác nhau. Thứ hai, các đối tượng như chó và mèo dễ bị nhầm lẫn khi góc nhìn xấu hoặc phần mặt bị khuất. Thứ ba, một số ảnh chỉ bộc lộ dấu hiệu cục bộ, ví dụ xe chỉ lộ bánh và gầm xe, mèo chỉ lộ tai và mảng lông, hay ghế nằm lẫn trong vùng của người. Vì vậy, mô hình cần học tốt cả đặc trưng toàn cục lẫn đặc trưng địa phương.
+
+\subsection{Mục tiêu dự án}
+Mục tiêu của dự án là xây dựng một pipeline có thể huấn luyện, suy luận và đánh giá một mô hình phát hiện đối tượng hoàn chỉnh trên bộ dữ liệu cung cấp. Cụ thể, hệ thống cần thỏa mãn các yêu cầu sau:
+\begin{itemize}
+    \item đọc đúng định dạng annotation từ \texttt{public/annotations/train.json} và \texttt{public/annotations/val.json};
+    \item huấn luyện được mô hình anchor-free với đặc trưng đa tỉ lệ;
+    \item sinh checkpoint tốt nhất để tái sử dụng trong suy luận;
+    \item dự đoán trên toàn bộ tập validation và xuất kết quả JSON đúng chuẩn;
+    \item hỗ trợ phân tích lỗi thông qua hardcase và ảnh minh họa khi cần.
+\end{itemize}
+
+\subsection{Câu hỏi nghiên cứu}
+Bám theo cấu trúc của mẫu báo cáo, dự án này tập trung trả lời ba câu hỏi kỹ thuật chính:
+\begin{enumerate}
+    \item Làm thế nào để thiết kế một mô hình anchor-free đủ gọn để huấn luyện thực tế, nhưng vẫn giữ được khả năng nhận biết các chi tiết đặc trưng của năm lớp đối tượng?
+    \item Những chiến lược nào trong \texttt{train.py} và \texttt{utils/loss.py} giúp mô hình không bỏ sót vật thể nhỏ hoặc vật thể bị che khuất một phần?
+    \item Sau khi mô hình học xong, \texttt{predict.py} cần hậu xử lý ra sao để giảm false positive, giữ lại các dự đoán khó và sinh dữ liệu phục vụ phân tích lỗi?
+\end{enumerate}
+
+\section{CƠ SỞ LÝ THUYẾT}
+
+\subsection{Bài toán phát hiện đối tượng}
+Một mô hình object detection thường bao gồm hai phần: trích xuất đặc trưng ảnh và dự đoán hộp giới hạn. Với ảnh đầu vào $\mathbf{I}$, hệ thống cần sinh ra tập dự đoán:
+\[
+\mathcal{D} = \{(b_i, c_i, s_i)\}_{i=1}^{N},
+\]
+trong đó $b_i$ là bounding box, $c_i$ là lớp và $s_i \in [0,1]$ là độ tin cậy. Chất lượng của hệ thống thường được đánh giá bằng IoU (Intersection over Union), precision, recall và mAP. Trong notebook của dự án, việc chấm điểm bên ngoài được thực hiện bởi \texttt{public/tools/evaluate\_predictions.py}.
+
+\subsection{Hướng tiếp cận anchor-free}
+Khác với các mô hình anchor-based phải định nghĩa sẵn hàng loạt anchor box với nhiều tỉ lệ và tỉ số khung hình, hướng anchor-free xem mỗi điểm trên feature map như một vị trí ứng viên. Tại mỗi vị trí, mô hình học trực tiếp khoảng cách đến bốn biên của hộp mục tiêu theo dạng $(t,l,b,r)$. Cách tiếp cận này làm giảm độ phức tạp thiết kế, tránh phụ thuộc nặng vào anchor engineering, và phù hợp với bài toán có nhiều vật thể kích thước đa dạng.
+
+Trong dự án hiện tại, \texttt{utils/loss.py} xây dựng các điểm tâm lưới cho từng mức FPN bằng công thức:
+\[
+x = (j + 0.5)\cdot \text{stride}, \qquad y = (i + 0.5)\cdot \text{stride}.
+\]
+Nếu một điểm nằm trong hộp đối tượng và thỏa các ràng buộc gán nhãn theo mức, điểm đó sẽ trở thành positive sample cho lớp tương ứng.
+
+\subsection{Backbone ResNet34 và FPN}
+ResNet34 là mạng tích chập sâu dùng kết nối tắt residual để giảm khó khăn tối ưu khi tăng độ sâu mạng. Trong \texttt{utils/model.py}, backbone được lấy từ \texttt{torchvision.models.resnet34} với trọng số pretrained ImageNet khi có thể. Sau stem và các residual stage, hệ thống lấy ba mức đặc trưng:
+\begin{itemize}
+    \item \textbf{C2} ở stride 8, 128 kênh;
+    \item \textbf{C3} ở stride 16, 256 kênh;
+    \item \textbf{C4} ở stride 32, 512 kênh.
+\end{itemize}
+
+Ba mức này được đưa qua các lateral convolution $1\times1$ rồi hợp nhất bằng kiến trúc FPN theo hướng top-down. Mục đích của FPN là để bản đồ stride nhỏ giữ được chi tiết không gian, còn bản đồ stride lớn giữ được ngữ nghĩa cao. Đây là một lựa chọn quan trọng cho các lớp như \texttt{cat} hay \texttt{dog}, nơi đặc trưng phân biệt đôi khi chỉ là tai, đầu, lưng hoặc mảng lông nhỏ.
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+    node distance=0.85cm and 0.55cm,
+    feat/.style={draw, rounded corners, align=center, minimum width=2.4cm, minimum height=0.95cm, fill=blue!7},
+    proc/.style={draw, rounded corners, align=center, minimum width=2.4cm, minimum height=0.95cm, fill=green!8},
+    head/.style={draw, rounded corners, align=center, minimum width=2.3cm, minimum height=0.95cm, fill=orange!10},
+    arrow/.style={-{Latex[length=3mm]}, thick}
+]
+\node[proc] (img) {Ảnh RGB\\$640\times640$};
+\node[feat, below=of img] (stem) {Stem + Layer1};
+\node[feat, below left=of stem] (c2) {C2\\stride 8};
+\node[feat, below=of stem] (c3) {C3\\stride 16};
+\node[feat, below right=of stem] (c4) {C4\\stride 32};
+\node[feat, below=1.2cm of c3] (fpn) {FPN top-down + lateral};
+\node[head, below left=of fpn] (p2) {P2\\cls/reg/ctr};
+\node[head, below=of fpn] (p3) {P3\\cls/reg/ctr};
+\node[head, below right=of fpn] (p4) {P4\\cls/reg/ctr};
+\node[proc, below=1.2cm of p3] (out) {Loss khi train\\Decode + NMS khi predict};
+
+\draw[arrow] (img) -- (stem);
+\draw[arrow] (stem) -- (c2);
+\draw[arrow] (stem) -- (c3);
+\draw[arrow] (stem) -- (c4);
+\draw[arrow] (c2) -- (fpn);
+\draw[arrow] (c3) -- (fpn);
+\draw[arrow] (c4) -- (fpn);
+\draw[arrow] (fpn) -- (p2);
+\draw[arrow] (fpn) -- (p3);
+\draw[arrow] (fpn) -- (p4);
+\draw[arrow] (p2) -- (out);
+\draw[arrow] (p3) -- (out);
+\draw[arrow] (p4) -- (out);
+\end{tikzpicture}
+\caption{Kiến trúc tổng quát của mô hình trong \texttt{utils/model.py}}
+\label{fig:model-arch}
+\end{figure}
+
+\subsection{Hàm mất mát}
+Trong \texttt{utils/loss.py}, tổng loss của hệ thống được viết dưới dạng:
+\[
+L = \lambda_{\text{cls}} L_{\text{cls}} + \lambda_{\text{reg}} L_{\text{reg}} + \lambda_{\text{ctr}} L_{\text{ctr}}.
+\]
+Các hệ số mặc định từ \texttt{utils/config.py} là:
+\[
+\lambda_{\text{cls}} = 1.35,\quad \lambda_{\text{reg}} = 1.50,\quad \lambda_{\text{ctr}} = 0.40.
+\]
+
+\subsubsection{Focal loss cho phân lớp}
+Do số lượng negative location trên feature map lớn hơn rất nhiều so với positive location, dự án dùng sigmoid focal loss để giảm tác động của những negative dễ:
+\[
+L_{\text{cls}} = -\alpha_t (1-p_t)^{\gamma}\log(p_t).
+\]
+Trong cấu hình hiện tại, \texttt{FOCAL\_ALPHA = 0.30}, \texttt{FOCAL\_GAMMA = 2.0}. Ngoài ra loss còn kết hợp \texttt{class\_weights} và \texttt{label smoothing} để giảm thiên lệch về lớp \texttt{person}, vốn xuất hiện nhiều nhất trong dữ liệu.
+
+\subsubsection{CIoU loss cho hồi quy hộp}
+Phần hồi quy hộp sử dụng Complete IoU loss trong hàm \texttt{ciou\_loss()}. So với L1 loss đơn giản, CIoU không chỉ quan tâm đến phần giao nhau mà còn xét khoảng cách tâm và tỉ lệ khung hình. Điều này giúp hộp dự đoán hội tụ ổn định hơn ở các ảnh mà vật thể bị che khuất hoặc chỉ lộ một phần.
+
+\subsubsection{Centerness}
+Mỗi điểm positive còn được gán một mục tiêu centerness:
+\[
+\text{ctr} = \sqrt{
+\frac{\min(l,r)}{\max(l,r)}
+\cdot
+\frac{\min(t,b)}{\max(t,b)}
+}.
+\]
+Điểm càng gần tâm hình học của đối tượng thì centerness càng cao. Khi suy luận, \texttt{predict.py} kết hợp xác suất lớp với centerness theo kiểu \texttt{sqrt}, nhờ đó giảm bớt các hộp nằm ở rìa đối tượng.
+
+\subsection{Gán nhãn đa mức và xử lý vật thể nhỏ}
+Một chi tiết rất quan trọng của dự án nằm ở cơ chế target assignment trong \texttt{utils/loss.py}. Mỗi mức FPN chỉ ưu tiên một khoảng kích thước đối tượng nhất định, nhưng các khoảng được cho chồng lấn có chủ đích để tránh mất đối tượng ở ranh giới giữa các mức. Với các stride hiện tại, dải kích thước danh nghĩa là như Bảng \ref{tab:fpn-ranges}.
+
+\begin{table}[H]
+\centering
+\caption{Dải kích thước danh nghĩa cho từng mức FPN trong hàm \texttt{\_default\_scale\_ranges}}
+\label{tab:fpn-ranges}
+\begin{tabular}{ccc}
+\toprule
+Mức đặc trưng & Stride & Dải $\max(l,t,r,b)$ theo pixel \\
+\midrule
+P2 & 8 & $[0, 64)$ \\
+P3 & 16 & $[20, 128)$ \\
+P4 & 32 & $[40, +\infty)$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Để không bỏ sót vật thể rất nhỏ, mã nguồn còn có \texttt{tiny object fallback}. Nếu một ground truth quá nhỏ không có điểm positive nào ở một mức, thuật toán sẽ cưỡng bức chọn điểm gần tâm nhất trong vùng mở rộng quanh hộp. Đây là cơ chế đặc biệt hữu ích cho các ca như mèo ẩn trong cỏ hoặc xe ở xa chỉ lộ vài chi tiết.
+
+\subsection{Hậu xử lý và NMS}
+Sau khi mô hình dự đoán xong, \texttt{utils/nms.py} thực hiện quy trình giải mã đa mức, lọc theo độ tin cậy, NMS theo lớp và đưa hộp từ không gian letterbox về kích thước ảnh gốc. Dự án dùng \textbf{soft-NMS} theo lớp, sau đó còn có thêm:
+\begin{itemize}
+    \item lọc hộp quá nhỏ bằng \texttt{MIN\_BOX\_SIZE};
+    \item ưu tiên hộp lớn hơn khi hai hộp cùng lớp bao hàm nhau và độ tin cậy gần nhau;
+    \item scale điểm số theo lớp bằng \texttt{CLASS\_SCORE\_SCALES};
+    \item ngưỡng confidence riêng cho từng lớp trong \texttt{predict.py};
+    \item luật loại bỏ \texttt{chair} nếu nó nằm gần như hoàn toàn trong vùng \texttt{person} và diện tích quá nhỏ.
+\end{itemize}
+
+\section{THIẾT KẾ VÀ TRIỂN KHAI HỆ THỐNG}
+
+\subsection{Cấu trúc dữ liệu}
+Hai tệp annotation \texttt{train.json} và \texttt{val.json} cùng dùng một cấu trúc thống nhất gồm ba thành phần: danh sách lớp, danh sách ảnh và danh sách annotation. Hàm \texttt{parse\_samples()} trong \texttt{train.py} chuyển dữ liệu này thành danh sách \texttt{Sample} với các trường \texttt{image\_id}, \texttt{image\_path}, \texttt{width}, \texttt{height}, \texttt{boxes}, \texttt{labels}.
+
+\begin{table}[H]
+\centering
+\caption{Quy mô bộ dữ liệu theo annotation JSON}
+\label{tab:dataset-overview}
+\begin{tabular}{lcc}
+\toprule
+Tập dữ liệu & Số ảnh & Số bounding box \\
+\midrule
+Train & 7500 & 10642 \\
+Validation & 1500 & 2021 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[H]
+\centering
+\caption{Phân bố số lượng đối tượng theo lớp}
+\label{tab:class-counts}
+\begin{tabular}{lrrrr}
+\toprule
+Lớp & Train & Tỉ lệ train & Validation & Tỉ lệ validation \\
+\midrule
+\texttt{person} & 5829 & 54.77\% & 1074 & 53.14\% \\
+\texttt{car} & 1339 & 12.58\% & 283 & 14.00\% \\
+\texttt{dog} & 1028 & 9.66\% & 206 & 10.19\% \\
+\texttt{cat} & 833 & 7.83\% & 176 & 8.71\% \\
+\texttt{chair} & 1613 & 15.16\% & 282 & 13.95\% \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Bảng \ref{tab:class-counts} cho thấy dữ liệu bị lệch lớp khá rõ: \texttt{person} chiếm hơn một nửa số annotation, trong khi \texttt{cat} và \texttt{dog} ít hơn nhiều. Vì vậy, nếu chỉ tối ưu theo tần suất tự nhiên, mô hình rất dễ nghiêng về phát hiện người tốt nhưng bỏ sót mèo, chó hoặc xe.
+
+\begin{table}[H]
+\centering
+\caption{Thống kê kích thước hộp đối tượng theo tỉ lệ diện tích ảnh}
+\label{tab:size-stats}
+\begin{tabular}{lccc}
+\toprule
+Tập dữ liệu & Trung vị diện tích/ảnh & Phân vị 10\% & Tỉ lệ hộp $< 0.012$ diện tích ảnh \\
+\midrule
+Train & 0.1117 & 0.0091 & 13.18\% \\
+Validation & 0.1197 & 0.0087 & 14.05\% \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Theo Bảng \ref{tab:size-stats}, khoảng 13--14\% số hộp là vật thể nhỏ hơn ngưỡng \texttt{SMALL\_OBJECT\_AREA\_RATIO = 0.012}. Đây là lý do dự án phải tăng cường cả ở loss, sampling và hậu xử lý để tránh bỏ sót đối tượng nhỏ.
+
+\subsection{Vai trò của từng tệp chính}
+\begin{table}[H]
+\centering
+\caption{Các thành phần mã nguồn chính của dự án}
+\label{tab:file-roles}
+\begin{tabularx}{\textwidth}{>{\raggedright\arraybackslash}p{3.2cm}Y}
+\toprule
+Tệp / thư mục & Vai trò \\
+\midrule
+\texttt{train.py} & Đọc annotation, tạo DataLoader, augment ảnh, xây mô hình, tối ưu loss và lưu checkpoint \texttt{best.pth}/\texttt{last.pth}. \\
+\texttt{predict.py} & Tải checkpoint, chạy suy luận trên tập validation, hậu xử lý, xuất JSON và sinh \texttt{hardcase\_summary.json}. \\
+\texttt{utils/config.py} & Trung tâm cấu hình: lớp, stride, ngưỡng confidence, các hệ số loss, tham số low-light, tham số object nhỏ. \\
+\texttt{utils/model.py} & Kiến trúc ResNet34 + FPN ba mức + ba đầu dự đoán classification, regression, centerness. \\
+\texttt{utils/loss.py} & Focal loss, CIoU loss, BCE centerness, target assignment đa mức, center sampling và fallback cho vật thể rất nhỏ. \\
+\texttt{utils/nms.py} & Giải mã đa mức, remap hộp về ảnh gốc, soft-NMS và loại bỏ các hộp không hợp lệ. \\
+\texttt{utils/runtime.py} & Hỗ trợ chọn device, worker, pin memory, GradScaler và checkpoint tiện ích. \\
+\texttt{utils/process.py} & Công cụ trực quan hóa pipeline tăng cường dữ liệu để xem mô hình được cho học trên ảnh biến đổi như thế nào. \\
+\texttt{utils/forecast.py} & Mô-đun đầu dự đoán đa tỉ lệ cho mục đích thử nghiệm hoặc mở rộng, không phải đường chạy chính của notebook. \\
+\texttt{utils/image\_ops.py} & Hàm hỗ trợ tăng sáng ảnh tối ở mức tiện ích; trong đường chạy chính, logic tương đương được viết trực tiếp trong \texttt{train.py} và \texttt{predict.py}. \\
+\texttt{obj-detec.ipynb} & Kịch bản thực thi toàn bộ quy trình train, predict, evaluate, phân tích lỗi và đóng gói nộp bài trên Kaggle. \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\subsection{Workflow tổng thể}
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+    node distance=0.9cm and 0.55cm,
+    block/.style={draw, rounded corners, align=center, minimum width=2.7cm, minimum height=1.0cm, fill=blue!6},
+    data/.style={draw, rounded corners, align=center, minimum width=2.7cm, minimum height=1.0cm, fill=green!8},
+    arrow/.style={-{Latex[length=3mm]}, thick}
+]
+\node[data] (ann) {train.json\\val.json};
+\node[data, right=of ann] (images) {Ảnh train/val};
+\node[block, below=of ann] (train) {\texttt{train.py}\\đọc dữ liệu, augment,\\huấn luyện};
+\node[data, below=of train] (ckpt) {\texttt{models/best.pth}};
+\node[block, right=of ckpt] (predict) {\texttt{predict.py}\\suy luận + hậu xử lý};
+\node[data, right=of predict] (jsonout) {\texttt{val\_predictions.json}};
+\node[block, below=of predict] (eval) {\texttt{evaluate\_predictions.py}\\chấm mAP/điểm};
+\node[block, left=of eval] (hardcase) {\texttt{hardcase\_summary.json}\\và ảnh lỗi};
+
+\draw[arrow] (ann) -- (train);
+\draw[arrow] (images) -- (train);
+\draw[arrow] (train) -- (ckpt);
+\draw[arrow] (ckpt) -- (predict);
+\draw[arrow] (images) |- (predict);
+\draw[arrow] (predict) -- (jsonout);
+\draw[arrow] (jsonout) -- (eval);
+\draw[arrow] (jsonout) -- (hardcase);
+\draw[arrow] (ann) |- (eval);
+\draw[arrow] (ann) |- (hardcase);
+\end{tikzpicture}
+\caption{Workflow tổng thể của dự án}
+\label{fig:workflow}
+\end{figure}
+
+\subsection{Cách \texttt{train.py} tổ chức việc học}
+
+\subsubsection{Tạo trọng số lớp và trọng số mẫu}
+Để đối phó mất cân bằng dữ liệu, \texttt{compute\_class\_weights()} trong \texttt{train.py} tính tần suất lớp từ train/validation, sau đó suy ra trọng số theo inverse-frequency đã làm mềm bằng căn bậc hai và nhân thêm hệ số nhấn lớp từ \texttt{CLASS\_LOSS\_WEIGHTS}. Việc clip trọng số trong khoảng $[0.45, 2.20]$ giúp tăng lớp hiếm nhưng không làm loss nổ quá mạnh.
+
+Tiếp theo, \texttt{build\_sample\_weights()} tính trọng số cho từng ảnh để cấp cho \texttt{WeightedRandomSampler}. Trọng số ảnh phụ thuộc vào:
+\begin{itemize}
+    \item trung bình trọng số các lớp xuất hiện trong ảnh;
+    \item \textbf{crowd bonus} khi ảnh có nhiều đối tượng;
+    \item \textbf{small bonus} khi ảnh chứa các hộp có diện tích tương đối nhỏ.
+\end{itemize}
+
+Điều này cho phép các ảnh khó, đông vật thể hoặc có vật thể nhỏ xuất hiện thường xuyên hơn trong quá trình huấn luyện.
+
+\subsubsection{Tăng cường dữ liệu}
+Phần tăng cường dữ liệu trong \texttt{get\_train\_transforms()} khá phong phú. Từ góc nhìn học máy, đây là cách buộc mô hình không ghi nhớ một dáng vẻ duy nhất của đối tượng mà phải nhận biết bản chất ổn định của nó. Các nhóm augment chính gồm:
+\begin{itemize}
+    \item chuẩn hóa kích thước: \texttt{RandomSizedBBoxSafeCrop}, \texttt{LongestMaxSize}, \texttt{PadIfNeeded};
+    \item thay đổi hình học: horizontal flip, vertical flip nhẹ, rotate $90^\circ$, affine;
+    \item làm biến thiên chất lượng ảnh: CLAHE, sharpen, blur, motion blur, downscale;
+    \item thay đổi màu và độ sáng: \texttt{ColorJitter}, \texttt{RandomGamma}, posterize/solarize/equalize;
+    \item giả lập che khuất: \texttt{CoarseDropout}.
+\end{itemize}
+
+Nếu quy chiếu về trực giác, mô hình không được dạy rằng ``ô tô phải luôn nhìn thấy toàn thân'' hay ``mèo phải luôn lộ mặt''. Thay vào đó, các phép biến đổi làm cho mô hình buộc phải tìm những tín hiệu bền vững hơn như bánh xe, thân xe, tai mèo, hình dạng lưng, tỉ lệ thân, hoặc rìa hộp phù hợp với từng lớp.
+
+\subsubsection{Dataset và DataLoader}
+\texttt{DetectionDataset} đọc ảnh bằng OpenCV thông qua \texttt{imread\_unicode()}, áp dụng tăng sáng có điều kiện cho ảnh tối bằng CLAHE + gamma correction, chuyển sang RGB rồi đưa qua Albumentations. Hàm \texttt{collate\_fn()} trả về batch ảnh dạng tensor và danh sách target biến thiên theo số lượng hộp trong mỗi ảnh.
+
+Ở mức hệ thống, \texttt{train.py} còn bật:
+\begin{itemize}
+    \item \texttt{torch.backends.cudnn.benchmark = True};
+    \item \texttt{TF32} cho CUDA;
+    \item \texttt{channels\_last} để tối ưu truy cập bộ nhớ;
+    \item \texttt{autocast} và \texttt{GradScaler} cho mixed precision.
+\end{itemize}
+Đây là các chi tiết kỹ thuật giúp đẩy nhanh huấn luyện trên GPU mà không phải thay đổi bản chất mô hình.
+
+\subsubsection{Tối ưu và chọn checkpoint}
+Mô hình được tối ưu bằng \texttt{AdamW}. Backbone và các head có learning rate tách riêng:
+\[
+\texttt{lr\_backbone} = 2\times 10^{-4}, \qquad \texttt{lr\_head} = 2\times 10^{-3}.
+\]
+Điều này phản ánh một chiến lược phổ biến: giữ nhịp học chậm hơn cho backbone pretrained và cho phép head học nhanh hơn theo bài toán mới.
+
+Sau mỗi epoch, \texttt{train.py} tính \texttt{train\_loss} và \texttt{val\_loss}. Checkpoint tốt nhất \texttt{models/best.pth} được lưu khi \texttt{val\_loss} giảm. Song song với đó, \texttt{models/last.pth} luôn giữ trạng thái epoch gần nhất để tiện resume.
+
+\subsection{Mô hình học đặc trưng như thế nào}
+Điểm quan trọng cần nhấn mạnh là mô hình không hề được viết tay quy tắc nhận dạng từng lớp. Không có đoạn mã nào nói trực tiếp rằng xe phải có bốn bánh hay mèo phải có hai tai. Những đặc trưng đó được học ngầm qua quá trình tối ưu gradient:
+\begin{itemize}
+    \item các convolution tầng thấp học rìa, góc, texture và màu cục bộ;
+    \item các tầng sâu hơn tổ hợp chúng thành bộ phận như bánh xe, cửa xe, tai, đầu, chân, lưng, mặt ghế;
+    \item FPN duy trì các đặc trưng này ở nhiều độ phân giải khác nhau;
+    \item focal loss nhấn mạnh các vị trí positive khó;
+    \item centerness và CIoU khiến hộp phải vừa đúng lớp vừa đúng hình học.
+\end{itemize}
+
+Với các hardcase thường gặp, ý nghĩa của thiết kế này có thể diễn giải như sau:
+\begin{table}[H]
+\centering
+\caption{Một số nhóm hardcase và cơ chế kỹ thuật dùng để đối phó}
+\label{tab:hardcases}
+\begin{tabularx}{\textwidth}{>{\raggedright\arraybackslash}p{3.0cm}Y Y}
+\toprule
+Nhóm lỗi điển hình & Dấu hiệu mô hình cần học & Thành phần mã nguồn hỗ trợ \\
+\midrule
+Xe chỉ lộ chi tiết cục bộ & Bánh xe, gầm xe, khối thân xe, cạnh ngang dọc cứng & FPN đa mức, augment crop/blur/downscale, soft-NMS ưu tiên hộp lớn hơn khi bao hàm nhau \\
+\texttt{cat} nhìn rõ tai và lông & Texture lông, hình tam giác của tai, độ tròn vùng đầu & tăng cường màu, sharpen/CLAHE, ngưỡng lớp \texttt{cat} thấp hơn để tăng recall \\
+\texttt{dog} bị nhầm thành \texttt{cat} khi không rõ mặt & Lưng, cổ, chân, tỉ lệ đầu-thân thay vì chỉ dựa vào mặt & class weights cho lớp hiếm, target assignment mềm cho vật thể khó, augment góc nhìn \\
+Mèo bị che trong cỏ hoặc sau vật khác & Một phần tai, mắt, rìa thân còn lộ & coarse dropout, center sampling, tiny-object fallback, small-object bonus trong sampler \\
+Ghế lẫn trong người & Hộp ghế nhỏ nằm trọn trong vùng người & luật \texttt{suppress\_chair\_inside\_person()} trong \texttt{predict.py} \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\subsection{Ý nghĩa của checkpoint \texttt{best.pth}}
+Trong học máy, checkpoint là nơi lưu lại trạng thái tri thức của mô hình sau một giai đoạn học. Tệp \texttt{best.pth} không chứa dữ liệu thô của ảnh, mà chứa các tham số số học đã được tối ưu từ dữ liệu. Theo hàm \texttt{save\_checkpoint()} trong \texttt{train.py}, checkpoint tốt nhất bao gồm các khóa như Bảng \ref{tab:checkpoint}.
+
+\begin{table}[H]
+\centering
+\caption{Thông tin được lưu trong \texttt{models/best.pth}}
+\label{tab:checkpoint}
+\begin{tabularx}{\textwidth}{>{\raggedright\arraybackslash}p{3.3cm}Y}
+\toprule
+Khóa & Ý nghĩa \\
+\midrule
+\texttt{model\_state\_dict} & Toàn bộ trọng số đã học của backbone, FPN và ba head dự đoán. \\
+\texttt{optimizer\_state\_dict} & Trạng thái bộ tối ưu AdamW để có thể tiếp tục train. \\
+\texttt{scheduler\_state\_dict} & Trạng thái lịch learning rate. \\
+\texttt{epoch} & Epoch tại thời điểm checkpoint được lưu. \\
+\texttt{best\_val\_loss} & Giá trị \texttt{val\_loss} tốt nhất đạt được đến thời điểm đó. \\
+\texttt{classes} & Thứ tự lớp để \texttt{predict.py} giải mã đúng chỉ số lớp. \\
+\texttt{img\_size} & Kích thước ảnh dùng trong huấn luyện. \\
+\texttt{strides} & Các stride của đặc trưng đa mức. \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+Nói cách khác, \texttt{best.pth} chính là bản ghi nhớ nén của quá trình học: từ hàng nghìn ảnh và hơn mười nghìn bounding box, mô hình đã biến tri thức đó thành khoảng 23.6 triệu tham số có thể tái sử dụng ngay cho suy luận.
+
+\subsection{Cách \texttt{predict.py} làm bài}
+Sau khi tải checkpoint qua \texttt{load\_checkpoint\_model()}, \texttt{predict.py} đi theo pipeline sau:
+\begin{enumerate}
+    \item đọc từng ảnh validation;
+    \item tăng sáng ảnh tối nếu cần;
+    \item letterbox ảnh về kích thước chuẩn và chuẩn hóa theo \texttt{MEAN}/\texttt{STD};
+    \item chạy mô hình để nhận \texttt{cls\_logits}, \texttt{reg\_preds}, \texttt{center\_logits};
+    \item gọi \texttt{postprocess\_batch()} từ \texttt{utils/nms.py} để giải mã hộp;
+    \item áp dụng ngưỡng riêng cho từng lớp;
+    \item loại ghế khả nghi nằm trong người;
+    \item chuẩn hóa kết quả sang số nguyên và ghi ra JSON.
+\end{enumerate}
+
+Nếu một ảnh không phát hiện được đối tượng nào, hệ thống còn có \texttt{TTA fallback}. Khi đó ảnh gốc, ảnh lật ngang và ảnh quay $180^\circ$ sẽ được suy luận riêng, sau đó hợp nhất bằng cụm IoU trong \texttt{\_merge\_tta\_boxes()}. Cơ chế này được thiết kế để ``cứu'' các ca khó mà mô hình bỏ sót hoàn toàn ở một lần chạy duy nhất.
+
+\subsection{Phân tích lỗi bằng hardcase}
+Điểm hay của dự án là \texttt{predict.py} không dừng ở việc sinh đáp án, mà còn chuẩn bị dữ liệu để mô hình ``học từ lỗi sai'' trong vòng lặp tiếp theo. Hàm \texttt{export\_hardcase\_summary()} tính điểm lỗi theo từng ảnh dựa trên:
+\begin{itemize}
+    \item false negative bị phạt mạnh nhất;
+    \item false positive bị phạt thấp hơn;
+    \item các hộp đúng lớp nhưng khớp hình học chưa tốt bị cộng thêm \texttt{loc\_penalty}.
+\end{itemize}
+
+Những ảnh có điểm lỗi cao nhất sẽ được ghi vào \texttt{results/hardcase\_summary.json}. Nếu kết hợp với phần vẽ của \texttt{draw\_hardcase()}, người làm mô hình có thể nhìn lại ngay xem mô hình đã:
+\begin{itemize}
+    \item bỏ sót lớp nào;
+    \item nhầm lớp nào với lớp nào;
+    \item khoanh thiếu, khoanh thừa hay khoanh lệch ra sao.
+\end{itemize}
+Chính từ vòng lặp phân tích hardcase này mà các điều chỉnh ở class weights, sampler, tiny fallback, ngưỡng riêng theo lớp và TTA fallback trở nên có ý nghĩa thực tế.
+
+\section{THỰC NGHIỆM}
+
+\subsection{Notebook thực thi trên Kaggle}
+Notebook \texttt{obj-detec.ipynb} gồm tám ô lệnh, đóng vai trò như một kịch bản vận hành toàn bộ dự án trên môi trường Kaggle. Nội dung của từng ô được tóm tắt trong Bảng \ref{tab:notebook}.
+
+\begin{table}[H]
+\centering
+\caption{Các bước trong notebook \texttt{obj-detec.ipynb}}
+\label{tab:notebook}
+\begin{tabular}{cl}
+\toprule
+Ô lệnh & Nội dung thực hiện \\
+\midrule
+1 & Clone hoặc cập nhật repository từ GitHub \\
+2 & Kiểm tra thư mục làm việc \\
+3 & Cài đặt phụ thuộc từ \texttt{requirements.txt} \\
+4 & Chạy \texttt{train.py} trên train/validation \\
+5 & Chạy \texttt{predict.py} để sinh \texttt{val\_predictions.json} \\
+6 & Chấm điểm bằng \texttt{evaluate\_predictions.py} \\
+7 & Chạy \texttt{img\_error.py} để trực quan lỗi \\
+8 & Nén project để nộp bài \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Với cách tổ chức này, notebook không thay thế các script chính mà đóng vai trò orchestration layer. Điều đó giúp dự án rõ ràng: logic lõi nằm trong mã Python chuẩn, còn notebook chỉ là giao diện để thực nghiệm và nộp bài.
+
+\subsection{Cấu hình huấn luyện mặc định}
+Theo mã nguồn hiện tại, cấu hình mặc định cho đường chạy cơ sở gồm:
+\begin{itemize}
+    \item kích thước ảnh \texttt{IMG\_SIZE = 640};
+    \item ba mức đặc trưng với stride \texttt{[8,16,32]};
+    \item số kênh FPN là \texttt{128};
+    \item \texttt{batch\_size = 8};
+    \item \texttt{epochs = 30};
+    \item \texttt{lr\_backbone = 2e-4}, \texttt{lr\_head = 2e-3};
+    \item \texttt{weight\_decay = 1e-4};
+    \item mixed precision được bật nếu có CUDA;
+    \item chọn checkpoint tốt nhất theo \texttt{val\_loss}.
+\end{itemize}
+
+Khi khởi tạo mô hình \texttt{AnchorFreeDetector(num\_classes=5, pretrained=False)} từ \texttt{utils/model.py}, số tham số học được xấp xỉ \textbf{23{,}619{,}294}. Đây là một quy mô vừa phải đối với bài toán năm lớp, đủ để học đặc trưng phong phú nhưng vẫn phù hợp với huấn luyện trên GPU phổ thông như T4.
+
+\subsection{Đánh giá định lượng và định tính}
+Điểm cần lưu ý là \texttt{train.py} tự thân chỉ theo dõi \texttt{train\_loss} và \texttt{val\_loss}. Đây là thước đo tối ưu hóa nội bộ, chưa phải điểm số cuối cùng của bài toán phát hiện đối tượng. Việc chấm mAP hoặc điểm submission được thực hiện sau đó bởi script ngoài trong notebook. Trong bản sao mã nguồn hiện tại, repository chưa kèm sẵn tệp \texttt{val\_score.json}, vì vậy báo cáo này không công bố một con số mAP cố định mà tập trung vào khả năng tái hiện pipeline và phân tích thiết kế kỹ thuật.
+
+Tuy nhiên, ngay cả khi chưa có số mAP được đóng gói sẵn, ta vẫn có thể đánh giá chất lượng hệ thống ở hai mức:
+\begin{itemize}
+    \item \textbf{định lượng nội bộ}: \texttt{val\_loss}, \texttt{best\_val\_loss} lưu trong checkpoint;
+    \item \textbf{định tính}: khả năng tìm lại vật thể nhỏ, xử lý ca che khuất và giảm lỗi nhầm lớp qua ảnh hardcase.
+\end{itemize}
+
+\subsection{Những điểm mạnh rút ra từ mã nguồn}
+Từ việc đọc trực tiếp các file \texttt{train.py}, \texttt{predict.py} và \texttt{utils/}, có thể rút ra một số điểm mạnh của dự án:
+\begin{itemize}
+    \item mô hình có thiết kế rõ ràng, thống nhất giữa train và predict;
+    \item target assignment được viết cẩn thận, có cả cơ chế fallback cho vật thể rất nhỏ;
+    \item hậu xử lý khá giàu kinh nghiệm thực chiến, đặc biệt là soft-NMS, luật loại bỏ ghế trong người và TTA fallback;
+    \item pipeline hardcase giúp tạo vòng lặp cải tiến thay vì chỉ nhìn điểm số cuối;
+    \item notebook thực thi đầy đủ từ train đến nộp bài, thuận tiện cho môi trường thi hoặc Kaggle.
+\end{itemize}
+
+\subsection{Hạn chế hiện tại}
+Bên cạnh các điểm mạnh, dự án hiện tại vẫn còn một số hạn chế kỹ thuật:
+\begin{itemize}
+    \item tiêu chí chọn checkpoint trong \texttt{train.py} là \texttt{val\_loss}, chưa trực tiếp là mAP;
+    \item \texttt{predict.py} có nhiều luật heuristic, hiệu quả thực tế tốt nhưng cần tinh chỉnh thủ công nếu đổi bộ dữ liệu;
+    \item logic tăng sáng ảnh tối đang được viết lặp lại trong cả \texttt{train.py} và \texttt{predict.py};
+    \item một số mô-đun phụ như \texttt{forecast.py} và \texttt{image\_ops.py} chưa được tích hợp đầy đủ vào đường chạy chính.
+\end{itemize}
+
+Các hạn chế này không làm dự án mất giá trị, nhưng chỉ ra rằng đây vẫn là một hệ thống đang trong quá trình hoàn thiện, đặc biệt nếu mục tiêu sau này là tối ưu hóa điểm số cuối cùng hoặc mở rộng sang dữ liệu mới.
+
+\section{KẾT LUẬN VÀ HƯỚNG PHÁT TRIỂN}
+Dự án đã xây dựng được một hệ thống phát hiện đối tượng anchor-free tương đối hoàn chỉnh, gồm mô-đun huấn luyện, mô-đun suy luận, thư viện tiện ích và notebook thực thi. Về mặt kỹ thuật, hệ thống kết hợp một backbone mạnh vừa phải là ResNet34, FPN ba mức cho đa tỉ lệ, focal loss để chống mất cân bằng, CIoU cho hồi quy hộp, centerness cho định vị tốt hơn, và một chuỗi hậu xử lý thực dụng để tăng khả năng giữ lại các dự đoán khó.
+
+Điểm có giá trị nhất của dự án không chỉ nằm ở chỗ ``mô hình chạy được'', mà ở việc mã nguồn thể hiện tư duy làm mô hình một cách có hệ thống: đọc dữ liệu cẩn thận, cân bằng phân bố lớp, ưu tiên vật thể nhỏ, quan tâm ảnh tối, phân tích lỗi bằng hardcase và xây sẵn workflow thực thi trên Kaggle. Nếu tiếp tục phát triển, các hướng hợp lý gồm:
+\begin{itemize}
+    \item chọn checkpoint theo mAP trên validation thay vì chỉ theo \texttt{val\_loss};
+    \item gom logic low-light enhancement về một mô-đun dùng chung;
+    \item bổ sung thí nghiệm ablation để đo riêng tác động của class weights, tiny fallback, TTA fallback và luật suppress chair;
+    \item mở rộng sang backbone mạnh hơn hoặc thêm nhánh đặc trưng stride nhỏ hơn nếu ưu tiên tuyệt đối cho vật thể rất nhỏ.
+\end{itemize}
+
+Tóm lại, đây là một dự án có nền tảng kỹ thuật tốt, trình bày được đầy đủ chu trình học của mô hình từ dữ liệu đến checkpoint và từ checkpoint đến dự đoán. Báo cáo này cho thấy cách từng file trong dự án cùng phối hợp để biến một tập ảnh gán nhãn thành một hệ thống phát hiện đối tượng có thể huấn luyện, đánh giá và cải tiến lặp lại.
+
+\clearpage
+\addcontentsline{toc}{section}{TÀI LIỆU THAM KHẢO}
+\begin{thebibliography}{99}
+
+\bibitem{resnet}
+Kaiming He, Xiangyu Zhang, Shaoqing Ren, Jian Sun,
+\textit{Deep Residual Learning for Image Recognition},
+CVPR, 2016.
+
+\bibitem{fpn}
+Tsung-Yi Lin, Piotr Dollár, Ross Girshick, Kaiming He, Bharath Hariharan, Serge Belongie,
+\textit{Feature Pyramid Networks for Object Detection},
+CVPR, 2017.
+
+\bibitem{focal}
+Tsung-Yi Lin, Priya Goyal, Ross Girshick, Kaiming He, Piotr Dollár,
+\textit{Focal Loss for Dense Object Detection},
+ICCV, 2017.
+
+\bibitem{fcos}
+Zhi Tian, Chunhua Shen, Hao Chen, Tong He,
+\textit{FCOS: Fully Convolutional One-Stage Object Detection},
+ICCV, 2019.
+
+\bibitem{pytorch}
+PyTorch Team,
+\textit{PyTorch Documentation},
+\url{https://pytorch.org/docs/stable/}.
+
+\bibitem{torchvision}
+Torchvision Team,
+\textit{Torchvision Model Documentation},
+\url{https://pytorch.org/vision/stable/models.html}.
+
+\bibitem{albumentations}
+Albumentations Team,
+\textit{Albumentations Documentation},
+\url{https://albumentations.ai/docs/}.
+
+\bibitem{projectcode}
+Dự án mã nguồn \texttt{train.py}, \texttt{predict.py}, \texttt{utils/} và \texttt{obj-detec.ipynb}
+trong thư mục làm việc hiện tại.
+
+\end{thebibliography}
+
+\end{document}

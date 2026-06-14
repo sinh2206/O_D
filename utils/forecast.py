@@ -30,7 +30,11 @@ from .config import CONF_THRESH, FPN_CHANNELS, IMG_SIZE, NMS_IOU_THRESH, NUM_CLA
 
 
 class ConvBNLeaky(nn.Module):
+    """Small reusable Conv-BN-LeakyReLU block used inside forecast heads."""
+
     def __init__(self, in_ch: int, out_ch: int, k: int = 3, s: int = 1, p: int = 1):
+        """Configure one convolutional block with fixed normalization/activation."""
+
         super().__init__()
         self.block = nn.Sequential(
             nn.Conv2d(in_ch, out_ch, kernel_size=k, stride=s, padding=p, bias=False),
@@ -39,6 +43,8 @@ class ConvBNLeaky(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply the convolutional block to one feature tensor."""
+
         return self.block(x)
 
 
@@ -46,6 +52,8 @@ class AnchorFreeForecastHead(nn.Module):
     """Decoupled prediction head for one FPN level."""
 
     def __init__(self, in_ch: int = FPN_CHANNELS, num_classes: int = NUM_CLASSES):
+        """Create the shared stem plus class/regression prediction layers."""
+
         super().__init__()
 
         self.stem = nn.Sequential(
@@ -60,6 +68,8 @@ class AnchorFreeForecastHead(nn.Module):
         self._init_params()
 
     def _init_params(self) -> None:
+        """Initialize logits with a low-positive prior and stable box bias."""
+
         # Initialize low class confidence at start.
         nn.init.normal_(self.cls_pred.weight, mean=0.0, std=0.01)
         nn.init.constant_(self.cls_pred.bias, -1.2)
@@ -68,6 +78,8 @@ class AnchorFreeForecastHead(nn.Module):
         nn.init.constant_(self.reg_pred.bias, 1.0)
 
     def forward(self, feat: torch.Tensor) -> Dict[str, torch.Tensor]:
+        """Predict class logits and box distances for one FPN feature map."""
+
         x = self.stem(feat)
         cls_logits = self.cls_pred(x)
         reg_tlbr = F.relu(self.reg_pred(x))
@@ -81,12 +93,16 @@ class MultiScaleForecast(nn.Module):
     """Three independent heads for stride8, stride16 and stride32 feature maps."""
 
     def __init__(self, in_ch: int = FPN_CHANNELS, num_classes: int = NUM_CLASSES):
+        """Instantiate one forecast head per feature scale."""
+
         super().__init__()
         self.head_s8 = AnchorFreeForecastHead(in_ch=in_ch, num_classes=num_classes)
         self.head_s16 = AnchorFreeForecastHead(in_ch=in_ch, num_classes=num_classes)
         self.head_s32 = AnchorFreeForecastHead(in_ch=in_ch, num_classes=num_classes)
 
     def forward(self, p2_out: torch.Tensor, p3_out: torch.Tensor, p4_out: torch.Tensor) -> Dict[str, Any]:
+        """Run all three heads and package their outputs in project format."""
+
         out8 = self.head_s8(p2_out)
         out16 = self.head_s16(p3_out)
         out32 = self.head_s32(p4_out)
@@ -98,6 +114,8 @@ class MultiScaleForecast(nn.Module):
 
 
 def _build_grid(h: int, w: int, stride: float, device: torch.device) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Build center coordinates for every location on one feature map level."""
+
     ys = (torch.arange(h, device=device, dtype=torch.float32) + 0.5) * stride
     xs = (torch.arange(w, device=device, dtype=torch.float32) + 0.5) * stride
     gy, gx = torch.meshgrid(ys, xs, indexing="ij")

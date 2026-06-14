@@ -10,6 +10,8 @@ from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 
 
 def resolve_device(preferred: str = "auto") -> torch.device:
+    """Choose CPU or CUDA device from a simple user-facing preference string."""
+
     pref = str(preferred).strip().lower()
     if pref == "auto":
         return torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -23,6 +25,8 @@ def resolve_device(preferred: str = "auto") -> torch.device:
 
 
 def device_summary(device: torch.device) -> str:
+    """Format a short human-readable description of the active device."""
+
     if device.type != "cuda" or not torch.cuda.is_available():
         return "cpu"
     idx = torch.cuda.current_device()
@@ -32,6 +36,8 @@ def device_summary(device: torch.device) -> str:
 
 
 def _cpu_limit_from_affinity() -> int:
+    """Estimate a safe worker upper bound from OS CPU affinity settings."""
+
     cpu_count = os.cpu_count() or 1
     try:
         aff = len(os.sched_getaffinity(0))
@@ -43,6 +49,8 @@ def _cpu_limit_from_affinity() -> int:
 
 
 def resolve_num_workers(requested: int) -> Tuple[int, int]:
+    """Resolve DataLoader workers while staying conservative on constrained hosts."""
+
     max_safe = _cpu_limit_from_affinity()
     if "COLAB_GPU" in os.environ:
         max_safe = min(max_safe, 2)
@@ -57,10 +65,14 @@ def resolve_num_workers(requested: int) -> Tuple[int, int]:
 
 
 def should_pin_memory(device: torch.device) -> bool:
+    """Return whether DataLoader pin_memory should be enabled."""
+
     return device.type == "cuda" and torch.cuda.is_available()
 
 
 def create_grad_scaler(device: torch.device, enabled: bool) -> Any:
+    """Create an AMP GradScaler compatible with multiple PyTorch versions."""
+
     amp_enabled = bool(enabled and device.type == "cuda")
     if hasattr(torch, "amp") and hasattr(torch.amp, "GradScaler"):
         try:
@@ -80,6 +92,8 @@ def save_checkpoint(
     classes: list[str],
     img_size: int,
 ) -> None:
+    """Save model weights plus optional optimizer/scheduler resume state."""
+
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
         "epoch": int(epoch),
@@ -102,6 +116,8 @@ def load_checkpoint(
     scheduler: Optional[torch.optim.lr_scheduler.LRScheduler] = None,
     map_location: Optional[torch.device] = None,
 ) -> Tuple[int, float]:
+    """Load checkpoint contents into model and optional optimizer objects."""
+
     ckpt = torch.load(str(path), map_location=map_location)
     state_dict = ckpt.get("model_state_dict", ckpt)
     try:
@@ -125,6 +141,8 @@ def get_optimizer(
     weight_decay: float = 1e-4,
     backbone_lr_factor: float = 0.1,
 ) -> torch.optim.Optimizer:
+    """Build AdamW with separate learning rates for backbone and heads."""
+
     backbone_params = []
     head_params = []
     for name, param in model.named_parameters():
@@ -150,6 +168,8 @@ def get_scheduler(
     warmup_epochs: int = 3,
     min_lr_ratio: float = 0.05,
 ) -> torch.optim.lr_scheduler.LRScheduler:
+    """Build a warmup + cosine schedule for the full training duration."""
+
     total_epochs = max(1, int(epochs))
     warm = max(0, min(int(warmup_epochs), total_epochs - 1))
 

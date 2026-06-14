@@ -20,6 +20,8 @@ VALID_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 
 @dataclass
 class Record:
+    """Lightweight annotation record used for augmentation visualization only."""
+
     image_id: str
     file_name: str
     boxes: List[List[float]]
@@ -27,11 +29,15 @@ class Record:
 
 
 def load_json(path: Path):
+    """Read one annotation JSON file used by the preview utility."""
+
     with path.open("r", encoding="utf-8") as f:
         return json.load(f)
 
 
 def imread_unicode(path: Path) -> Optional[np.ndarray]:
+    """Read an image from a Unicode-safe path with OpenCV."""
+
     if not path.exists():
         return None
     arr = np.fromfile(str(path), dtype=np.uint8)
@@ -42,6 +48,8 @@ def imread_unicode(path: Path) -> Optional[np.ndarray]:
 
 
 def imwrite_unicode(path: Path, image_bgr: np.ndarray) -> bool:
+    """Write a preview image while keeping Unicode path compatibility."""
+
     ext = path.suffix.lower()
     if ext not in VALID_EXTS:
         ext = ".jpg"
@@ -54,6 +62,8 @@ def imwrite_unicode(path: Path, image_bgr: np.ndarray) -> bool:
 
 
 def make_pad_if_needed(img_size: int):
+    """Create a version-tolerant Albumentations padding transform."""
+
     params = inspect.signature(A.PadIfNeeded.__init__).parameters
     kwargs = {
         "min_height": img_size,
@@ -73,6 +83,8 @@ def make_pad_if_needed(img_size: int):
 
 
 def collect_records(annotation_path: Path, image_dir: Path) -> Tuple[List[Record], List[str]]:
+    """Parse annotation JSON into preview-friendly `Record` objects."""
+
     data = load_json(annotation_path)
     classes = data.get("classes", [])
 
@@ -108,6 +120,8 @@ def collect_records(annotation_path: Path, image_dir: Path) -> Tuple[List[Record
 
 
 def scale_boxes_xyxy(boxes: np.ndarray, sx: float, sy: float) -> np.ndarray:
+    """Scale xyxy boxes by separate horizontal and vertical factors."""
+
     out = boxes.copy().astype(np.float32)
     out[:, [0, 2]] *= float(sx)
     out[:, [1, 3]] *= float(sy)
@@ -115,6 +129,8 @@ def scale_boxes_xyxy(boxes: np.ndarray, sx: float, sy: float) -> np.ndarray:
 
 
 def clip_filter_boxes(boxes: np.ndarray, labels: List[str], w: int, h: int, min_area: float = 1.0) -> Tuple[np.ndarray, List[str]]:
+    """Clip boxes to image bounds and discard invalid or too-small boxes."""
+
     if boxes.size == 0:
         return boxes.reshape(0, 4), []
 
@@ -138,6 +154,8 @@ def clip_filter_boxes(boxes: np.ndarray, labels: List[str], w: int, h: int, min_
 
 
 def draw_boxes(image_bgr: np.ndarray, boxes: np.ndarray, labels: List[str], classes: List[str]) -> np.ndarray:
+    """Visualize labeled boxes for augmentation inspection."""
+
     out = image_bgr.copy()
     cls_to_idx = {c: i for i, c in enumerate(classes)}
 
@@ -155,6 +173,8 @@ def draw_boxes(image_bgr: np.ndarray, boxes: np.ndarray, labels: List[str], clas
 
 
 def load_resized_record(record: Record, image_dir: Path, target_size: int) -> Tuple[np.ndarray, np.ndarray, List[str]]:
+    """Load one image and letterbox it into a square preview canvas."""
+
     img_path = image_dir / record.file_name
     img = imread_unicode(img_path)
     if img is None:
@@ -182,6 +202,8 @@ def load_resized_record(record: Record, image_dir: Path, target_size: int) -> Tu
 
 
 def build_mosaic(records: List[Record], image_dir: Path, img_size: int, primary_idx: int, rng: random.Random):
+    """Create a 4-image mosaic and remap all boxes into mosaic coordinates."""
+
     s = img_size
     mosaic = np.full((2 * s, 2 * s, 3), 114, dtype=np.uint8)
 
@@ -239,6 +261,8 @@ def maybe_mixup(
     rng: random.Random,
     p: float = 0.5,
 ):
+    """Optionally blend another mosaic image and concatenate its boxes."""
+
     if rng.random() >= p:
         return image, boxes, labels
 
@@ -269,6 +293,8 @@ def maybe_mixup(
 
 
 def build_train_transform(img_size: int) -> A.Compose:
+    """Build the same style of augmentation chain used for train preview export."""
+
     try:
         affine = A.Affine(
             scale=(0.85, 1.25),
@@ -319,6 +345,8 @@ def build_train_transform(img_size: int) -> A.Compose:
 
 
 def denormalize_to_bgr(tensor_chw: np.ndarray) -> np.ndarray:
+    """Undo normalization on a CHW tensor so it can be saved with OpenCV."""
+
     img = tensor_chw.transpose(1, 2, 0)
     img = img * np.array(STD, dtype=np.float32) + np.array(MEAN, dtype=np.float32)
     img = np.clip(img * 255.0, 0, 255).astype(np.uint8)
@@ -336,6 +364,8 @@ def export_augmented_samples(
     mixup_prob: float,
     seed: int,
 ) -> int:
+    """Export side-by-side original and augmented samples for debugging."""
+
     rng = random.Random(seed)
     np.random.seed(seed)
 
@@ -408,6 +438,8 @@ def export_augmented_samples(
 
 
 def parse_args() -> argparse.Namespace:
+    """Define CLI arguments for the augmentation preview helper script."""
+
     p = argparse.ArgumentParser(description="Build Anchor-Free augmentation previews: Mosaic -> Affine -> HSV -> Flip.")
     p.add_argument("--annotation", type=Path, default=Path("public/annotations/val.json"))
     p.add_argument("--image_dir", type=Path, default=Path("public/val/images"))
@@ -421,6 +453,8 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> None:
+    """Run the augmentation preview export utility from the command line."""
+
     args = parse_args()
 
     records, classes = collect_records(args.annotation, args.image_dir)

@@ -1,5 +1,16 @@
 from __future__ import annotations
 
+"""
+Training entrypoint for the anchor-free object detector.
+
+This file is responsible for:
+- reading JSON annotations and image paths;
+- building train/validation datasets and augmentations;
+- computing class/sample balancing weights;
+- running the optimization loop and validation loop;
+- saving the best and latest checkpoints.
+"""
+
 import argparse
 import inspect
 import json
@@ -46,6 +57,8 @@ VALID_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 
 @dataclass
 class Sample:
+    """One parsed training sample with image metadata and ground-truth boxes."""
+
     image_id: str
     image_path: Path
     width: int
@@ -59,10 +72,14 @@ def compute_class_weights(
     train_samples: Optional[List[Sample]] = None,
     val_samples: Optional[List[Sample]] = None,
 ) -> torch.Tensor:
+    """Estimate per-class loss weights from dataset frequency priors."""
+
     if num_classes <= 0:
         return torch.zeros((0,), dtype=torch.float32)
 
     def _freq_from_samples(samples: List[Sample]) -> np.ndarray:
+        """Compute normalized class frequencies from a parsed sample list."""
+
         counts = np.zeros((num_classes,), dtype=np.float64)
         for s in samples:
             if not s.labels:
@@ -102,6 +119,8 @@ def compute_class_weights(
 
 
 def build_sample_weights(samples: List[Sample], class_weights: torch.Tensor) -> torch.Tensor:
+    """Build per-image sampling weights for the weighted random sampler."""
+
     cw = class_weights.cpu().numpy().astype(np.float64)
     class_sampler_weights = np.asarray(CLASS_SAMPLER_WEIGHTS, dtype=np.float64)
     if class_sampler_weights.size != cw.size:
@@ -148,6 +167,8 @@ def build_sample_weights(samples: List[Sample], class_weights: torch.Tensor) -> 
 
 
 def seed_everything(seed: int) -> None:
+    """Seed Python, NumPy and PyTorch for reproducible training runs."""
+
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -155,6 +176,8 @@ def seed_everything(seed: int) -> None:
 
 
 def imread_unicode(path: Path) -> Optional[np.ndarray]:
+    """Read an image from a path that may contain Unicode characters."""
+
     if not path.exists():
         return None
     arr = np.fromfile(str(path), dtype=np.uint8)
@@ -164,6 +187,8 @@ def imread_unicode(path: Path) -> Optional[np.ndarray]:
 
 
 def enhance_low_light_bgr(image_bgr: np.ndarray) -> np.ndarray:
+    """Apply conditional CLAHE + gamma enhancement on dark input images."""
+
     gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
     if float(gray.mean()) >= float(LOW_LIGHT_MEAN_THRESH):
         return image_bgr
@@ -182,11 +207,15 @@ def enhance_low_light_bgr(image_bgr: np.ndarray) -> np.ndarray:
 
 
 def load_annotation(annotation_path: Path) -> dict:
+    """Load one COCO-like JSON annotation file from disk."""
+
     with annotation_path.open("r", encoding="utf-8") as f:
         return json.load(f)
 
 
 def parse_samples(annotation_path: Path, image_dir: Path, class_names: Optional[List[str]] = None) -> Tuple[List[Sample], List[str]]:
+    """Convert annotation JSON into a list of `Sample` objects."""
+
     data = load_annotation(annotation_path)
     json_classes = data.get("classes", [])
     classes = class_names if class_names is not None else (json_classes if json_classes else CLASS_NAMES)
@@ -248,6 +277,8 @@ def parse_samples(annotation_path: Path, image_dir: Path, class_names: Optional[
 
 
 def make_pad_if_needed(img_size: int):
+    """Create a version-safe Albumentations `PadIfNeeded` transform."""
+
     params = inspect.signature(A.PadIfNeeded.__init__).parameters
     kwargs = {
         "min_height": img_size,
@@ -267,6 +298,8 @@ def make_pad_if_needed(img_size: int):
 
 
 def get_train_transforms(img_size: int) -> A.Compose:
+    """Return the full augmentation pipeline used for training."""
+
     affine_params = inspect.signature(A.Affine.__init__).parameters
     affine_kwargs = dict(
         scale=(0.85, 1.25),
@@ -314,33 +347,19 @@ def get_train_transforms(img_size: int) -> A.Compose:
             A.HorizontalFlip(p=0.5),
             A.VerticalFlip(p=0.05),
             A.RandomRotate90(p=0.12),
-            A.OneOf(
-                [
-                    A.CLAHE(clip_limit=3.0, tile_grid_size=(8, 8), p=1.0),
-                    A.Sharpen(alpha=(0.2, 0.5), lightness=(0.8, 1.2), p=1.0),
-                ],
-                p=0.35,
-            ),
+            A.CLAHE(clip_limit=2.2, tile_grid_size=(8, 8), p=0.2),
             A.OneOf(
                 [
                     A.GaussianBlur(blur_limit=(3, 7), p=1.0),
                     A.MotionBlur(blur_limit=5, p=1.0),
                     downscale_aug,
                 ],
-                p=0.20,
+                p=0.18,
             ),
-            A.ColorJitter(brightness=0.15, contrast=0.15, saturation=0.15, hue=0.08, p=0.45),
-            A.RandomGamma(gamma_limit=(80, 120), p=0.25),
-            A.OneOf(
-                [
-                    A.Posterize(p=1.0),
-                    A.Solarize(p=1.0),
-                    A.Equalize(p=1.0),
-                ],
-                p=0.12,
-            ),
+            A.Sharpen(alpha=(0.15, 0.35), lightness=(0.85, 1.15), p=0.16),
+            A.RandomGamma(gamma_limit=(88, 122), p=0.25),
+            A.ColorJitter(brightness=0.12, contrast=0.12, saturation=0.1, hue=0.05, p=0.45),
             affine,
-            A.CoarseDropout(max_holes=8, max_height=int(img_size * 0.1), max_width=int(img_size * 0.1), fill_value=114, p=0.25),
             A.Normalize(mean=MEAN, std=STD),
             ToTensorV2(),
         ],
@@ -355,6 +374,8 @@ def get_train_transforms(img_size: int) -> A.Compose:
 
 
 def get_val_transforms(img_size: int) -> A.Compose:
+    """Return the deterministic preprocessing pipeline for validation."""
+
     return A.Compose(
         [
             A.LongestMaxSize(max_size=img_size, interpolation=cv2.INTER_LINEAR),
@@ -373,14 +394,22 @@ def get_val_transforms(img_size: int) -> A.Compose:
 
 
 class DetectionDataset(Dataset):
+    """PyTorch dataset that reads images and applies box-aware transforms."""
+
     def __init__(self, samples: List[Sample], transforms: A.Compose):
+        """Store parsed samples and the transform pipeline used per sample."""
+
         self.samples = samples
         self.transforms = transforms
 
     def __len__(self) -> int:
+        """Return the number of samples available in this dataset split."""
+
         return len(self.samples)
 
     def __getitem__(self, idx: int):
+        """Read one image, apply transforms and return `(image_tensor, target)`."""
+
         sample = self.samples[idx]
         image = imread_unicode(sample.image_path)
         if image is None:
@@ -412,12 +441,16 @@ class DetectionDataset(Dataset):
 
 
 def collate_fn(batch):
+    """Stack image tensors while keeping targets as a variable-length list."""
+
     images = torch.stack([x[0] for x in batch], dim=0)
     targets = [x[1] for x in batch]
     return images, targets
 
 
 def move_targets_to_device(targets: List[dict], device: torch.device) -> List[dict]:
+    """Move every tensor field inside the target dictionaries to one device."""
+
     out = []
     for t in targets:
         out.append(
@@ -438,6 +471,8 @@ def make_dataloader(
     sampler: Optional[WeightedRandomSampler] = None,
     pin_memory: bool = False,
 ) -> DataLoader:
+    """Build a DataLoader with the project's standard collation settings."""
+
     return DataLoader(
         dataset,
         batch_size=batch_size,
@@ -460,6 +495,8 @@ def train_one_epoch(
     scaler: torch.cuda.amp.GradScaler,
     amp_enabled: bool,
 ) -> Dict[str, float]:
+    """Run one full training epoch and return averaged loss components."""
+
     model.train()
     running = {"loss": 0.0, "loss_cls": 0.0, "loss_reg": 0.0, "loss_ctr": 0.0}
     steps = 0
@@ -500,6 +537,8 @@ def validate_one_epoch(
     device: torch.device,
     amp_enabled: bool,
 ) -> Dict[str, float]:
+    """Run one validation pass without gradient updates."""
+
     model.eval()
     running = {"loss": 0.0, "loss_cls": 0.0, "loss_reg": 0.0, "loss_ctr": 0.0}
     steps = 0
@@ -525,6 +564,8 @@ def validate_one_epoch(
 
 
 def build_optimizer(model: AnchorFreeDetector, lr_backbone: float, lr_head: float, weight_decay: float) -> torch.optim.Optimizer:
+    """Create AdamW with a lower LR for the pretrained backbone."""
+
     backbone_params = list(model.backbone_fpn.parameters())
     head_params = (
         list(model.head_s8.parameters())
@@ -551,6 +592,8 @@ def save_checkpoint(
     classes: List[str],
     img_size: int,
 ) -> None:
+    """Persist the current training state so it can be resumed or reused."""
+
     path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(
         {
@@ -568,6 +611,8 @@ def save_checkpoint(
 
 
 def parse_args() -> argparse.Namespace:
+    """Define the command-line interface for the training script."""
+
     parser = argparse.ArgumentParser(description="Train anchor-free detector (ResNet34 + 3-level FPN).")
     parser.add_argument("--train_data", type=Path, required=True)
     parser.add_argument("--val_data", type=Path, required=True)
@@ -593,6 +638,8 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> None:
+    """Wire together data, model, optimizer and the epoch training loop."""
+
     args = parse_args()
     seed_everything(args.seed)
     torch.backends.cudnn.benchmark = True

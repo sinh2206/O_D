@@ -9,6 +9,8 @@ from .config import CLAHE_CLIP_LIMIT, CLAHE_TILE_GRID, DARK_LUMA_THRESHOLD, LOWL
 
 
 def _gamma_lut(gamma: float) -> np.ndarray:
+    """Precompute a lookup table for gamma correction on uint8 images."""
+
     inv = max(float(gamma), 1e-6)
     x = np.arange(256, dtype=np.float32) / 255.0
     y = np.power(x, inv) * 255.0
@@ -46,4 +48,3 @@ def enhance_low_light_bgr(
     lut = _gamma_lut(float(gamma))
     out = cv2.LUT(out, lut)
     return out
-

@@ -1,5 +1,15 @@
 from __future__ import annotations
 
+"""
+Inference entrypoint for the anchor-free object detector.
+
+This script:
+- loads a trained checkpoint;
+- preprocesses validation images with letterbox resizing;
+- decodes model outputs and applies post-processing;
+- exports prediction JSON and hardcase summaries for error analysis.
+"""
+
 import argparse
 import json
 import math
@@ -40,6 +50,8 @@ DEFAULT_OUTPUT_JSON = Path("val_predictions.json")
 
 
 def imread_unicode(path: Path) -> Optional[np.ndarray]:
+    """Read an image file safely even when the path contains Unicode text."""
+
     if not path.exists():
         return None
     arr = np.fromfile(str(path), dtype=np.uint8)
@@ -49,6 +61,8 @@ def imread_unicode(path: Path) -> Optional[np.ndarray]:
 
 
 def imwrite_unicode(path: Path, image_bgr: np.ndarray) -> bool:
+    """Write an image to disk while preserving Unicode-friendly paths."""
+
     path.parent.mkdir(parents=True, exist_ok=True)
     ext = path.suffix.lower() if path.suffix.lower() in VALID_EXTS else ".jpg"
     out_path = path if path.suffix.lower() in VALID_EXTS else path.with_suffix(ext)
@@ -60,6 +74,8 @@ def imwrite_unicode(path: Path, image_bgr: np.ndarray) -> bool:
 
 
 def enhance_low_light_bgr(image_bgr: np.ndarray) -> np.ndarray:
+    """Lightly brighten dark inference images before normalization."""
+
     gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
     if float(gray.mean()) >= float(LOW_LIGHT_MEAN_THRESH):
         return image_bgr
@@ -74,6 +90,8 @@ def enhance_low_light_bgr(image_bgr: np.ndarray) -> np.ndarray:
 
 
 def letterbox_preprocess(image_bgr: np.ndarray, img_size: int) -> Tuple[torch.Tensor, LetterboxMeta]:
+    """Resize one image to a square canvas and keep remapping metadata."""
+
     image_bgr = enhance_low_light_bgr(image_bgr)
     h, w = image_bgr.shape[:2]
     scale = min(float(img_size) / max(w, 1), float(img_size) / max(h, 1))
@@ -95,15 +113,21 @@ def letterbox_preprocess(image_bgr: np.ndarray, img_size: int) -> Tuple[torch.Te
 
 
 def collect_images(image_dir: Path) -> List[Path]:
+    """Collect supported image files from one directory in sorted order."""
+
     imgs = [p for p in sorted(image_dir.iterdir()) if p.is_file() and p.suffix.lower() in VALID_EXTS]
     return imgs
 
 
 def _round_half_up(value: float) -> int:
+    """Round values in the same way as standard annotation export tooling."""
+
     return int(math.floor(float(value) + 0.5))
 
 
 def _normalize_bbox_for_draw(bbox: Sequence[float], image_shape: Tuple[int, int, int]) -> Optional[List[int]]:
+    """Clamp and sanitize one box before drawing it on an image."""
+
     if not isinstance(bbox, (list, tuple)) or len(bbox) != 4:
         return None
     try:
@@ -142,6 +166,8 @@ def _normalize_bbox_for_draw(bbox: Sequence[float], image_shape: Tuple[int, int,
 
 
 def _is_fully_inside(inner: Sequence[int], outer: Sequence[int]) -> bool:
+    """Check whether one integer box is fully contained inside another."""
+
     return bool(
         inner[0] >= outer[0]
         and inner[1] >= outer[1]
@@ -151,6 +177,8 @@ def _is_fully_inside(inner: Sequence[int], outer: Sequence[int]) -> bool:
 
 
 def _suppress_same_class_contained_int(boxes: List[dict]) -> List[dict]:
+    """Remove redundant same-class boxes when one fully contains the other."""
+
     ordered = sorted(boxes, key=lambda b: float(b.get("confidence", 0.0)), reverse=True)
     kept: List[dict] = []
 
@@ -206,6 +234,8 @@ def _draw_labeled_box(
     color: Tuple[int, int, int],
     thickness: int = 2,
 ) -> None:
+    """Draw one colored bounding box and its label on an image."""
+
     norm = _normalize_bbox_for_draw(bbox, image_bgr.shape)
     if norm is None:
         return
@@ -246,6 +276,8 @@ def sanitize_predictions_for_export(
     class_names: Sequence[str],
     max_objects: int = MAX_OBJECTS_PER_IMAGE,
 ) -> List[dict]:
+    """Convert predictions to clean, JSON-ready integer boxes per image."""
+
     valid_classes = set(class_names)
     out: List[dict] = []
 
@@ -326,6 +358,8 @@ def sanitize_predictions_for_export(
 
 
 def clean_results_dir(results_dir: Path) -> None:
+    """Remove old hardcase images while keeping the summary JSON if present."""
+
     if not results_dir.exists():
         return
     for p in results_dir.iterdir():
@@ -338,6 +372,8 @@ def clean_results_dir(results_dir: Path) -> None:
 
 
 def box_iou(a: Sequence[float], b: Sequence[float]) -> float:
+    """Compute IoU between two boxes stored in xyxy format."""
+
     ax1, ay1, ax2, ay2 = [float(v) for v in a]
     bx1, by1, bx2, by2 = [float(v) for v in b]
     xx1 = max(ax1, bx1)
@@ -353,6 +389,8 @@ def box_iou(a: Sequence[float], b: Sequence[float]) -> float:
 
 
 def _inverse_hflip_boxes(boxes: Sequence[dict], width: int) -> List[dict]:
+    """Map boxes from a horizontally flipped view back to the original image."""
+
     out: List[dict] = []
     for box in boxes:
         bbox = box.get("bbox", [])
@@ -368,6 +406,8 @@ def _inverse_hflip_boxes(boxes: Sequence[dict], width: int) -> List[dict]:
 
 
 def _inverse_rot180_boxes(boxes: Sequence[dict], width: int, height: int) -> List[dict]:
+    """Map boxes from a 180-degree rotated view back to the original image."""
+
     out: List[dict] = []
     for box in boxes:
         bbox = box.get("bbox", [])
@@ -389,6 +429,8 @@ def _merge_tta_boxes(
     iou_thresh: float = 0.45,
     min_votes: int = 2,
 ) -> List[dict]:
+    """Merge boxes from several TTA views into one consensus prediction set."""
+
     if not all_boxes:
         return []
 
@@ -451,6 +493,8 @@ def _run_tta_fallback_single(
     center_combine: str,
     tta_min_votes: int,
 ) -> List[dict]:
+    """Retry inference with simple TTA when the normal pass finds nothing."""
+
     h, w = image_bgr.shape[:2]
     fallback_conf = max(0.20, min(float(conf_thresh) * 0.75, 0.28))
 
@@ -490,6 +534,8 @@ def _run_tta_fallback_single(
 
 
 def load_ground_truth(annotation_path: Path, class_names: Sequence[str]) -> Dict[str, List[dict]]:
+    """Load validation ground truth into a per-image dictionary."""
+
     data = json.loads(annotation_path.read_text(encoding="utf-8"))
     valid_classes = set(class_names)
 
@@ -524,6 +570,8 @@ def score_image_error(
     class_names: Sequence[str],
     iou_thresh: float = 0.5,
 ) -> Dict[str, float]:
+    """Assign an error score to one image from TP/FP/FN and localization gaps."""
+
     fn = 0
     fp = 0
     tp = 0
@@ -577,6 +625,8 @@ def match_predictions_to_ground_truth(
     class_names: Sequence[str],
     iou_thresh: float = 0.5,
 ) -> Tuple[List[bool], List[Optional[int]], List[bool]]:
+    """Greedily match predictions to GT boxes of the same class by IoU."""
+
     gt_by_class: Dict[str, List[Tuple[int, dict]]] = {}
     for idx, gt in enumerate(gt_boxes):
         cls_name = str(gt.get("class", ""))
@@ -629,6 +679,8 @@ def draw_hardcase(
     class_names: Sequence[str],
     iou_thresh: float = 0.5,
 ) -> np.ndarray:
+    """Overlay GT and predictions to visualize why one image is hard."""
+
     out = image_bgr.copy()
     pred_is_correct, _, gt_is_matched = match_predictions_to_ground_truth(
         gt_boxes=gt_boxes,
@@ -660,6 +712,8 @@ def export_hardcase_summary(
     top_k: int = 100,
     iou_thresh: float = 0.5,
 ) -> Tuple[int, Path]:
+    """Rank the most difficult validation images and save the summary to disk."""
+
     gt = load_ground_truth(annotation_path, class_names)
     pred_map = {str(p.get("image_id", "")): list(p.get("boxes", [])) for p in predictions}
 
@@ -692,6 +746,8 @@ def export_hardcase_summary(
 
 
 def load_hardcase_summary(summary_path: Path) -> List[dict]:
+    """Load a previously exported hardcase summary if it exists."""
+
     if not summary_path.exists():
         return []
     try:
@@ -712,6 +768,8 @@ def load_hardcase_summary(summary_path: Path) -> List[dict]:
 
 
 def draw_prediction(image_bgr: np.ndarray, boxes: Sequence[dict], class_names: Sequence[str]) -> np.ndarray:
+    """Render predicted boxes only, without referencing ground truth."""
+
     out = image_bgr.copy()
     cls_to_idx = {c: i for i, c in enumerate(class_names)}
 
@@ -734,6 +792,8 @@ def apply_class_thresholds(
     class_names: Sequence[str],
     class_conf_thresh: Sequence[float],
 ) -> List[dict]:
+    """Apply class-specific score thresholds after decode and NMS."""
+
     th_map = {c: float(class_conf_thresh[i]) for i, c in enumerate(class_names) if i < len(class_conf_thresh)}
     out: List[dict] = []
     for pred in predictions:
@@ -749,7 +809,11 @@ def apply_class_thresholds(
 
 
 def suppress_chair_inside_person(predictions: List[dict], iou_thresh: float) -> List[dict]:
+    """Drop tiny chair detections that are fully embedded inside a person box."""
+
     def _box_area(bbox: Sequence[float]) -> float:
+        """Compute area for one exported bbox inside the chair-filter heuristic."""
+
         x1, y1, x2, y2 = [float(v) for v in bbox]
         return max(0.0, x2 - x1) * max(0.0, y2 - y1)
 
@@ -796,6 +860,8 @@ def run_inference(
     enable_tta_fallback: bool = False,
     tta_min_votes: int = 2,
 ) -> List[dict]:
+    """Run batched inference over all images and return JSON-style outputs."""
+
     results: List[dict] = []
     amp_enabled = device.type == "cuda"
 
@@ -866,6 +932,8 @@ def run_inference(
 
 
 def save_preview_images(predictions: List[dict], image_dir: Path, preview_dir: Path, limit: int, class_names: Sequence[str]) -> int:
+    """Save a limited number of visualized prediction previews to disk."""
+
     preview_dir.mkdir(parents=True, exist_ok=True)
     saved = 0
 
@@ -884,6 +952,8 @@ def save_preview_images(predictions: List[dict], image_dir: Path, preview_dir: P
 
 
 def load_checkpoint_model(checkpoint_path: Path, device: torch.device) -> Tuple[AnchorFreeDetector, List[str], int]:
+    """Restore the detector and metadata from a saved checkpoint file."""
+
     ckpt = torch.load(str(checkpoint_path), map_location=device)
     classes = ckpt.get("classes", CLASS_NAMES)
     img_size = int(ckpt.get("img_size", IMG_SIZE))
@@ -904,6 +974,8 @@ def load_checkpoint_model(checkpoint_path: Path, device: torch.device) -> Tuple[
 
 
 def parse_args() -> argparse.Namespace:
+    """Define the CLI arguments used by the inference/export script."""
+
     parser = argparse.ArgumentParser(description="Predict val set, export integer bbox JSON, and save hardcase summary.")
     parser.add_argument("--image_dir", type=Path, default=DEFAULT_VAL_IMAGE_DIR)
     parser.add_argument("--val_annotation", type=Path, default=DEFAULT_VAL_ANNOTATION)
@@ -931,19 +1003,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--class_conf",
         type=str,
-        default="0.35,0.30,0.32,0.28,0.35",
+        default=",".join(str(x) for x in CLASS_CONF_THRESH),
         help="Per-class thresholds in CLASS_NAMES order, e.g. '0.38,0.40,0.40,0.40,0.72'",
     )
     parser.add_argument("--chair_suppress_iou", type=float, default=CHAIR_SUPPRESS_WITH_PERSON_IOU)
-    parser.add_argument("--hardcase_topk", type=int, default=100)
-    parser.add_argument("--hardcase_iou", type=float, default=0.45)
-    parser.add_argument("--tta_fallback", action="store_true", default=True, help="Enable TTA fallback on images with zero detections.")
-    parser.add_argument("--tta_min_votes", type=int, default=1, help="Minimum TTA consensus votes to keep a fallback box.")
+    parser.add_argument("--hardcase_topk", type=int, default=50)
+    parser.add_argument("--hardcase_iou", type=float, default=0.5)
+    parser.add_argument("--tta_fallback", action="store_true", help="Enable TTA fallback on images with zero detections.")
+    parser.add_argument("--tta_min_votes", type=int, default=2, help="Minimum TTA consensus votes to keep a fallback box.")
     parser.add_argument("--device", type=str, default="auto", choices=["auto", "cuda", "cpu"])
     return parser.parse_args()
 
 
 def main() -> None:
+    """Validate paths, run inference and export all downstream artifacts."""
+
     args = parse_args()
     if not args.checkpoint.exists():
         raise FileNotFoundError(f"Checkpoint not found: {args.checkpoint}")

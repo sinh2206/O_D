@@ -1,129 +1,196 @@
-Ghi chú cập nhật `train.py` và tối ưu tốc độ
-===========================================
+Cài đặt một mô hình phát hiện đối tượng (object detection) từ đầu và đánh giá trên bộ dữ liệu ảnh được cung cấp.
 
-1. `train.py` học tốt hơn bản trước ở điểm nào
-----------------------------------------------
+Sinh viên cần tự xây dựng quy trình huấn luyện và suy luận cho bài toán phát hiện đối tượng, bao gồm:
 
-`train.py` mới không còn học theo kiểu "nhìn cả ảnh rồi đoán chung chung".
-Nó được chỉnh để tập trung hơn vào các chi tiết đặc trưng gây lỗi trong hardcase.
+Đọc dữ liệu và tiền xử lý ảnh/nhãn.
+Tăng cường dữ liệu.
+Mạng trích xuất đặc trưng, ví dụ mạng tích chập CNN.
+Đầu dự đoán phát hiện đối tượng.
+Hàm mất mát.
+Suy luận, ngưỡng độ tin cậy và khử trùng hộp bao bằng NMS (Non-Maximum Suppression).
+Không được sử dụng các bộ phát hiện đối tượng hoàn chỉnh như YOLOv5/v8, Detectron2, MMDetection, hoặc Faster R-CNN/SSD có sẵn trong torchvision. Được phép dùng PyTorch, các lớp mạng cơ bản, và mạng trích xuất đặc trưng đã huấn luyện trước nếu giảng viên cho phép.
 
-- Có nhánh `stride 4` nên mô hình nhìn sát hơn vào chi tiết nhỏ như tai mèo, bánh xe, gầm xe, gáy và lưng chó.
-- Có `focus crop` nên ảnh train thường được cắt gần vật thể nhỏ hoặc khó, đặc biệt là `car`, `dog`, `cat`.
-- Có `partial occlusion` nên mô hình được luyện cả khi vật thể bị che một phần, thay vì chỉ học từ ảnh thấy trọn vẹn.
-- Loss hồi quy có thêm thành phần SmoothL1 nhẹ, nên mô hình không chỉ biết "có vật" mà còn học khoanh box sát hơn.
-- Validation không chỉ nhìn `val_loss`, mà còn theo dõi:
-  - recall chung
-  - recall riêng cho `car`, `dog`, `cat`
-  - recall vật nhỏ
-  - IoU trung bình của box đã match
-  - tỷ lệ nhầm `dog` với `cat`
+Bộ Dữ Liệu
+Link download dữ liệuLinks to an external site.
 
-Hiểu như một học sinh:
+Bộ dữ liệu gồm ảnh tự nhiên có đối tượng thuộc 5 lớp:
 
-- Bản cũ: em có thể làm bài tổng thể tạm ổn, nhưng hay trượt ở ca khó.
-- Bản mới: em được luyện đúng những thứ từng làm sai, nên nhạy hơn với chi tiết đặc trưng của `car`, `dog`, `cat`.
+person
+car
+dog
+cat
+chair
+Cấu trúc thư mục:
 
+public/
+├── classes.json
+├── train/
+│   └── images/
+├── val/
+│   └── images/
+├── annotations/
+│   ├── train.json
+│   └── val.json
+└── tools/
+    └── evaluate_predictions.py
+Trong thư mục public/ chỉ có tập huấn luyện và tập kiểm định. Khi chấm tự động, hệ thống mới cung cấp thư mục ảnh kiểm tra ẩn cho predict.py; nhãn của tập kiểm tra ẩn được giữ riêng và không công bố.
 
-2. Vì sao bản mới nhanh hơn trên Kaggle T4
-------------------------------------------
+Định Dạng Nhãn
+Tệp train.json và val.json có dạng:
 
-Mục tiêu của lần tối ưu này là giảm thời gian mỗi epoch mạnh xuống, nhưng vẫn giữ những ý học quan trọng nhất.
+{
+  "classes": ["person", "car", "dog", "cat", "chair"],
+  "images": [
+    {
+      "id": "img_a13f42c9d8b0.jpg",
+      "file_name": "train/images/img_a13f42c9d8b0.jpg",
+      "width": 500,
+      "height": 375
+    }
+  ],
+  "annotations": [
+    {
+      "image_id": "img_a13f42c9d8b0.jpg",
+      "class": "person",
+      "bbox": [48, 72, 210, 356]
+    }
+  ]
+}
+Quy ước hộp bao:
 
-Các thay đổi chính:
+bbox = [xmin, ymin, xmax, ymax]
+Tọa độ tính theo điểm ảnh trên ảnh gốc.
 
-- `IMG_SIZE` giảm xuống `512`.
-  Số pixel ít hơn nên backbone, FPN và head đều chạy nhẹ hơn rõ rệt.
+Yêu Cầu Kĩ Thuật
+1. Quy Trình Dữ Liệu
+Sinh viên cần cài đặt:
 
-- `FPN_CHANNELS` giảm từ `128` xuống `96`.
-  Vẫn đủ giữ thông tin, nhưng giảm lượng tính toán trong FPN và head.
+Bộ đọc dữ liệu.
+Thay đổi kích thước ảnh và chuẩn hóa giá trị điểm ảnh.
+Xử lý nhiều đối tượng trong cùng một ảnh.
+Tăng cường dữ liệu, tối thiểu gồm lật ngang ảnh. Khuyến khích cắt ngẫu nhiên, thay đổi màu sắc, và huấn luyện với nhiều kích thước ảnh.
+2. Mô Hình Phát Hiện Đối Tượng
+Mô hình cần dự đoán:
 
-- `HEAD_NUM_CONVS = 1`.
-  Đây là thay đổi rất đáng kể cho tốc độ vì head ở nhánh `stride 4` vốn rất tốn compute.
+Hộp bao.
+Nhãn lớp.
+Điểm độ tin cậy hoặc điểm có đối tượng.
+Sinh viên có thể chọn một trong các hướng:
 
-- `batch_size` mặc định tăng lên `16`.
-  Trên T4 với AMP, cấu hình này thường hiệu quả hơn `batch_size = 8` vì giảm số step mỗi epoch.
+Mô hình dùng hộp neo (anchor-based).
+Mô hình không dùng hộp neo (anchor-free).
+Mô hình dựa trên lưới kiểu YOLO nhỏ.
+Mô hình kiểu SSD tự cài đặt.
+3. Hàm Mất Mát
+Hàm mất mát cần có các thành phần phù hợp với thiết kế mô hình:
 
-- `num_workers = -1`.
-  Code sẽ tự chọn số worker hợp lý cho môi trường Kaggle thay vì khóa cứng ở `2`.
+Mất mát phân lớp.
+Mất mát định vị hộp bao.
+Mất mát độ tin cậy hoặc điểm có đối tượng nếu mô hình có thành phần này.
+Khuyến khích dùng Cross Entropy, BCE, Smooth L1, IoU/GIoU/DIoU.
 
-- Có `prefetch_factor` và `worker_init_fn`.
-  Điều này giúp worker nạp data sớm hơn và tránh tranh chấp luồng OpenCV quá mức.
+4. Suy Luận
+Sinh viên cần cài đặt:
 
-- Mặc định tắt `low-light enhance` trong train/val.
-  Bước này khá nặng trên CPU. Khi cần vẫn có thể bật lại bằng cờ dòng lệnh.
+Ngưỡng độ tin cậy.
+NMS theo từng lớp.
+Chuyển hộp bao về tọa độ ảnh gốc.
+Yêu Cầu Nộp Bài
+Sinh viên nộp tệp nén của thư mục <my_submission>/ gồm:
 
-- Pipeline augment được làm gọn.
-  Bản nhanh vẫn giữ các augment có ích nhất:
-  - focus crop
-  - partial occlusion
-  - blur/downscale
-  - color jitter
-  - affine
-  Nhưng đã giảm bớt các phép biến đổi nặng hoặc lợi ích thấp.
+<my_submission>/
+├── public/ <vị trí của public/, không cần nộp lại thư mục public>
+├── models/
+├── utils/
+├── train.py
+├── predict.py
+├── README.md
+└── requirements.txt
+Lệnh suy luận bắt buộc:
 
-- Validation chuyển sang chế độ nhanh hơn.
-  Không còn decode và chấm detection metric trên toàn bộ `val` ở mọi epoch.
-  Thay vào đó:
-  - mỗi epoch chỉ duyệt một phần `val`
-  - metric detection chi tiết chỉ chạy theo chu kỳ `metric_interval`
-  - epoch cuối vẫn chạy metric để chọn checkpoint hợp lý
+python predict.py \
+  --image_dir /path/to/images \
+  --output predictions.json
+Lệnh huấn luyện bắt buộc:
 
-- Có hỗ trợ `torch.compile` khi chạy CUDA.
-  Điều này giúp giảm overhead Python ở phần forward của mô hình nếu môi trường hỗ trợ.
+python train.py \
+  --train_data ./public/annotations/train.json \
+  --val_data ./public/annotations/val.json \
+  --image_dir ./public/train/images \
+  --val_image_dir ./public/val/images \
+  --checkpoint_dir ./models/
+Lệnh huấn luyện trên phải chạy được và lưu mô hình tốt nhất vào ./models/best.pth. Sinh viên có thể thêm tham số khác nếu cần.
 
+Tệp README.md cần nêu rõ:
 
-3. Những file `utils` đã được chỉnh để phục vụ mục tiêu này
------------------------------------------------------------
+Cách cài đặt môi trường.
+Cách huấn luyện.
+Cách chạy suy luận.
+Vị trí đặt mô hình hoặc trọng số mô hình.
+Định Dạng Kết Quả Dự Đoán
+Tệp predictions.json phải là một mảng JSON:
 
-- `utils/config.py`
-  Chứa preset nhanh cho T4:
-  - `IMG_SIZE = 512`
-  - `FPN_CHANNELS = 96`
-  - `HEAD_NUM_CONVS = 1`
-  - `TRAIN_BATCH_SIZE = 16`
-  - `TRAIN_NUM_WORKERS = -1`
-  - `MAX_VAL_BATCHES`, `METRIC_EVAL_INTERVAL`, `METRIC_EVAL_BATCHES`
-  - cờ `ENABLE_TORCH_COMPILE`
+[
+  {
+    "image_id": "img_7fd91a4c2e30.jpg",
+    "boxes": [
+      {
+        "class": "person",
+        "confidence": 0.91,
+        "bbox": [48, 72, 210, 356]
+      }
+    ]
+  }
+]
+Quy định:
 
-- `utils/model.py`
-  Head gọn hơn do lấy `HEAD_NUM_CONVS` từ config.
-  FPN dùng ít kênh hơn nên nhanh hơn nhưng vẫn giữ nhánh `stride 4`.
+image_id là tên file ảnh trong thư mục ảnh cần suy luận.
+class thuộc 5 lớp quy định.
+confidence là độ tin cậy, nằm trong đoạn [0, 1].
+bbox là [xmin, ymin, xmax, ymax].
+Tọa độ bbox tính theo điểm ảnh trên ảnh gốc.
+Ảnh không phát hiện đối tượng nào vẫn cần xuất "boxes": [].
+trong public/annotations có các file predictions.json (chính xác 100%) để làm mẫu.
+Chấm Tự Động
+Sinh viên có thể tự kiểm tra định dạng và điểm trên tập huấn luyện/kiểm định bằng tệp chấm đi kèm trong thư mục public/. Ví dụ, sau khi xuất dự đoán cho tập kiểm định:
 
-- `utils/runtime.py`
-  Có thêm:
-  - nhận diện Kaggle để giới hạn worker hợp lý
-  - `seed_worker()` cho DataLoader
-  - `maybe_compile_model()` để bật `torch.compile` an toàn khi có CUDA
+python public/tools/evaluate_predictions.py \
+  --ground_truth public/annotations/val.json \
+  --predictions val_predictions.json \
+  --output val_score.json
+Hệ thống chấm sẽ:
 
-- `utils/process.py`
-  Pipeline preview augment đã được chỉnh lại để phản ánh train pipeline nhẹ hơn.
+Kiểm tra JSON có đúng định dạng không.
+Kiểm tra hộp bao hợp lệ và nằm trong ảnh.
+Kiểm tra nhãn lớp hợp lệ.
+Tính IoU, độ chính xác (precision), độ bao phủ (recall) và mAP@0.5 trên tập kiểm tra ẩn.
+Lệnh chấm mẫu:
 
+python tools/evaluate_predictions.py \
+  --ground_truth ./private/hidden_test_annotations.json \
+  --predictions predictions.json \
+  --output score.json
+Thang Điểm
+Nội dung	Điểm
+Quy trình dữ liệu	20
+Kiến trúc mô hình	20
+Hàm mất mát và quy trình huấn luyện	20
+Suy luận và NMS	20
+Kết quả trên tập kiểm tra ẩn	20
+Thang điểm các phần cài đặt dựa trên mức độ "làm từ đầu" của cài đặt.
 
-4. Cái giá phải chấp nhận khi đổi sang bản nhanh
-------------------------------------------------
+Thang điểm kết quả:
 
-Bản nhanh không phải miễn phí hoàn toàn.
-Nó đánh đổi một phần độ kỹ để đổi lấy tốc độ.
+mAP@0.5	Điểm
+< 0.30	0
+0.30 - < 0.45	5
+0.45 - < 0.60	10
+0.60 - < 0.75	15
+>= 0.75	20
+Sau đó được chuẩn hóa: người có kết quả cao nhất được 20 điểm, người có kết quả thấp nhất được 0 điểm.
 
-- Ảnh nhỏ hơn nên cực tiểu vật thể có thể khó hơn một chút so với bản ảnh lớn hơn.
-- Validation theo lô con và theo chu kỳ sẽ nhanh hơn, nhưng metric mỗi epoch không còn "đủ toàn bộ tập val".
-- Head gọn hơn làm mô hình bớt nặng, nhưng cũng giảm một phần sức biểu diễn so với head dày hơn.
-
-Tuy nhiên, vì các ý quan trọng như `stride 4`, focus crop, partial occlusion, loss hồi quy và metric cho `car/dog/cat` vẫn được giữ lại, nên bản này là kiểu:
-
-- nhanh hơn rất nhiều
-- vẫn học đúng trọng tâm
-- phù hợp hơn với GPU T4 trên Kaggle
-
-
-5. Cách hiểu ngắn gọn nhất
---------------------------
-
-- Bản trước: học rất kỹ trong mỗi buổi, nhưng một buổi kéo quá dài.
-- Bản mới: vẫn học đúng trọng tâm, nhưng giáo án gọn hơn, cách nạp bài thông minh hơn và cách kiểm tra cũng hợp lý hơn.
-
-Vì vậy:
-
-- khả năng học hardcase vẫn được giữ
-- thời gian mỗi epoch được cắt xuống mạnh hơn
-- phù hợp hơn để train thực tế trên Kaggle T4
+Quy Định Đạo Văn
+Không được sao chép toàn bộ mã nguồn của mô hình phát hiện đối tượng có sẵn.
+Có thể tham khảo tài liệu nhưng phải tự triển khai phần chính.
+Giảng viên có thể yêu cầu phỏng vấn mã nguồn trực tiếp.
+Bài có dấu hiệu sao chép sẽ bị xử lý theo quy chế của nhà trường.
