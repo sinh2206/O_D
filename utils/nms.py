@@ -409,11 +409,89 @@ def _suppress_same_class_contained(
     return boxes[keep_idx], scores[keep_idx], class_ids[keep_idx]
 
 
-def nms_single_class(boxes: torch.Tensor, scores: torch.Tensor, iou_thresh: float) -> torch.Tensor:
-    """
-    Pure PyTorch NMS for one class.
+def box_diou_iou(one: torch.Tensor, many: torch.Tensor) -> torch.Tensor:
+    """Distance-IoU: IoU - (distance^2 / diagonal^2)."""
+    xx1 = torch.maximum(one[0], many[:, 0])
+    yy1 = torch.maximum(one[1], many[:, 1])
+    xx2 = torch.minimum(one[2], many[:, 2])
+    yy2 = torch.minimum(one[3], many[:, 3])
 
-    Returns indices relative to input tensors.
+    inter_w = (xx2 - xx1).clamp(min=0)
+    inter_h = (yy2 - yy1).clamp(min=0)
+    inter = inter_w * inter_h
+
+    area_one = (one[2] - one[0]).clamp(min=0) * (one[3] - one[1]).clamp(min=0)
+    area_many = (many[:, 2] - many[:, 0]).clamp(min=0) * (many[:, 3] - many[:, 1]).clamp(min=0)
+    union = area_one + area_many - inter + 1e-7
+    iou = inter / union
+
+    # Enclosing box
+    ex1 = torch.minimum(one[0], many[:, 0])
+    ey1 = torch.minimum(one[1], many[:, 1])
+    ex2 = torch.maximum(one[2], many[:, 2])
+    ey2 = torch.maximum(one[3], many[:, 3])
+
+    c2 = (ex2 - ex1).pow(2) + (ey2 - ey1).pow(2) + 1e-7
+    # Center distance
+    rho2 = (
+        (one[0] + one[2] - (many[:, 0] + many[:, 2])).pow(2)
+        + (one[1] + one[3] - (many[:, 1] + many[:, 3])).pow(2)
+    ) / 4.0
+
+    return iou - rho2 / c2
+
+
+def soft_nms_single_class(
+    boxes: torch.Tensor,
+    scores: torch.Tensor,
+    iou_thresh: float,
+    sigma: float = 0.5,
+    score_thresh: float = 0.1,
+    method: str = "gaussian",
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Soft-NMS implementation (linear or gaussian).
+    Returns (kept_boxes_indices, updated_scores).
+    """
+    if boxes.numel() == 0:
+        return torch.zeros((0,), dtype=torch.long, device=boxes.device), scores
+
+    dets = boxes.clone()
+    sc = scores.clone()
+    num = dets.shape[0]
+    indices = torch.arange(num, device=boxes.device)
+
+    for i in range(num):
+        max_idx = torch.argmax(sc[i:]) + i
+        # swap
+        dets[i], dets[max_idx] = dets[max_idx].clone(), dets[i].clone()
+        sc[i], sc[max_idx] = sc[max_idx].clone(), sc[i].clone()
+        indices[i], indices[max_idx] = indices[max_idx].clone(), indices[i].clone()
+
+        current_box = dets[i]
+        ious = _box_iou_xyxy(current_box, dets[i + 1 :])
+
+        if method == "gaussian":
+            weight = torch.exp(-(ious * ious) / sigma)
+        else:  # linear
+            weight = torch.ones_like(ious)
+            mask = ious > iou_thresh
+            weight[mask] = 1.0 - ious[mask]
+
+        sc[i + 1 :] *= weight
+
+    keep = sc > score_thresh
+    return indices[keep], sc[keep]
+
+
+def nms_single_class(
+    boxes: torch.Tensor,
+    scores: torch.Tensor,
+    iou_thresh: float,
+    use_diou: bool = True,
+) -> torch.Tensor:
+    """
+    Pure PyTorch NMS for one class, optionally using DIoU.
     """
     if boxes.numel() == 0:
         return torch.zeros((0,), dtype=torch.long, device=boxes.device)
@@ -429,9 +507,12 @@ def nms_single_class(boxes: torch.Tensor, scores: torch.Tensor, iou_thresh: floa
             break
 
         rest = order[1:]
-        ious = _box_iou_xyxy(boxes[i], boxes[rest])
-        rest = rest[ious <= float(iou_thresh)]
-        order = rest
+        if use_diou:
+            ious = box_diou_iou(boxes[i], boxes[rest])
+        else:
+            ious = _box_iou_xyxy(boxes[i], boxes[rest])
+        
+        order = rest[ious <= float(iou_thresh)]
 
     return torch.tensor(keep, dtype=torch.long, device=boxes.device)
 
@@ -441,34 +522,53 @@ def class_wise_nms(
     scores: torch.Tensor,
     class_ids: torch.Tensor,
     nms_thresh: float = NMS_IOU_THRESH,
-) -> torch.Tensor:
+    use_soft_nms: bool = True,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Apply NMS independently for each class id.
-
-    Returns global kept indices.
+    Returns (kept_boxes, kept_scores, kept_class_ids).
     """
     if boxes.numel() == 0:
-        return torch.zeros((0,), dtype=torch.long, device=boxes.device)
+        return boxes, scores, class_ids
 
-    keep_global: List[torch.Tensor] = []
+    out_boxes: List[torch.Tensor] = []
+    out_scores: List[torch.Tensor] = []
+    out_classes: List[torch.Tensor] = []
+
     unique_cls = class_ids.unique(sorted=True)
 
     for cls in unique_cls:
         cls_mask = class_ids == cls
-        idx = torch.where(cls_mask)[0]
-        if idx.numel() == 0:
+        b = boxes[cls_mask]
+        s = scores[cls_mask]
+        if b.numel() == 0:
             continue
 
-        cls_keep_rel = nms_single_class(boxes[idx], scores[idx], iou_thresh=float(nms_thresh))
-        keep_global.append(idx[cls_keep_rel])
+        if use_soft_nms:
+            idx, s_new = soft_nms_single_class(b, s, iou_thresh=float(nms_thresh), score_thresh=0.15)
+            out_boxes.append(b[idx])
+            out_scores.append(s_new)
+            out_classes.append(torch.full((idx.shape[0],), int(cls.item()), device=boxes.device, dtype=torch.long))
+        else:
+            idx = nms_single_class(b, s, iou_thresh=float(nms_thresh), use_diou=True)
+            out_boxes.append(b[idx])
+            out_scores.append(s[idx])
+            out_classes.append(class_ids[cls_mask][idx])
 
-    if not keep_global:
-        return torch.zeros((0,), dtype=torch.long, device=boxes.device)
+    if not out_boxes:
+        return (
+            torch.zeros((0, 4), dtype=boxes.dtype, device=boxes.device),
+            torch.zeros((0,), dtype=scores.dtype, device=boxes.device),
+            torch.zeros((0,), dtype=class_ids.dtype, device=boxes.device),
+        )
 
-    keep = torch.cat(keep_global, dim=0)
-    # Return in global confidence order.
-    keep = keep[torch.argsort(scores[keep], descending=True)]
-    return keep
+    ret_boxes = torch.cat(out_boxes, dim=0)
+    ret_scores = torch.cat(out_scores, dim=0)
+    ret_classes = torch.cat(out_classes, dim=0)
+
+    # Global sort
+    sort_idx = torch.argsort(ret_scores, descending=True)
+    return ret_boxes[sort_idx], ret_scores[sort_idx], ret_classes[sort_idx]
 
 
 def remap_boxes_to_original(boxes: torch.Tensor, meta: LetterboxMeta) -> torch.Tensor:
@@ -551,16 +651,13 @@ def postprocess_single_image(
     if boxes.numel() == 0:
         return {"image_id": image_id, "boxes": []}
 
-    keep = class_wise_nms(
+    boxes, scores, cls_ids = class_wise_nms(
         boxes=boxes,
         scores=scores,
         class_ids=cls_ids,
         nms_thresh=nms_thresh,
+        use_soft_nms=True,
     )
-
-    boxes = boxes[keep]
-    scores = scores[keep]
-    cls_ids = cls_ids[keep]
 
     if letterbox_meta is not None:
         boxes = remap_boxes_to_original(boxes, letterbox_meta)

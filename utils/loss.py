@@ -105,8 +105,8 @@ def _box_area(boxes: torch.Tensor) -> torch.Tensor:
     return wh[:, 0] * wh[:, 1]
 
 
-def giou_loss(pred_boxes: torch.Tensor, target_boxes: torch.Tensor, reduction: str = "mean") -> torch.Tensor:
-    """Generalized IoU loss between two sets of boxes (N,4) in xyxy."""
+def ciou_loss(pred_boxes: torch.Tensor, target_boxes: torch.Tensor, reduction: str = "mean") -> torch.Tensor:
+    """Complete IoU loss between two sets of boxes (N,4) in xyxy."""
     if pred_boxes.numel() == 0:
         return pred_boxes.new_tensor(0.0)
 
@@ -124,17 +124,26 @@ def giou_loss(pred_boxes: torch.Tensor, target_boxes: torch.Tensor, reduction: s
     union = area_p + area_t - inter + EPS
     iou = inter / union
 
+    # Enclosing box
     ex1 = torch.min(pred_boxes[:, 0], target_boxes[:, 0])
     ey1 = torch.min(pred_boxes[:, 1], target_boxes[:, 1])
     ex2 = torch.max(pred_boxes[:, 2], target_boxes[:, 2])
     ey2 = torch.max(pred_boxes[:, 3], target_boxes[:, 3])
 
-    enc_w = (ex2 - ex1).clamp(min=0)
-    enc_h = (ey2 - ey1).clamp(min=0)
-    enc_area = enc_w * enc_h + EPS
+    c2 = (ex2 - ex1).pow(2) + (ey2 - ey1).pow(2) + EPS  # convex diagonal squared
+    rho2 = (
+        (pred_boxes[:, 0] + pred_boxes[:, 2] - (target_boxes[:, 0] + target_boxes[:, 2])).pow(2)
+        + (pred_boxes[:, 1] + pred_boxes[:, 3] - (target_boxes[:, 1] + target_boxes[:, 3])).pow(2)
+    ) / 4.0  # center distance squared
 
-    giou = iou - (enc_area - union) / enc_area
-    loss = 1.0 - giou
+    w1, h1 = pred_boxes[:, 2] - pred_boxes[:, 0], pred_boxes[:, 3] - pred_boxes[:, 1]
+    w2, h2 = target_boxes[:, 2] - target_boxes[:, 0], target_boxes[:, 3] - target_boxes[:, 1]
+
+    v = (4 / (math.pi**2)) * torch.pow(torch.atan(w2 / (h2 + EPS)) - torch.atan(w1 / (h1 + EPS)), 2)
+    with torch.no_grad():
+        alpha = v / (1 - iou + v + EPS)
+
+    loss = 1.0 - iou + rho2 / c2 + alpha * v
 
     if reduction == "mean":
         return loss.mean()
@@ -718,7 +727,7 @@ def compute_loss(
 
             pred_boxes = tlbr_to_xyxy(pts_pos, reg_pos)
             tgt_boxes = tlbr_to_xyxy(pts_pos, tgt_pos)
-            total_reg = total_reg + giou_loss(pred_boxes, tgt_boxes, reduction="sum")
+            total_reg = total_reg + ciou_loss(pred_boxes, tgt_boxes, reduction="sum")
 
             if ctr_levels is not None:
                 ctr_logits = ctr_levels[lvl].permute(0, 2, 3, 1).reshape(-1)

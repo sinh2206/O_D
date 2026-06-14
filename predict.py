@@ -918,7 +918,7 @@ def parse_args() -> argparse.Namespace:
         help="Path to trained model checkpoint (.pth). '--model_path' is kept as a backward-compatible alias.",
     )
     parser.add_argument("--img_size", type=int, default=IMG_SIZE)
-    parser.add_argument("--batch_size", type=int, default=32)
+    parser.add_argument("--batch_size", type=int, default=8)
     parser.add_argument("--conf_thresh", type=float, default=CONF_THRESH)
     parser.add_argument("--nms_thresh", type=float, default=NMS_IOU_THRESH)
     parser.add_argument(
@@ -931,14 +931,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--class_conf",
         type=str,
-        default=",".join(str(x) for x in CLASS_CONF_THRESH),
+        default="0.35,0.30,0.32,0.28,0.35",
         help="Per-class thresholds in CLASS_NAMES order, e.g. '0.38,0.40,0.40,0.40,0.72'",
     )
     parser.add_argument("--chair_suppress_iou", type=float, default=CHAIR_SUPPRESS_WITH_PERSON_IOU)
-    parser.add_argument("--hardcase_topk", type=int, default=50)
-    parser.add_argument("--hardcase_iou", type=float, default=0.5)
-    parser.add_argument("--tta_fallback", action="store_true", help="Enable TTA fallback on images with zero detections.")
-    parser.add_argument("--tta_min_votes", type=int, default=2, help="Minimum TTA consensus votes to keep a fallback box.")
+    parser.add_argument("--hardcase_topk", type=int, default=100)
+    parser.add_argument("--hardcase_iou", type=float, default=0.45)
+    parser.add_argument("--tta_fallback", action="store_true", default=True, help="Enable TTA fallback on images with zero detections.")
+    parser.add_argument("--tta_min_votes", type=int, default=1, help="Minimum TTA consensus votes to keep a fallback box.")
     parser.add_argument("--device", type=str, default="auto", choices=["auto", "cuda", "cpu"])
     return parser.parse_args()
 

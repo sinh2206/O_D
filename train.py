@@ -314,19 +314,33 @@ def get_train_transforms(img_size: int) -> A.Compose:
             A.HorizontalFlip(p=0.5),
             A.VerticalFlip(p=0.05),
             A.RandomRotate90(p=0.12),
-            A.CLAHE(clip_limit=2.2, tile_grid_size=(8, 8), p=0.2),
+            A.OneOf(
+                [
+                    A.CLAHE(clip_limit=3.0, tile_grid_size=(8, 8), p=1.0),
+                    A.Sharpen(alpha=(0.2, 0.5), lightness=(0.8, 1.2), p=1.0),
+                ],
+                p=0.35,
+            ),
             A.OneOf(
                 [
                     A.GaussianBlur(blur_limit=(3, 7), p=1.0),
                     A.MotionBlur(blur_limit=5, p=1.0),
                     downscale_aug,
                 ],
-                p=0.18,
+                p=0.20,
             ),
-            A.Sharpen(alpha=(0.15, 0.35), lightness=(0.85, 1.15), p=0.16),
-            A.RandomGamma(gamma_limit=(88, 122), p=0.25),
-            A.ColorJitter(brightness=0.12, contrast=0.12, saturation=0.1, hue=0.05, p=0.45),
+            A.ColorJitter(brightness=0.15, contrast=0.15, saturation=0.15, hue=0.08, p=0.45),
+            A.RandomGamma(gamma_limit=(80, 120), p=0.25),
+            A.OneOf(
+                [
+                    A.Posterize(p=1.0),
+                    A.Solarize(p=1.0),
+                    A.Equalize(p=1.0),
+                ],
+                p=0.12,
+            ),
             affine,
+            A.CoarseDropout(max_holes=8, max_height=int(img_size * 0.1), max_width=int(img_size * 0.1), fill_value=114, p=0.25),
             A.Normalize(mean=MEAN, std=STD),
             ToTensorV2(),
         ],
@@ -561,12 +575,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--val_image_dir", type=Path, required=True)
     parser.add_argument("--checkpoint_dir", type=Path, default=Path("./models"))
     parser.add_argument("--img_size", type=int, default=IMG_SIZE)
-    parser.add_argument("--batch_size", type=int, default=32)
+    parser.add_argument("--batch_size", type=int, default=8)
     parser.add_argument("--epochs", type=int, default=30)
     parser.add_argument("--lr_backbone", type=float, default=2e-4)
     parser.add_argument("--lr_head", type=float, default=2e-3)
     parser.add_argument("--weight_decay", type=float, default=1e-4)
-    parser.add_argument("--num_workers", type=int, default=4)
+    parser.add_argument("--num_workers", type=int, default=2)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--resume", type=Path, default=None)
     parser.add_argument("--label_smoothing", type=float, default=LABEL_SMOOTHING)
