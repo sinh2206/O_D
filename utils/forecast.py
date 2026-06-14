@@ -1,285 +1,148 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
-"""
-Forecast head and decoding utilities for anchor-free detection.
+"""Optional public-set analysis helpers for exported YOLOv8 predictions."""
 
-Design (per FPN level):
-- Input feature: (B, 128, H, W)
-- 3x [Conv3x3 -> BN -> LeakyReLU(0.1)] shared stem
-- Classification branch: Conv1x1 -> (B, C, H, W)
-- Regression branch: Conv1x1 -> (B, 4, H, W), decoded as (t, l, b, r)
+from pathlib import Path
+from typing import Dict, List, Sequence, Tuple
 
-Confidence (no objectness branch):
-- class_prob = sigmoid(cls_logits)
-- confidence = max(class_prob)
-
-Box decode at location (i, j):
-- cx = (j + 0.5) * stride
-- cy = (i + 0.5) * stride
-- x1 = cx - l, y1 = cy - t, x2 = cx + r, y2 = cy + b
-"""
-
-from typing import Any, Dict, List, Optional, Tuple
-
-import numpy as np
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-
-from .config import CONF_THRESH, FPN_CHANNELS, IMG_SIZE, NMS_IOU_THRESH, NUM_CLASSES
+from .runtime import load_json, write_json
 
 
-class ConvBNLeaky(nn.Module):
-    """Small reusable Conv-BN-LeakyReLU block used inside forecast heads."""
+def box_iou(box_a: Sequence[float], box_b: Sequence[float]) -> float:
+    """Compute IoU between two xyxy boxes."""
 
-    def __init__(self, in_ch: int, out_ch: int, k: int = 3, s: int = 1, p: int = 1):
-        """Configure one convolutional block with fixed normalization/activation."""
-
-        super().__init__()
-        self.block = nn.Sequential(
-            nn.Conv2d(in_ch, out_ch, kernel_size=k, stride=s, padding=p, bias=False),
-            nn.BatchNorm2d(out_ch),
-            nn.LeakyReLU(0.1, inplace=True),
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Apply the convolutional block to one feature tensor."""
-
-        return self.block(x)
+    ax1, ay1, ax2, ay2 = [float(v) for v in box_a]
+    bx1, by1, bx2, by2 = [float(v) for v in box_b]
+    xx1 = max(ax1, bx1)
+    yy1 = max(ay1, by1)
+    xx2 = min(ax2, bx2)
+    yy2 = min(ay2, by2)
+    inter_w = max(0.0, xx2 - xx1)
+    inter_h = max(0.0, yy2 - yy1)
+    inter = inter_w * inter_h
+    area_a = max(0.0, ax2 - ax1) * max(0.0, ay2 - ay1)
+    area_b = max(0.0, bx2 - bx1) * max(0.0, by2 - by1)
+    return inter / max(area_a + area_b - inter, 1e-9)
 
 
-class AnchorFreeForecastHead(nn.Module):
-    """Decoupled prediction head for one FPN level."""
+def load_ground_truth(annotation_path: Path) -> Dict[str, List[dict]]:
+    """Load the repo's JSON annotations into a per-image dictionary."""
 
-    def __init__(self, in_ch: int = FPN_CHANNELS, num_classes: int = NUM_CLASSES):
-        """Create the shared stem plus class/regression prediction layers."""
-
-        super().__init__()
-
-        self.stem = nn.Sequential(
-            ConvBNLeaky(in_ch, in_ch, k=3, s=1, p=1),
-            ConvBNLeaky(in_ch, in_ch, k=3, s=1, p=1),
-            ConvBNLeaky(in_ch, in_ch, k=3, s=1, p=1),
-        )
-
-        self.cls_pred = nn.Conv2d(in_ch, num_classes, kernel_size=1, bias=True)
-        self.reg_pred = nn.Conv2d(in_ch, 4, kernel_size=1, bias=True)
-
-        self._init_params()
-
-    def _init_params(self) -> None:
-        """Initialize logits with a low-positive prior and stable box bias."""
-
-        # Initialize low class confidence at start.
-        nn.init.normal_(self.cls_pred.weight, mean=0.0, std=0.01)
-        nn.init.constant_(self.cls_pred.bias, -1.2)
-
-        nn.init.normal_(self.reg_pred.weight, mean=0.0, std=0.01)
-        nn.init.constant_(self.reg_pred.bias, 1.0)
-
-    def forward(self, feat: torch.Tensor) -> Dict[str, torch.Tensor]:
-        """Predict class logits and box distances for one FPN feature map."""
-
-        x = self.stem(feat)
-        cls_logits = self.cls_pred(x)
-        reg_tlbr = F.relu(self.reg_pred(x))
-        return {
-            "cls_logits": cls_logits,
-            "reg_preds": reg_tlbr,
-        }
-
-
-class MultiScaleForecast(nn.Module):
-    """Three independent heads for stride8, stride16 and stride32 feature maps."""
-
-    def __init__(self, in_ch: int = FPN_CHANNELS, num_classes: int = NUM_CLASSES):
-        """Instantiate one forecast head per feature scale."""
-
-        super().__init__()
-        self.head_s8 = AnchorFreeForecastHead(in_ch=in_ch, num_classes=num_classes)
-        self.head_s16 = AnchorFreeForecastHead(in_ch=in_ch, num_classes=num_classes)
-        self.head_s32 = AnchorFreeForecastHead(in_ch=in_ch, num_classes=num_classes)
-
-    def forward(self, p2_out: torch.Tensor, p3_out: torch.Tensor, p4_out: torch.Tensor) -> Dict[str, Any]:
-        """Run all three heads and package their outputs in project format."""
-
-        out8 = self.head_s8(p2_out)
-        out16 = self.head_s16(p3_out)
-        out32 = self.head_s32(p4_out)
-        return {
-            "cls_logits": [out8["cls_logits"], out16["cls_logits"], out32["cls_logits"]],
-            "reg_preds": [out8["reg_preds"], out16["reg_preds"], out32["reg_preds"]],
-            "strides": [8, 16, 32],
-        }
-
-
-def _build_grid(h: int, w: int, stride: float, device: torch.device) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Build center coordinates for every location on one feature map level."""
-
-    ys = (torch.arange(h, device=device, dtype=torch.float32) + 0.5) * stride
-    xs = (torch.arange(w, device=device, dtype=torch.float32) + 0.5) * stride
-    gy, gx = torch.meshgrid(ys, xs, indexing="ij")
-    return gx, gy
-
-
-def decode_level(
-    cls_logits: torch.Tensor,
-    reg_preds: torch.Tensor,
-    stride: float,
-    conf_thresh: float = CONF_THRESH,
-    img_size: Optional[int] = IMG_SIZE,
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """
-    Decode one level output to boxes + scores + class ids for a single image.
-
-    Inputs:
-    - cls_logits: (C, H, W)
-    - reg_preds:  (4, H, W), order (t, l, b, r)
-    """
-    if cls_logits.dim() != 3 or reg_preds.dim() != 3:
-        raise ValueError("decode_level expects cls_logits (C,H,W) and reg_preds (4,H,W).")
-
-    c, h, w = cls_logits.shape
-    if reg_preds.shape[0] != 4:
-        raise ValueError("reg_preds first dim must be 4 for (t,l,b,r).")
-
-    cls_prob = torch.sigmoid(cls_logits)
-    best_score, best_cls = cls_prob.max(dim=0)  # (H, W)
-
-    mask = best_score >= conf_thresh
-    if not mask.any():
-        return (
-            np.zeros((0, 4), dtype=np.float32),
-            np.zeros((0,), dtype=np.float32),
-            np.zeros((0,), dtype=np.int64),
-        )
-
-    ys, xs = torch.where(mask)
-    scores = best_score[ys, xs]
-    cls_ids = best_cls[ys, xs]
-
-    gx, gy = _build_grid(h, w, stride=float(stride), device=cls_logits.device)
-    cx = gx[ys, xs]
-    cy = gy[ys, xs]
-
-    t = reg_preds[0, ys, xs]
-    l = reg_preds[1, ys, xs]
-    b = reg_preds[2, ys, xs]
-    r = reg_preds[3, ys, xs]
-
-    x1 = cx - l
-    y1 = cy - t
-    x2 = cx + r
-    y2 = cy + b
-
-    if img_size is not None:
-        x1 = x1.clamp(0, float(img_size))
-        y1 = y1.clamp(0, float(img_size))
-        x2 = x2.clamp(0, float(img_size))
-        y2 = y2.clamp(0, float(img_size))
-
-    boxes = torch.stack([x1, y1, x2, y2], dim=-1)
-    return (
-        boxes.detach().cpu().numpy().astype(np.float32),
-        scores.detach().cpu().numpy().astype(np.float32),
-        cls_ids.detach().cpu().numpy().astype(np.int64),
-    )
-
-
-def decode_multilevel(
-    outputs: Dict[str, Any],
-    conf_thresh: float = CONF_THRESH,
-    img_size: Optional[int] = IMG_SIZE,
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """
-    Decode model outputs from `utils/model.py` or `MultiScaleForecast`.
-
-    Expected keys:
-    - outputs['cls_logits']: List[(B,C,H,W)] or List[(C,H,W)]
-    - outputs['reg_preds']:  List[(B,4,H,W)] or List[(4,H,W)]
-    - outputs['strides']:    List[int]
-
-    Returns concatenated (boxes, scores, cls_ids) for batch index 0.
-    """
-    cls_levels = outputs["cls_logits"]
-    reg_levels = outputs["reg_preds"]
-    strides = outputs.get("strides", [8, 16, 32])
-
-    all_boxes: List[np.ndarray] = []
-    all_scores: List[np.ndarray] = []
-    all_cls: List[np.ndarray] = []
-
-    for cls_t, reg_t, stride in zip(cls_levels, reg_levels, strides):
-        if cls_t.dim() == 4:
-            cls_i = cls_t[0]
-        else:
-            cls_i = cls_t
-
-        if reg_t.dim() == 4:
-            reg_i = reg_t[0]
-        else:
-            reg_i = reg_t
-
-        boxes, scores, cls_ids = decode_level(
-            cls_logits=cls_i,
-            reg_preds=reg_i,
-            stride=float(stride),
-            conf_thresh=conf_thresh,
-            img_size=img_size,
-        )
-        if boxes.shape[0] == 0:
+    data = load_json(annotation_path)
+    gt: Dict[str, List[dict]] = {str(im.get("id", "")): [] for im in data.get("images", [])}
+    for ann in data.get("annotations", []):
+        image_id = str(ann.get("image_id", ""))
+        bbox = ann.get("bbox", [])
+        if image_id not in gt or not isinstance(bbox, list) or len(bbox) != 4:
             continue
+        gt[image_id].append({"class": str(ann.get("class", "")), "bbox": [int(v) for v in bbox]})
+    return gt
 
-        all_boxes.append(boxes)
-        all_scores.append(scores)
-        all_cls.append(cls_ids)
 
-    if not all_boxes:
-        return (
-            np.zeros((0, 4), dtype=np.float32),
-            np.zeros((0,), dtype=np.float32),
-            np.zeros((0,), dtype=np.int64),
+def evaluate_predictions(gt_map: Dict[str, List[dict]], predictions: Sequence[dict], iou_thresh: float = 0.5) -> Dict[str, float]:
+    """Compute simple micro precision/recall style metrics for quick inspection."""
+
+    pred_map = {str(item.get("image_id", "")): list(item.get("boxes", [])) for item in predictions}
+    tp = 0
+    fp = 0
+    fn = 0
+    iou_sum = 0.0
+
+    for image_id, gt_boxes in gt_map.items():
+        pred_boxes = pred_map.get(image_id, [])
+        used_gt: set[int] = set()
+
+        for pred in pred_boxes:
+            pred_cls = str(pred.get("class", ""))
+            best_iou = 0.0
+            best_idx = -1
+            for idx, gt in enumerate(gt_boxes):
+                if idx in used_gt or str(gt.get("class", "")) != pred_cls:
+                    continue
+                current_iou = box_iou(pred.get("bbox", [0, 0, 0, 0]), gt.get("bbox", [0, 0, 0, 0]))
+                if current_iou > best_iou:
+                    best_iou = current_iou
+                    best_idx = idx
+
+            if best_idx >= 0 and best_iou >= float(iou_thresh):
+                used_gt.add(best_idx)
+                tp += 1
+                iou_sum += best_iou
+            else:
+                fp += 1
+
+        fn += max(0, len(gt_boxes) - len(used_gt))
+
+    precision = tp / max(tp + fp, 1)
+    recall = tp / max(tp + fn, 1)
+    mean_iou = iou_sum / max(tp, 1)
+    return {
+        "true_positives": float(tp),
+        "false_positives": float(fp),
+        "false_negatives": float(fn),
+        "precision": float(precision),
+        "recall": float(recall),
+        "mean_iou": float(mean_iou),
+    }
+
+
+def build_hardcase_summary(gt_map: Dict[str, List[dict]], predictions: Sequence[dict], top_k: int = 50, iou_thresh: float = 0.5) -> List[dict]:
+    """Rank the hardest public images by missed detections and false positives."""
+
+    pred_map = {str(item.get("image_id", "")): list(item.get("boxes", [])) for item in predictions}
+    items: List[dict] = []
+
+    for image_id, gt_boxes in gt_map.items():
+        pred_boxes = pred_map.get(image_id, [])
+        matched_gt: set[int] = set()
+        tp = 0
+        fp = 0
+        iou_penalty = 0.0
+
+        for pred in pred_boxes:
+            pred_cls = str(pred.get("class", ""))
+            best_iou = 0.0
+            best_idx = -1
+            for idx, gt in enumerate(gt_boxes):
+                if idx in matched_gt or str(gt.get("class", "")) != pred_cls:
+                    continue
+                current_iou = box_iou(pred.get("bbox", [0, 0, 0, 0]), gt.get("bbox", [0, 0, 0, 0]))
+                if current_iou > best_iou:
+                    best_iou = current_iou
+                    best_idx = idx
+            if best_idx >= 0 and best_iou >= float(iou_thresh):
+                matched_gt.add(best_idx)
+                tp += 1
+                iou_penalty += 1.0 - best_iou
+            else:
+                fp += 1
+
+        fn = max(0, len(gt_boxes) - len(matched_gt))
+        error_score = 3.0 * fn + 1.5 * fp + iou_penalty
+        items.append(
+            {
+                "image_id": image_id,
+                "gt_count": len(gt_boxes),
+                "pred_count": len(pred_boxes),
+                "tp": tp,
+                "fp": fp,
+                "fn": fn,
+                "error_score": float(error_score),
+            }
         )
 
-    return (
-        np.concatenate(all_boxes, axis=0),
-        np.concatenate(all_scores, axis=0),
-        np.concatenate(all_cls, axis=0),
-    )
+    items.sort(key=lambda item: (item["error_score"], item["fn"], item["fp"]), reverse=True)
+    return items[: max(0, int(top_k))]
 
 
-def nms_per_class_numpy(boxes: np.ndarray, scores: np.ndarray, cls_ids: np.ndarray, iou_thresh: float = NMS_IOU_THRESH):
-    """Simple per-class NMS (numpy) to keep high-confidence boxes (e.g. 0.95)."""
-    if len(boxes) == 0:
-        return np.zeros((0,), dtype=np.int64)
+def save_analysis_outputs(predictions: Sequence[dict], annotation_path: Path, results_dir: Path, top_k: int = 50, iou_thresh: float = 0.5) -> Tuple[Path, Path]:
+    """Write a simple metrics summary and a hardcase ranking JSON."""
 
-    keep_global: List[int] = []
-    for c in np.unique(cls_ids):
-        idx = np.where(cls_ids == c)[0]
-        if idx.size == 0:
-            continue
-        b = boxes[idx]
-        s = scores[idx]
+    results_dir.mkdir(parents=True, exist_ok=True)
+    gt_map = load_ground_truth(annotation_path)
+    metrics = evaluate_predictions(gt_map, predictions, iou_thresh=iou_thresh)
+    hardcases = build_hardcase_summary(gt_map, predictions, top_k=top_k, iou_thresh=iou_thresh)
 
-        x1, y1, x2, y2 = b[:, 0], b[:, 1], b[:, 2], b[:, 3]
-        areas = np.maximum(0.0, x2 - x1) * np.maximum(0.0, y2 - y1)
-        order = s.argsort()[::-1]
-
-        while order.size > 0:
-            i = order[0]
-            keep_global.append(int(idx[i]))
-
-            xx1 = np.maximum(x1[i], x1[order[1:]])
-            yy1 = np.maximum(y1[i], y1[order[1:]])
-            xx2 = np.minimum(x2[i], x2[order[1:]])
-            yy2 = np.minimum(y2[i], y2[order[1:]])
-
-            w = np.maximum(0.0, xx2 - xx1)
-            h = np.maximum(0.0, yy2 - yy1)
-            inter = w * h
-            iou = inter / (areas[i] + areas[order[1:]] - inter + 1e-6)
-            order = order[1:][iou < float(iou_thresh)]
-
-    if not keep_global:
-        return np.zeros((0,), dtype=np.int64)
-    return np.asarray(sorted(set(keep_global)), dtype=np.int64)
+    metrics_path = write_json(results_dir / "analysis_summary.json", metrics)
+    hardcase_path = write_json(results_dir / "hardcase_summary.json", hardcases)
+    return metrics_path, hardcase_path
