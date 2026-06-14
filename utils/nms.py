@@ -2,6 +2,22 @@ from __future__ import annotations
 
 """
 Post-processing (decode + confidence filtering + class-wise NMS) for anchor-free detector.
+
+This module is synchronized with `utils/model.py` output format:
+{
+  "cls_logits": [Tensor(B,C,H,W), Tensor(B,C,H,W)],
+  "reg_preds": [Tensor(B,4,H,W), Tensor(B,4,H,W)],   # (t,l,b,r)
+  "center_logits": [Tensor(B,1,H,W), Tensor(B,1,H,W)] optional,
+  "strides": [8, 16, 32]
+}
+
+Pipeline:
+1) Decode multi-level predictions to xyxy boxes on letterbox image.
+2) Compute confidence score from classification (+ centerness if available).
+3) Threshold by confidence.
+4) Apply class-wise NMS.
+5) Remap boxes from letterbox space back to original image space.
+6) Return JSON-ready results.
 """
 
 from dataclasses import dataclass
@@ -10,41 +26,31 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 import torch
 
 try:
-    from .config import (
-        CLASS_NAMES,
-        CLASS_SCORE_SCALES,
-        CONF_THRESH,
-        CONTAINED_BOX_REPLACE_MARGIN,
-        DECODE_CANDIDATE_CONF,
-        DECODE_TOPK,
-        IMG_SIZE,
-        INFER_CENTER_COMBINE,
-        MAX_OBJECTS_PER_IMAGE,
-        MIN_BOX_SIZE,
-        NMS_IOU_THRESH,
-        NUM_CLASSES,
-        PRE_NMS_MAX_CANDIDATES,
-        STRIDES,
-    )
+    from .config import CLASS_NAMES, CLASS_SCORE_SCALES, CONF_THRESH, IMG_SIZE, INFER_CENTER_COMBINE, MAX_OBJECTS_PER_IMAGE, MIN_BOX_SIZE, NMS_IOU_THRESH, NUM_CLASSES, STRIDES
 except Exception:
+    # Safe fallbacks when config.py is not present.
     CLASS_NAMES = ["person", "car", "dog", "cat", "chair"]
     CLASS_SCORE_SCALES = [1.0 for _ in CLASS_NAMES]
     INFER_CENTER_COMBINE = "cls"
     CONF_THRESH = 0.50
-    CONTAINED_BOX_REPLACE_MARGIN = 0.12
-    DECODE_CANDIDATE_CONF = 0.20
-    DECODE_TOPK = 2
-    PRE_NMS_MAX_CANDIDATES = 3500
     NMS_IOU_THRESH = 0.50
     IMG_SIZE = 320
     NUM_CLASSES = 5
-    STRIDES = [4, 8, 16, 32]
-    MAX_OBJECTS_PER_IMAGE = 20
+    STRIDES = [8, 16, 32]
+    MAX_OBJECTS_PER_IMAGE = 15
     MIN_BOX_SIZE = 1.0
 
 
 @dataclass
 class LetterboxMeta:
+    """
+    Mapping info from original image to letterbox image.
+
+    scale: scaling factor used before padding
+    dx,dy: left/top padding offsets in letterbox image
+    orig_w,orig_h: original image size
+    """
+
     scale: float
     dx: float
     dy: float
@@ -63,7 +69,20 @@ def _make_grid(h: int, w: int, stride: float, device: torch.device) -> Tuple[tor
 
 
 def _apply_regression_activation(reg_raw: torch.Tensor, mode: str = "auto") -> torch.Tensor:
+    """
+    Convert raw regression outputs to positive distances.
+
+    mode:
+    - "exp":      distances = exp(raw)
+    - "relu":     distances = relu(raw)
+    - "identity": distances = raw (assume already non-negative)
+    - "auto":     if tensor has negative values -> exp, otherwise identity
+
+    Note: `utils/model.py` currently outputs `relu(reg_out)`, so default "auto"
+    behaves as identity for that model (synchronized behavior).
+    """
     mode = mode.lower()
+
     if mode == "exp":
         return torch.exp(reg_raw).clamp(max=1e4)
     if mode == "relu":
@@ -77,25 +96,60 @@ def _apply_regression_activation(reg_raw: torch.Tensor, mode: str = "auto") -> t
     raise ValueError(f"Unsupported reg_decode mode: {mode}")
 
 
-def _combine_center_scores(
-    class_scores: torch.Tensor,
-    center_logits: Optional[torch.Tensor],
-    center_combine: str,
-) -> torch.Tensor:
-    if center_logits is None:
-        return class_scores
-    if center_logits.dim() != 3 or center_logits.shape[0] != 1:
-        raise ValueError("center_logits must be (1,H,W) when provided")
+def _classification_scores(
+    cls_logits: torch.Tensor,
+    num_classes: int,
+    background_index: Optional[int] = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Compute class score and class id per location.
 
-    center = torch.sigmoid(center_logits[0]).unsqueeze(0)
-    mode = center_combine.lower()
-    if mode == "sqrt":
-        return torch.sqrt((class_scores * center).clamp(min=1e-12))
-    if mode == "soft":
-        return class_scores * (0.5 + 0.5 * center)
-    if mode == "cls":
-        return class_scores
-    return class_scores * center
+    Returns:
+    - cls_score: (H,W)
+    - cls_id:    (H,W) in [0..num_classes-1]
+
+    Cases:
+    - logits channels == num_classes: sigmoid over C channels.
+    - logits channels == num_classes+1: treat one channel as background.
+    """
+    c, _, _ = cls_logits.shape
+
+    if c == num_classes:
+        prob = torch.sigmoid(cls_logits)
+        if len(CLASS_SCORE_SCALES) == int(num_classes):
+            scale = torch.as_tensor(CLASS_SCORE_SCALES, dtype=prob.dtype, device=prob.device).view(-1, 1, 1)
+            prob = torch.clamp(prob * scale, min=0.0, max=1.0)
+        cls_score, cls_id = prob.max(dim=0)
+        return cls_score, cls_id
+
+    if c == num_classes + 1:
+        prob = torch.softmax(cls_logits, dim=0)
+
+        if background_index is None:
+            background_index = num_classes
+        if background_index < 0 or background_index >= c:
+            raise ValueError("background_index out of range for cls logits")
+
+        fg_indices = [i for i in range(c) if i != background_index]
+        fg_prob = prob[fg_indices, :, :]
+        if len(CLASS_SCORE_SCALES) == int(num_classes):
+            scale = torch.as_tensor(CLASS_SCORE_SCALES, dtype=fg_prob.dtype, device=fg_prob.device).view(-1, 1, 1)
+            fg_prob = torch.clamp(fg_prob * scale, min=0.0, max=1.0)
+
+        fg_max, fg_id_local = fg_prob.max(dim=0)
+        fg_score = 1.0 - prob[background_index, :, :]
+
+        # Combine explicit foreground probability with class peak.
+        cls_score = fg_max * fg_score
+
+        fg_ids_tensor = torch.tensor(fg_indices, device=cls_logits.device, dtype=torch.long)
+        cls_id = fg_ids_tensor[fg_id_local]
+        return cls_score, cls_id
+
+    raise ValueError(
+        f"Unexpected cls channels={c}. Expected num_classes ({num_classes}) "
+        f"or num_classes+1 ({num_classes + 1})."
+    )
 
 
 def decode_level(
@@ -109,52 +163,53 @@ def decode_level(
     reg_decode: str = "auto",
     center_combine: str = INFER_CENTER_COMBINE,
     background_index: Optional[int] = None,
-    topk: int = DECODE_TOPK,
-    pre_nms_max_candidates: int = PRE_NMS_MAX_CANDIDATES,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Decode one FPN level for a single image.
+
+    Inputs:
+    - cls_logits:   (C,H,W)
+    - reg_preds:    (4,H,W) raw (t,l,b,r)
+    - center_logits:(1,H,W) or None
+
+    Returns filtered tensors on letterbox image:
+    - boxes_xyxy: (N,4)
+    - scores:     (N,)
+    - class_ids:  (N,)
+    """
     if cls_logits.dim() != 3:
         raise ValueError("cls_logits must be (C,H,W)")
     if reg_preds.dim() != 3 or reg_preds.shape[0] != 4:
         raise ValueError("reg_preds must be (4,H,W)")
 
-    c, h, w = cls_logits.shape
+    _, h, w = cls_logits.shape
     device = cls_logits.device
-    topk = max(1, int(topk))
-    conf_thresh = float(min(conf_thresh, DECODE_CANDIDATE_CONF if c == num_classes else conf_thresh))
 
-    if c == num_classes:
-        class_scores = torch.sigmoid(cls_logits)
-        if len(CLASS_SCORE_SCALES) == int(num_classes):
-            scale = torch.as_tensor(CLASS_SCORE_SCALES, dtype=class_scores.dtype, device=device).view(-1, 1, 1)
-            class_scores = torch.clamp(class_scores * scale, min=0.0, max=1.0)
-        class_scores = _combine_center_scores(class_scores, center_logits=center_logits, center_combine=center_combine)
-        k = min(topk, int(num_classes))
-        conf_k, cls_id_k = torch.topk(class_scores, k=k, dim=0)
-        keep = conf_k > conf_thresh
-    elif c == num_classes + 1:
-        prob = torch.softmax(cls_logits, dim=0)
-        if background_index is None:
-            background_index = num_classes
-        if background_index < 0 or background_index >= c:
-            raise ValueError("background_index out of range for cls logits")
+    cls_score, cls_id = _classification_scores(
+        cls_logits=cls_logits,
+        num_classes=num_classes,
+        background_index=background_index,
+    )
 
-        fg_indices = [i for i in range(c) if i != background_index]
-        class_scores = prob[fg_indices, :, :]
-        if len(CLASS_SCORE_SCALES) == int(num_classes):
-            scale = torch.as_tensor(CLASS_SCORE_SCALES, dtype=class_scores.dtype, device=device).view(-1, 1, 1)
-            class_scores = torch.clamp(class_scores * scale, min=0.0, max=1.0)
-        class_scores = class_scores * (1.0 - prob[background_index, :, :]).unsqueeze(0)
-        class_scores = _combine_center_scores(class_scores, center_logits=center_logits, center_combine=center_combine)
-        conf_k, cls_id_local = torch.topk(class_scores, k=1, dim=0)
-        fg_ids_tensor = torch.tensor(fg_indices, device=device, dtype=torch.long)
-        cls_id_k = fg_ids_tensor[cls_id_local]
-        keep = conf_k > conf_thresh
+    if center_logits is not None:
+        if center_logits.dim() != 3 or center_logits.shape[0] != 1:
+            raise ValueError("center_logits must be (1,H,W) when provided")
+        center = torch.sigmoid(center_logits[0])
+        center_combine = center_combine.lower()
+        if center_combine == "sqrt":
+            conf = torch.sqrt((cls_score * center).clamp(min=1e-12))
+        elif center_combine == "soft":
+            # Keep some centerness influence without collapsing confident class
+            # responses on crowded scenes.
+            conf = cls_score * (0.5 + 0.5 * center)
+        elif center_combine == "cls":
+            conf = cls_score
+        else:
+            conf = cls_score * center
     else:
-        raise ValueError(
-            f"Unexpected cls channels={c}. Expected num_classes ({num_classes}) "
-            f"or num_classes+1 ({num_classes + 1})."
-        )
+        conf = cls_score
 
+    keep = conf > float(conf_thresh)
     if not torch.any(keep):
         return (
             torch.zeros((0, 4), dtype=torch.float32, device=device),
@@ -163,7 +218,9 @@ def decode_level(
         )
 
     reg = _apply_regression_activation(reg_preds, mode=reg_decode)
+
     gx, gy = _make_grid(h, w, stride=float(stride), device=device)
+
     t = reg[0]
     l = reg[1]
     b = reg[2]
@@ -173,23 +230,19 @@ def decode_level(
     y1 = (gy - t).clamp(0.0, float(img_size))
     x2 = (gx + r).clamp(0.0, float(img_size))
     y2 = (gy + b).clamp(0.0, float(img_size))
+
     boxes = torch.stack([x1, y1, x2, y2], dim=-1)
 
-    rank_idx, ys, xs = torch.where(keep)
+    ys, xs = torch.where(keep)
     boxes_keep = boxes[ys, xs]
-    scores_keep = conf_k[rank_idx, ys, xs]
-    cls_keep = cls_id_k[rank_idx, ys, xs].long()
+    scores_keep = conf[ys, xs]
+    cls_keep = cls_id[ys, xs].long()
 
+    # Keep only valid geometry.
     valid = (boxes_keep[:, 2] > boxes_keep[:, 0]) & (boxes_keep[:, 3] > boxes_keep[:, 1])
     boxes_keep = boxes_keep[valid]
     scores_keep = scores_keep[valid]
     cls_keep = cls_keep[valid]
-
-    if boxes_keep.shape[0] > int(pre_nms_max_candidates):
-        top_keep = torch.argsort(scores_keep, descending=True)[: int(pre_nms_max_candidates)]
-        boxes_keep = boxes_keep[top_keep]
-        scores_keep = scores_keep[top_keep]
-        cls_keep = cls_keep[top_keep]
 
     return boxes_keep, scores_keep, cls_keep
 
@@ -204,12 +257,19 @@ def decode_multilevel(
     reg_decode: str = "auto",
     center_combine: str = INFER_CENTER_COMBINE,
     background_index: Optional[int] = None,
-    topk: int = DECODE_TOPK,
-    pre_nms_max_candidates: int = PRE_NMS_MAX_CANDIDATES,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Decode and confidence-filter all FPN levels for one image in batch.
+
+    Returns:
+    - boxes_xyxy_letterbox: (N,4)
+    - scores: (N,)
+    - class_ids: (N,)
+    """
     cls_levels = outputs["cls_logits"]
     reg_levels = outputs["reg_preds"]
     ctr_levels = outputs.get("center_logits", None)
+
     if strides is None:
         strides = outputs.get("strides", STRIDES)
 
@@ -220,6 +280,7 @@ def decode_multilevel(
     for lvl, (cls_l, reg_l, stride) in enumerate(zip(cls_levels, reg_levels, strides)):
         cls_i = cls_l[image_index] if cls_l.dim() == 4 else cls_l
         reg_i = reg_l[image_index] if reg_l.dim() == 4 else reg_l
+
         ctr_i = None
         if ctr_levels is not None:
             ctr_l = ctr_levels[lvl]
@@ -236,9 +297,8 @@ def decode_multilevel(
             reg_decode=reg_decode,
             center_combine=center_combine,
             background_index=background_index,
-            topk=topk,
-            pre_nms_max_candidates=pre_nms_max_candidates,
         )
+
         if b.numel() > 0:
             all_boxes.append(b)
             all_scores.append(s)
@@ -252,19 +312,15 @@ def decode_multilevel(
             torch.zeros((0,), dtype=torch.long, device=device),
         )
 
-    boxes = torch.cat(all_boxes, dim=0)
-    scores = torch.cat(all_scores, dim=0)
-    class_ids = torch.cat(all_classes, dim=0)
-
-    if boxes.shape[0] > int(pre_nms_max_candidates):
-        keep = torch.argsort(scores, descending=True)[: int(pre_nms_max_candidates)]
-        boxes = boxes[keep]
-        scores = scores[keep]
-        class_ids = class_ids[keep]
-    return boxes, scores, class_ids
+    return (
+        torch.cat(all_boxes, dim=0),
+        torch.cat(all_scores, dim=0),
+        torch.cat(all_classes, dim=0),
+    )
 
 
 def _box_iou_xyxy(one: torch.Tensor, many: torch.Tensor) -> torch.Tensor:
+    """IoU between one box (4,) and many boxes (N,4)."""
     xx1 = torch.maximum(one[0], many[:, 0])
     yy1 = torch.maximum(one[1], many[:, 1])
     xx2 = torch.minimum(one[2], many[:, 2])
@@ -276,6 +332,7 @@ def _box_iou_xyxy(one: torch.Tensor, many: torch.Tensor) -> torch.Tensor:
 
     area_one = (one[2] - one[0]).clamp(min=0) * (one[3] - one[1]).clamp(min=0)
     area_many = (many[:, 2] - many[:, 0]).clamp(min=0) * (many[:, 3] - many[:, 1]).clamp(min=0)
+
     union = area_one + area_many - inter + 1e-6
     return inter / union
 
@@ -324,11 +381,9 @@ def _suppress_same_class_contained(
             if not (cand_inside_kept or kept_inside_cand):
                 continue
 
-            if (
-                kept_inside_cand
-                and candidate_area > kept_area
-                and candidate_score + float(CONTAINED_BOX_REPLACE_MARGIN) >= kept_score
-            ):
+            # If one box fully contains the other and scores are close, prefer
+            # the larger box to avoid losing full-object detections.
+            if kept_inside_cand and candidate_area > kept_area and candidate_score + 0.03 >= kept_score:
                 replace_slot = slot
                 break
 
@@ -355,19 +410,29 @@ def _suppress_same_class_contained(
 
 
 def nms_single_class(boxes: torch.Tensor, scores: torch.Tensor, iou_thresh: float) -> torch.Tensor:
+    """
+    Pure PyTorch NMS for one class.
+
+    Returns indices relative to input tensors.
+    """
     if boxes.numel() == 0:
         return torch.zeros((0,), dtype=torch.long, device=boxes.device)
 
     order = torch.argsort(scores, descending=True)
     keep: List[int] = []
+
     while order.numel() > 0:
         i = int(order[0].item())
         keep.append(i)
+
         if order.numel() == 1:
             break
+
         rest = order[1:]
         ious = _box_iou_xyxy(boxes[i], boxes[rest])
-        order = rest[ious <= float(iou_thresh)]
+        rest = rest[ious <= float(iou_thresh)]
+        order = rest
+
     return torch.tensor(keep, dtype=torch.long, device=boxes.device)
 
 
@@ -377,42 +442,65 @@ def class_wise_nms(
     class_ids: torch.Tensor,
     nms_thresh: float = NMS_IOU_THRESH,
 ) -> torch.Tensor:
+    """
+    Apply NMS independently for each class id.
+
+    Returns global kept indices.
+    """
     if boxes.numel() == 0:
         return torch.zeros((0,), dtype=torch.long, device=boxes.device)
 
     keep_global: List[torch.Tensor] = []
-    for cls in class_ids.unique(sorted=True):
-        idx = torch.where(class_ids == cls)[0]
+    unique_cls = class_ids.unique(sorted=True)
+
+    for cls in unique_cls:
+        cls_mask = class_ids == cls
+        idx = torch.where(cls_mask)[0]
         if idx.numel() == 0:
             continue
+
         cls_keep_rel = nms_single_class(boxes[idx], scores[idx], iou_thresh=float(nms_thresh))
         keep_global.append(idx[cls_keep_rel])
 
     if not keep_global:
         return torch.zeros((0,), dtype=torch.long, device=boxes.device)
+
     keep = torch.cat(keep_global, dim=0)
-    return keep[torch.argsort(scores[keep], descending=True)]
+    # Return in global confidence order.
+    keep = keep[torch.argsort(scores[keep], descending=True)]
+    return keep
 
 
 def remap_boxes_to_original(boxes: torch.Tensor, meta: LetterboxMeta) -> torch.Tensor:
+    """
+    Convert boxes from letterbox (IMG_SIZE space) to original image coordinates.
+    """
     if boxes.numel() == 0:
         return boxes
-    out = boxes.clone().float()
+
     scale = float(meta.scale)
-    out[:, 0] = (out[:, 0] - float(meta.dx)) / max(scale, 1e-12)
-    out[:, 1] = (out[:, 1] - float(meta.dy)) / max(scale, 1e-12)
-    out[:, 2] = (out[:, 2] - float(meta.dx)) / max(scale, 1e-12)
-    out[:, 3] = (out[:, 3] - float(meta.dy)) / max(scale, 1e-12)
+    dx = float(meta.dx)
+    dy = float(meta.dy)
+
+    out = boxes.clone().float()
+    out[:, 0] = (out[:, 0] - dx) / max(scale, 1e-12)
+    out[:, 1] = (out[:, 1] - dy) / max(scale, 1e-12)
+    out[:, 2] = (out[:, 2] - dx) / max(scale, 1e-12)
+    out[:, 3] = (out[:, 3] - dy) / max(scale, 1e-12)
+
     out[:, 0] = out[:, 0].clamp(0.0, float(meta.orig_w))
     out[:, 1] = out[:, 1].clamp(0.0, float(meta.orig_h))
     out[:, 2] = out[:, 2].clamp(0.0, float(meta.orig_w))
     out[:, 3] = out[:, 3].clamp(0.0, float(meta.orig_h))
+
     return out
 
 
 def filter_small_boxes(boxes: torch.Tensor, min_size: float = MIN_BOX_SIZE) -> torch.Tensor:
+    """Return boolean mask keeping boxes with width/height >= min_size."""
     if boxes.numel() == 0:
         return torch.zeros((0,), dtype=torch.bool, device=boxes.device)
+
     w = boxes[:, 2] - boxes[:, 0]
     h = boxes[:, 3] - boxes[:, 1]
     return (w >= float(min_size)) & (h >= float(min_size))
@@ -432,9 +520,19 @@ def postprocess_single_image(
     center_combine: str = INFER_CENTER_COMBINE,
     background_index: Optional[int] = None,
     min_box_size: float = MIN_BOX_SIZE,
-    topk: int = DECODE_TOPK,
-    pre_nms_max_candidates: int = PRE_NMS_MAX_CANDIDATES,
 ) -> Dict[str, Any]:
+    """
+    Full decode + NMS + remap pipeline for one image.
+
+    Output format:
+    {
+      "image_id": "xxx.jpg",
+      "boxes": [
+         {"class": "person", "confidence": 0.91, "bbox": [x1,y1,x2,y2]},
+         ...
+      ]
+    }
+    """
     if class_names is None:
         class_names = CLASS_NAMES
 
@@ -448,13 +546,18 @@ def postprocess_single_image(
         reg_decode=reg_decode,
         center_combine=center_combine,
         background_index=background_index,
-        topk=topk,
-        pre_nms_max_candidates=pre_nms_max_candidates,
     )
+
     if boxes.numel() == 0:
         return {"image_id": image_id, "boxes": []}
 
-    keep = class_wise_nms(boxes=boxes, scores=scores, class_ids=cls_ids, nms_thresh=nms_thresh)
+    keep = class_wise_nms(
+        boxes=boxes,
+        scores=scores,
+        class_ids=cls_ids,
+        nms_thresh=nms_thresh,
+    )
+
     boxes = boxes[keep]
     scores = scores[keep]
     cls_ids = cls_ids[keep]
@@ -466,18 +569,20 @@ def postprocess_single_image(
     boxes = boxes[valid]
     scores = scores[valid]
     cls_ids = cls_ids[valid]
+
     boxes, scores, cls_ids = _suppress_same_class_contained(boxes, scores, cls_ids)
 
     if boxes.shape[0] > int(MAX_OBJECTS_PER_IMAGE):
-        keep_top = torch.argsort(scores, descending=True)[: int(MAX_OBJECTS_PER_IMAGE)]
-        boxes = boxes[keep_top]
-        scores = scores[keep_top]
-        cls_ids = cls_ids[keep_top]
+        topk = torch.argsort(scores, descending=True)[: int(MAX_OBJECTS_PER_IMAGE)]
+        boxes = boxes[topk]
+        scores = scores[topk]
+        cls_ids = cls_ids[topk]
 
     pred_boxes: List[Dict[str, Any]] = []
     for b, s, c in zip(boxes.tolist(), scores.tolist(), cls_ids.tolist()):
         cls_idx = int(c)
         cls_name = class_names[cls_idx] if 0 <= cls_idx < len(class_names) else str(cls_idx)
+
         pred_boxes.append(
             {
                 "class": cls_name,
@@ -485,7 +590,11 @@ def postprocess_single_image(
                 "bbox": [float(b[0]), float(b[1]), float(b[2]), float(b[3])],
             }
         )
-    return {"image_id": image_id, "boxes": pred_boxes}
+
+    return {
+        "image_id": image_id,
+        "boxes": pred_boxes,
+    }
 
 
 def postprocess_batch(
@@ -501,9 +610,8 @@ def postprocess_batch(
     center_combine: str = INFER_CENTER_COMBINE,
     background_index: Optional[int] = None,
     min_box_size: float = MIN_BOX_SIZE,
-    topk: int = DECODE_TOPK,
-    pre_nms_max_candidates: int = PRE_NMS_MAX_CANDIDATES,
 ) -> List[Dict[str, Any]]:
+    """Batch wrapper for JSON-ready predictions."""
     bsz = outputs["cls_logits"][0].shape[0]
     if len(image_ids) != bsz:
         raise ValueError(f"image_ids length ({len(image_ids)}) must equal batch size ({bsz}).")
@@ -530,8 +638,6 @@ def postprocess_batch(
                 center_combine=center_combine,
                 background_index=background_index,
                 min_box_size=min_box_size,
-                topk=topk,
-                pre_nms_max_candidates=pre_nms_max_candidates,
             )
         )
     return results

@@ -72,44 +72,6 @@ def make_pad_if_needed(img_size: int):
     return A.PadIfNeeded(**kwargs)
 
 
-def make_partial_occlusion(img_size: int):
-    params = inspect.signature(A.CoarseDropout.__init__).parameters
-    min_size = max(6, int(round(img_size * 0.08)))
-    max_size = max(min_size + 1, int(round(img_size * 0.22)))
-
-    if "num_holes_range" in params:
-        kwargs = {
-            "num_holes_range": (1, 3),
-            "hole_height_range": (0.08, 0.22),
-            "hole_width_range": (0.08, 0.22),
-            "p": 0.16,
-        }
-        if "fill" in params:
-            kwargs["fill"] = (114, 114, 114)
-        if "fill_mask" in params:
-            kwargs["fill_mask"] = 0
-        return A.CoarseDropout(**kwargs)
-
-    kwargs = {
-        "min_holes": 1,
-        "max_holes": 3,
-        "min_height": min_size,
-        "max_height": max_size,
-        "min_width": min_size,
-        "max_width": max_size,
-        "p": 0.16,
-    }
-    if "fill_value" in params:
-        kwargs["fill_value"] = (114, 114, 114)
-    elif "value" in params:
-        kwargs["value"] = (114, 114, 114)
-    if "mask_fill_value" in params:
-        kwargs["mask_fill_value"] = 0
-    elif "fill_mask" in params:
-        kwargs["fill_mask"] = 0
-    return A.CoarseDropout(**kwargs)
-
-
 def collect_records(annotation_path: Path, image_dir: Path) -> Tuple[List[Record], List[str]]:
     data = load_json(annotation_path)
     classes = data.get("classes", [])
@@ -315,7 +277,7 @@ def build_train_transform(img_size: int) -> A.Compose:
             shear=(-1.0, 1.0),
             border_mode=cv2.BORDER_CONSTANT,
             fill=114,
-            p=0.15,
+            p=0.25,
         )
     except TypeError:
         affine = A.Affine(
@@ -325,33 +287,24 @@ def build_train_transform(img_size: int) -> A.Compose:
             shear=(-1.0, 1.0),
             mode=cv2.BORDER_CONSTANT,
             cval=114,
-            p=0.15,
+            p=0.25,
         )
-
-    try:
-        crop_aug = A.RandomSizedBBoxSafeCrop(height=img_size, width=img_size, erosion_rate=0.0, p=0.10)
-    except TypeError:
-        crop_aug = A.NoOp(p=1.0)
 
     return A.Compose(
         [
-            crop_aug,
             A.LongestMaxSize(max_size=img_size, interpolation=cv2.INTER_LINEAR),
             make_pad_if_needed(img_size),
             A.HorizontalFlip(p=0.5),
-            make_partial_occlusion(img_size),
             affine,
             A.OneOf(
                 [
                     A.GaussianBlur(blur_limit=(3, 7), p=1.0),
                     A.MotionBlur(blur_limit=5, p=1.0),
-                    A.Downscale(scale_range=(0.72, 0.90), p=1.0) if "scale_range" in inspect.signature(A.Downscale.__init__).parameters else A.Downscale(scale_min=0.72, scale_max=0.90, p=1.0),
                 ],
-                p=0.15,
+                p=0.2,
             ),
-            A.CLAHE(clip_limit=2.0, tile_grid_size=(8, 8), p=0.08),
-            A.RandomGamma(gamma_limit=(92, 116), p=0.10),
-            A.ColorJitter(brightness=0.10, contrast=0.10, saturation=0.08, hue=0.04, p=0.30),
+            A.CLAHE(clip_limit=2.0, tile_grid_size=(8, 8), p=0.2),
+            A.HueSaturationValue(hue_shift_limit=20, sat_shift_limit=30, val_shift_limit=20, p=0.5),
             A.Normalize(mean=MEAN, std=STD),
             ToTensorV2(),
         ],
@@ -455,7 +408,7 @@ def export_augmented_samples(
 
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Build anchor-free augmentation previews aligned with the current training pipeline.")
+    p = argparse.ArgumentParser(description="Build Anchor-Free augmentation previews: Mosaic -> Affine -> HSV -> Flip.")
     p.add_argument("--annotation", type=Path, default=Path("public/annotations/val.json"))
     p.add_argument("--image_dir", type=Path, default=Path("public/val/images"))
     p.add_argument("--output_dir", type=Path, default=Path("results"))

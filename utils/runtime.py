@@ -1,12 +1,9 @@
 from __future__ import annotations
 
 import os
-import random
 from pathlib import Path
 from typing import Any, Optional, Tuple
 
-import cv2
-import numpy as np
 import torch
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
@@ -45,16 +42,10 @@ def _cpu_limit_from_affinity() -> int:
     return max(1, int(cpu_count))
 
 
-def _is_kaggle() -> bool:
-    return bool(os.environ.get("KAGGLE_KERNEL_RUN_TYPE") or os.environ.get("KAGGLE_URL_BASE"))
-
-
 def resolve_num_workers(requested: int) -> Tuple[int, int]:
     max_safe = _cpu_limit_from_affinity()
     if "COLAB_GPU" in os.environ:
         max_safe = min(max_safe, 2)
-    elif _is_kaggle():
-        max_safe = min(max_safe, 4)
 
     if requested < 0:
         if max_safe <= 2:
@@ -77,36 +68,6 @@ def create_grad_scaler(device: torch.device, enabled: bool) -> Any:
         except TypeError:
             return torch.amp.GradScaler(enabled=amp_enabled)
     return torch.cuda.amp.GradScaler(enabled=amp_enabled)
-
-
-def seed_worker(worker_id: int) -> None:
-    worker_seed = torch.initial_seed() % (2**32)
-    np.random.seed(worker_seed)
-    random.seed(worker_seed)
-    cv2.setNumThreads(1)
-    try:
-        cv2.ocl.setUseOpenCL(False)
-    except Exception:
-        pass
-
-
-def maybe_compile_model(
-    model: torch.nn.Module,
-    device: torch.device,
-    enabled: bool = True,
-    mode: str = "reduce-overhead",
-) -> torch.nn.Module:
-    if not bool(enabled):
-        return model
-    if device.type != "cuda":
-        return model
-    compile_fn = getattr(torch, "compile", None)
-    if compile_fn is None:
-        return model
-    try:
-        return compile_fn(model, mode=str(mode))
-    except Exception:
-        return model
 
 
 def save_checkpoint(
